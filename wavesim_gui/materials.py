@@ -39,6 +39,11 @@ _MATERIAL_TYPE = "Material"
 # Name of the child group (created by CommandNewSimulation) that holds materials.
 _MATERIALS_GROUP = "Materials"
 
+# Default colour for a freshly-created material, and the colour a body is reset
+# to when it is detached from a material (FreeCAD's default light grey).
+_DEFAULT_MATERIAL_COLOR = (0.30, 0.60, 0.90)
+_DEFAULT_BODY_COLOR = (0.80, 0.80, 0.80)
+
 
 # --------------------------------------------------------------------------- #
 # Document-object model
@@ -51,7 +56,10 @@ class MaterialObject:
         ``Eps`` / ``Mu`` -- relative permittivity / permeability of the fill.
         ``Pec``          -- if True the bodies are perfect electric conductor;
                             ``Eps``/``Mu`` are ignored and the cells are masked.
-        ``Bodies``       -- the CAD objects this material applies to.
+        ``Color``        -- display colour applied to every assigned body.
+        ``Bodies``       -- the CAD objects this material applies to. Bodies are
+                            attached by dragging them onto the material in the
+                            tree (not by pre-selecting them).
     """
 
     def __init__(self, obj):
@@ -84,10 +92,17 @@ class MaterialObject:
                 "Perfect electric conductor (overrides Eps/Mu)",
             )
             obj.Pec = False
+        if not hasattr(obj, "Color"):
+            obj.addProperty(
+                "App::PropertyColor", "Color", "Material",
+                "Display colour applied to the assigned bodies",
+            )
+            obj.Color = _DEFAULT_MATERIAL_COLOR
         if not hasattr(obj, "Bodies"):
             obj.addProperty(
                 "App::PropertyLinkList", "Bodies", "Material",
-                "CAD bodies this material is assigned to",
+                "CAD bodies this material is assigned to (drag bodies from the "
+                "tree onto the material to attach them)",
             )
 
     def onDocumentRestored(self, obj):
@@ -144,6 +159,58 @@ def _describe(obj):
     return "eps={:.3g}".format(getattr(obj, "Eps", 1.0))
 
 
+def _is_solid_body(obj):
+    """Return True if *obj* carries a solid Shape (a valid material body)."""
+    shape = getattr(obj, "Shape", None)
+    return shape is not None and bool(getattr(shape, "Solids", None))
+
+
+def _color_rgb(value):
+    """Normalise a colour property/tuple to a 3-tuple of floats in 0..1."""
+    if not value:
+        return _DEFAULT_BODY_COLOR
+    return (float(value[0]), float(value[1]), float(value[2]))
+
+
+def material_color(mat):
+    """Return the material's display colour as a 3-tuple of floats in 0..1."""
+    return _color_rgb(getattr(mat, "Color", None))
+
+
+def _set_body_color(body, rgb):
+    """Tint a single body's shape with *rgb* (no-op without a view object)."""
+    vobj = getattr(body, "ViewObject", None)
+    if vobj is None:
+        return
+    try:
+        vobj.ShapeColor = (rgb[0], rgb[1], rgb[2])
+    except Exception:
+        pass
+
+
+def apply_material_color(mat):
+    """Tint every body assigned to *mat* with the material's colour."""
+    rgb = material_color(mat)
+    for body in getattr(mat, "Bodies", []) or []:
+        _set_body_color(body, rgb)
+
+
+def _restore_body_color(body):
+    """Reset a detached body to the neutral default colour."""
+    _set_body_color(body, _DEFAULT_BODY_COLOR)
+
+
+def _detach_body(body, keep):
+    """Remove *body* from every material except *keep* (a body has one owner)."""
+    sim = active_simulation(getattr(body, "Document", None))
+    for mat in find_materials(sim):
+        if mat is keep:
+            continue
+        bodies = getattr(mat, "Bodies", []) or []
+        if body in bodies:
+            mat.Bodies = [b for b in bodies if b is not body]
+
+
 # --------------------------------------------------------------------------- #
 # GUI: view provider, task panel, command
 # --------------------------------------------------------------------------- #
@@ -157,6 +224,11 @@ except Exception:  # console mode / no Qt
 
 
 if _GUI_AVAILABLE:
+
+    def _after_bodies_changed(doc):
+        """Recompute and re-size the domain after a material's bodies change."""
+        from wavesim_gui import domain as domain_mod
+        domain_mod.notify_materials_changed(doc)
 
     class MaterialViewProvider:
         """Tree view provider for a Material; double-click opens the editor."""
@@ -176,6 +248,43 @@ if _GUI_AVAILABLE:
             obj = getattr(self, "Object", None)
             return list(getattr(obj, "Bodies", []) or []) if obj else []
 
+        # -- Drag & drop: attach bodies by dropping them onto the material ---- #
+
+        def canDragObjects(self):
+            return True
+
+        def canDragObject(self, obj):
+            return True
+
+        def dragObject(self, vobj, obj):
+            """Detach a body dragged off the material in the tree."""
+            mat = vobj.Object
+            bodies = getattr(mat, "Bodies", []) or []
+            if obj in bodies:
+                mat.Bodies = [b for b in bodies if b is not obj]
+                _restore_body_color(obj)
+                _after_bodies_changed(mat.Document)
+
+        def canDropObjects(self):
+            return True
+
+        def canDropObject(self, obj):
+            # Only accept solid bodies; reject other tree items (and the
+            # material's own children re-dropped on themselves).
+            return _is_solid_body(obj)
+
+        def dropObject(self, vobj, obj):
+            """Attach a body dropped onto the material and tint it."""
+            mat = vobj.Object
+            if not _is_solid_body(obj):
+                return
+            _detach_body(obj, keep=mat)
+            bodies = getattr(mat, "Bodies", []) or []
+            if obj not in bodies:
+                mat.Bodies = list(bodies) + [obj]
+            _set_body_color(obj, material_color(mat))
+            _after_bodies_changed(mat.Document)
+
         def setEdit(self, vobj, mode=0):
             _open_material_panel(vobj.Object)
             return True
@@ -194,15 +303,16 @@ if _GUI_AVAILABLE:
         __setstate__ = loads
 
     class TaskMaterialPanel:
-        """Task-tab panel to edit a Material's parameters and body links.
+        """Task-tab panel to edit a Material's name, colour and parameters.
 
         Shown via ``Gui.Control.showDialog``. ``accept`` writes the widget
         values back onto the object; ``reject`` removes the object when it was
-        created fresh for this edit (so a cancelled assignment leaves no trace).
+        created fresh for this edit (so a cancelled creation leaves no trace).
+        Bodies are not edited here -- they are attached by dragging them onto the
+        material in the tree.
         """
 
         def __init__(self, obj, created=False):
-            from PySide import QtCore
             try:
                 from PySide import QtWidgets
             except ImportError:
@@ -210,10 +320,17 @@ if _GUI_AVAILABLE:
 
             self.obj = obj
             self.created = created
+            self._color = material_color(obj)
 
             form = QtWidgets.QWidget()
             form.setWindowTitle("Wavesim Material")
             layout = QtWidgets.QFormLayout(form)
+
+            self._name = QtWidgets.QLineEdit(obj.Label)
+
+            self._color_btn = QtWidgets.QPushButton()
+            self._color_btn.clicked.connect(self._pick_color)
+            self._update_color_swatch()
 
             self._pec = QtWidgets.QCheckBox("Perfect electric conductor (PEC)")
             self._pec.setChecked(bool(getattr(obj, "Pec", False)))
@@ -233,10 +350,19 @@ if _GUI_AVAILABLE:
             self._bodies_label = QtWidgets.QLabel(self._bodies_text())
             self._bodies_label.setWordWrap(True)
 
+            layout.addRow("Name:", self._name)
+            layout.addRow("Colour:", self._color_btn)
             layout.addRow(self._pec)
             layout.addRow("Relative permittivity (eps_r):", self._eps)
             layout.addRow("Relative permeability (mu_r):", self._mu)
             layout.addRow("Assigned bodies:", self._bodies_label)
+
+            hint = QtWidgets.QLabel(
+                "Drag bodies from the model tree onto this material to assign "
+                "them; they take on the material colour."
+            )
+            hint.setWordWrap(True)
+            layout.addRow(hint)
 
             self._pec.toggled.connect(self._on_pec)
             self._on_pec(self._pec.isChecked())
@@ -246,8 +372,33 @@ if _GUI_AVAILABLE:
         def _bodies_text(self):
             bodies = getattr(self.obj, "Bodies", []) or []
             if not bodies:
-                return "(none)"
+                return "(none -- drag bodies here)"
             return ", ".join(b.Label for b in bodies)
+
+        def _update_color_swatch(self):
+            r, g, b = (int(round(c * 255)) for c in self._color)
+            self._color_btn.setText("  {}, {}, {}  ".format(r, g, b))
+            self._color_btn.setStyleSheet(
+                "background-color: rgb({}, {}, {});".format(r, g, b)
+            )
+
+        def _pick_color(self):
+            try:
+                from PySide import QtWidgets, QtGui
+            except ImportError:
+                from PySide import QtGui
+                QtWidgets = QtGui
+            r, g, b = (int(round(c * 255)) for c in self._color)
+            chosen = QtWidgets.QColorDialog.getColor(
+                QtGui.QColor(r, g, b), self.form, "Material colour"
+            )
+            if chosen.isValid():
+                self._color = (
+                    chosen.red() / 255.0,
+                    chosen.green() / 255.0,
+                    chosen.blue() / 255.0,
+                )
+                self._update_color_swatch()
 
         def _on_pec(self, checked):
             # eps/mu are meaningless for a PEC region.
@@ -260,7 +411,10 @@ if _GUI_AVAILABLE:
             self.obj.Pec = self._pec.isChecked()
             self.obj.Eps = self._eps.value()
             self.obj.Mu = self._mu.value()
-            self.obj.Label = "Material ({})".format(_describe(self.obj))
+            self.obj.Color = self._color
+            name = self._name.text().strip()
+            self.obj.Label = name or "Material ({})".format(_describe(self.obj))
+            apply_material_color(self.obj)
             doc.commitTransaction()
             doc.recompute()
             # Resize the domain to include this material's bodies.
@@ -297,24 +451,20 @@ if _GUI_AVAILABLE:
         Gui.Control.closeDialog()
         Gui.Control.showDialog(TaskMaterialPanel(obj, created=created))
 
-    def _selected_bodies():
-        """Return selected document objects that carry a solid Shape."""
-        bodies = []
-        for obj in Gui.Selection.getSelection():
-            shape = getattr(obj, "Shape", None)
-            if shape is not None and getattr(shape, "Solids", None):
-                bodies.append(obj)
-        return bodies
-
     class CommandAssignMaterial:
-        """Create a Material from the selection and open its editor panel."""
+        """Create an empty Material and open its editor panel.
+
+        Materials are created without pre-selecting any geometry; the user names
+        the material, picks its colour, and then drags bodies onto it in the tree
+        to assign them.
+        """
 
         def GetResources(self):
             return {
                 "Pixmap": _MATERIAL_ICON,
-                "MenuText": "Assign Material",
-                "ToolTip": "Assign an EM material (eps_r / mu_r / PEC) to the "
-                "selected solid bodies",
+                "MenuText": "New Material",
+                "ToolTip": "Create an EM material (eps_r / mu_r / PEC); drag "
+                "bodies onto it in the tree to assign them",
             }
 
         def Activated(self):
@@ -322,28 +472,14 @@ if _GUI_AVAILABLE:
             sim = active_simulation(doc)
             if sim is None:
                 FreeCAD.Console.PrintWarning(
-                    "Wavesim: create a Simulation before assigning materials.\n"
+                    "Wavesim: create a Simulation before adding materials.\n"
                 )
                 return
 
-            bodies = _selected_bodies()
-            if not bodies:
-                try:
-                    from PySide import QtWidgets
-                except ImportError:
-                    from PySide import QtGui as QtWidgets
-                QtWidgets.QMessageBox.information(
-                    Gui.getMainWindow(), "Assign Material",
-                    "Select one or more solid bodies first, then assign a "
-                    "material.",
-                )
-                return
-
-            doc.openTransaction("Wavesim: Assign Material")
+            doc.openTransaction("Wavesim: New Material")
             try:
                 mat = doc.addObject("App::FeaturePython", "Material")
                 MaterialObject(mat)
-                mat.Bodies = bodies
                 mat.Label = "Material ({})".format(_describe(mat))
                 if mat.ViewObject is not None:
                     MaterialViewProvider(mat.ViewObject)

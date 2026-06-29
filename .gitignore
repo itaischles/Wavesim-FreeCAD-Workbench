@@ -1,0 +1,19 @@
+# Editor / IDE
+.vscode/
+
+# Python bytecode cache
+__pycache__/
+*.py[cod]
+
+# Architecture map — local working doc, not part of the workbench
+ARCHITECTURE.md
+
+# External solver package (lives in its own repository)
+wavesim/
+
+# Solver run output
+wavesim_results/
+
+# Unused image assets
+Resources/Gemini_Generated_Image_.png
+Resources/excitation.png

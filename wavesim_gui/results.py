@@ -1,0 +1,729 @@
+# -*- coding: utf-8 -*-
+"""Results visualisation for the Wavesim workbench (Session 8).
+
+After a successful run, :func:`build_results` adds a "Results" group to the
+Simulation tree holding one leaf object per monitor that produced data:
+
+* **Energy** -- the total-domain energy time series.
+* **Probe**  -- a single field component (or magnitude) at one point vs. time.
+* **Snapshot** -- a stack of 2D field slices animated over time.
+
+Each leaf is self-contained: it stores the run's output directory and the key
+of its array inside ``results.npz``, so double-clicking it reopens the plot even
+after the document has been saved and reloaded (the run output is kept on disk).
+
+All plotting happens here, on the *FreeCAD* side, using FreeCAD's bundled
+matplotlib (3.10) driven through the Qt6/PySide6 ``QtAgg`` backend. The conda
+solver is not involved in viewing -- it only wrote ``results.npz`` /
+``summary.json``. Plots open in their own non-modal windows (the snapshot view
+includes a frame slider and Play control); they are deliberately separate from
+the 3D viewport, trading a weaker geometric link for robustness and a UX
+consistent across the three result types.
+
+The Results group is a singleton per simulation: re-running refreshes it so the
+tree always reflects the latest run.
+"""
+
+import os
+
+import FreeCAD
+
+from wavesim_gui import units
+from wavesim_gui.commands import active_simulation
+
+
+# --------------------------------------------------------------------------- #
+# Constants
+# --------------------------------------------------------------------------- #
+
+_WB_DIR = os.path.join(FreeCAD.getUserAppDataDir(), "Mod", "wavesim-workbench")
+_RESOURCES_DIR = os.path.join(_WB_DIR, "Resources")
+_RESULTS_ICON = os.path.join(_RESOURCES_DIR, "run.png")
+_RESULT_ICON = os.path.join(_RESOURCES_DIR, "mesh.png")
+
+_TYPE_PROP = "WavesimType"
+_RESULTS_TYPE = "Results"   # the container group
+_RESULT_TYPE = "Result"     # a single result leaf
+
+# Result kinds (stored on each leaf's ResultKind property).
+_KIND_ENERGY = "energy"
+_KIND_PROBE = "probe"
+_KIND_SNAPSHOT = "snapshot"
+
+_RESULTS_GROUP = "Results"
+
+_MM_PER_M = 1000.0
+
+# In-plane axis labels per snapshot plane (mirrors monitors._PLANES). The first
+# axis is the array's first in-plane index, the second its second.
+_PLANE_AXES = {"XY": ("x", "y"), "YZ": ("y", "z"), "XZ": ("x", "z")}
+
+
+# --------------------------------------------------------------------------- #
+# Document-object model
+# --------------------------------------------------------------------------- #
+
+def _add_type_marker(obj, type_name):
+    """Stamp the read-only ``WavesimType`` identity marker on *obj*."""
+    if not hasattr(obj, _TYPE_PROP):
+        obj.addProperty(
+            "App::PropertyString", _TYPE_PROP, "Wavesim",
+            "Marks this object as a Wavesim results node",
+        )
+        setattr(obj, _TYPE_PROP, type_name)
+        obj.setEditorMode(_TYPE_PROP, 1)  # read-only identity marker
+
+
+class ResultsContainer:
+    """``Proxy`` for the "Results" group holding one run's result leaves."""
+
+    def __init__(self, obj):
+        self.Type = _RESULTS_TYPE
+        obj.Proxy = self
+        _add_type_marker(obj, _RESULTS_TYPE)
+        if not hasattr(obj, "ResultsDir"):
+            obj.addProperty(
+                "App::PropertyString", "ResultsDir", "Results",
+                "Directory holding this run's results.npz / summary.json",
+            )
+            obj.setEditorMode("ResultsDir", 1)  # informational, read-only
+
+    def onDocumentRestored(self, obj):
+        obj.Proxy = self
+        self.Type = getattr(self, "Type", _RESULTS_TYPE)
+
+    def execute(self, obj):
+        pass
+
+    def dumps(self):
+        return {"Type": getattr(self, "Type", _RESULTS_TYPE)}
+
+    def loads(self, state):
+        if isinstance(state, dict):
+            self.Type = state.get("Type", _RESULTS_TYPE)
+        return None
+
+    __getstate__ = dumps
+    __setstate__ = loads
+
+
+class ResultObject:
+    """``Proxy`` for one result leaf (energy / probe / snapshot).
+
+    Carries everything needed to (re)open its plot without the producing
+    monitor: the run directory (``ResultsDir``), the ``results.npz`` array key
+    (``DataKey``) and the kind/component. Snapshot leaves also store the slice's
+    physical in-plane extent and axis labels so the animation can be drawn in mm.
+    """
+
+    def __init__(self, obj, kind):
+        self.Type = _RESULT_TYPE
+        obj.Proxy = self
+        _add_type_marker(obj, _RESULT_TYPE)
+
+        if not hasattr(obj, "ResultKind"):
+            obj.addProperty(
+                "App::PropertyString", "ResultKind", "Result",
+                "Kind of result: energy, probe or snapshot",
+            )
+            obj.ResultKind = kind
+            obj.setEditorMode("ResultKind", 1)
+        if not hasattr(obj, "DataKey"):
+            obj.addProperty(
+                "App::PropertyString", "DataKey", "Result",
+                "Base key of this result's array(s) inside results.npz",
+            )
+            obj.setEditorMode("DataKey", 1)
+        if not hasattr(obj, "ResultsDir"):
+            obj.addProperty(
+                "App::PropertyString", "ResultsDir", "Result",
+                "Directory holding this run's results.npz",
+            )
+            obj.setEditorMode("ResultsDir", 1)
+        if not hasattr(obj, "Component"):
+            obj.addProperty(
+                "App::PropertyString", "Component", "Result",
+                "Field quantity recorded (probe/snapshot)",
+            )
+            obj.setEditorMode("Component", 1)
+
+    def onDocumentRestored(self, obj):
+        obj.Proxy = self
+        self.Type = getattr(self, "Type", _RESULT_TYPE)
+
+    def execute(self, obj):
+        pass
+
+    def dumps(self):
+        return {"Type": getattr(self, "Type", _RESULT_TYPE)}
+
+    def loads(self, state):
+        if isinstance(state, dict):
+            self.Type = state.get("Type", _RESULT_TYPE)
+        return None
+
+    __getstate__ = dumps
+    __setstate__ = loads
+
+
+# --------------------------------------------------------------------------- #
+# Tree building (called after a successful run)
+# --------------------------------------------------------------------------- #
+
+def _is_type(obj, type_name):
+    return getattr(obj, _TYPE_PROP, None) == type_name
+
+
+def find_results(sim):
+    """Return the existing Results group under *sim*, or ``None``."""
+    if sim is None:
+        return None
+    for child in sim.Group:
+        if _is_type(child, _RESULTS_TYPE):
+            return child
+    return None
+
+
+def _remove_results(doc, sim):
+    """Delete any existing Results group (and its leaves) under *sim*."""
+    grp = find_results(sim)
+    if grp is None:
+        return
+    for child in list(grp.Group):
+        doc.removeObject(child.Name)
+    doc.removeObject(grp.Name)
+
+
+def _snapshot_extent(sim, name):
+    """Return (width_mm, height_mm, axis_x, axis_y, plane, offset_mm) for the
+    snapshot monitor labelled *name*, or ``None`` if it cannot be resolved."""
+    from wavesim_gui import monitors as mon_mod
+
+    for snap in mon_mod.find_snapshots(sim):
+        if str(snap.Label or snap.Name) != name:
+            continue
+        corners = list(getattr(snap, "Corners", []) or [])
+        plane = str(getattr(snap, "Plane", "XY"))
+        offset = float(snap.Offset.Value) if hasattr(snap, "Offset") else 0.0
+        ax = _PLANE_AXES.get(plane, ("x", "y"))
+        if len(corners) == 4:
+            width = (corners[1] - corners[0]).Length
+            height = (corners[3] - corners[0]).Length
+        else:
+            width = height = 0.0
+        return (width, height, ax[0], ax[1], plane, offset)
+    return None
+
+
+def build_results(doc, sim, workdir, summary):
+    """(Re)build the Results group under *sim* from a finished run.
+
+    *workdir* holds ``results.npz``; *summary* is the parsed ``summary.json``
+    (used for monitor names/components). Returns the Results group, or ``None``
+    if nothing could be loaded.
+    """
+    import numpy as np
+
+    npz_path = os.path.join(workdir, "results.npz")
+    if not os.path.isfile(npz_path):
+        FreeCAD.Console.PrintWarning(
+            "Wavesim: no results.npz to visualise in {}\n".format(workdir)
+        )
+        return None
+    try:
+        keys = set(np.load(npz_path).files)
+    except Exception as exc:
+        FreeCAD.Console.PrintError(
+            "Wavesim: could not read results.npz ({})\n".format(exc)
+        )
+        return None
+
+    workdir = workdir.replace("\\", "/")
+
+    doc.openTransaction("Wavesim: Build Results")
+    try:
+        _remove_results(doc, sim)
+
+        grp = doc.addObject("App::DocumentObjectGroupPython", "Results")
+        ResultsContainer(grp)
+        grp.Label = "Results"
+        grp.ResultsDir = workdir
+        if grp.ViewObject is not None:
+            ResultsViewProvider(grp.ViewObject)
+        sim.addObject(grp)
+
+        def _new_leaf(name, kind, data_key, component=""):
+            leaf = doc.addObject("App::FeaturePython", "Result")
+            ResultObject(leaf, kind)
+            leaf.Label = name
+            leaf.DataKey = data_key
+            leaf.ResultsDir = workdir
+            leaf.Component = component
+            if leaf.ViewObject is not None:
+                ResultViewProvider(leaf.ViewObject)
+            grp.addObject(leaf)
+            return leaf
+
+        # Energy (whole-domain total energy).
+        if "energy_values" in keys:
+            _new_leaf("Energy", _KIND_ENERGY, "energy")
+
+        # Probes (one time series each).
+        for idx, meta in enumerate(summary.get("probes", [])):
+            if "probe_{}_values".format(idx) not in keys:
+                continue
+            comp = meta.get("component", "")
+            name = meta.get("name") or "Probe {}".format(idx)
+            _new_leaf(
+                "{} ({})".format(name, comp) if comp else name,
+                _KIND_PROBE, "probe_{}".format(idx), comp,
+            )
+
+        # Snapshots (frame stacks). Capture the slice's physical extent from the
+        # producing monitor so the animation can be drawn in millimetres.
+        for idx, meta in enumerate(summary.get("snapshots", [])):
+            if "snapshot_{}_data".format(idx) not in keys:
+                continue
+            comp = meta.get("component", "")
+            name = meta.get("name") or "Snapshot {}".format(idx)
+            leaf = _new_leaf(
+                name, _KIND_SNAPSHOT, "snapshot_{}".format(idx), comp,
+            )
+            extent = _snapshot_extent(sim, name)
+            if extent is not None:
+                _store_snapshot_extent(leaf, *extent)
+    except Exception:
+        doc.abortTransaction()
+        raise
+    doc.commitTransaction()
+    doc.recompute()
+    FreeCAD.Console.PrintMessage(
+        "Wavesim: results added to the tree (double-click a node to plot).\n"
+    )
+    return grp
+
+
+def _store_snapshot_extent(leaf, width, height, axis_x, axis_y, plane, offset):
+    """Stash a snapshot slice's physical extent on its result leaf."""
+    if not hasattr(leaf, "InPlaneSize"):
+        leaf.addProperty(
+            "App::PropertyVector", "InPlaneSize", "Snapshot",
+            "Slice size (width, height, 0) in mm",
+        )
+        leaf.setEditorMode("InPlaneSize", 1)
+    leaf.InPlaneSize = FreeCAD.Vector(width, height, 0.0)
+    for prop, value in (
+        ("AxisX", axis_x), ("AxisY", axis_y), ("Plane", plane),
+    ):
+        if not hasattr(leaf, prop):
+            leaf.addProperty("App::PropertyString", prop, "Snapshot", "")
+            leaf.setEditorMode(prop, 1)
+        setattr(leaf, prop, value)
+    if not hasattr(leaf, "Offset"):
+        leaf.addProperty(
+            "App::PropertyDistance", "Offset", "Snapshot",
+            "Plane offset along its normal axis (mm)",
+        )
+        leaf.setEditorMode("Offset", 1)
+    leaf.Offset = "{} mm".format(offset)
+
+
+# --------------------------------------------------------------------------- #
+# GUI: view providers + matplotlib plot windows
+# --------------------------------------------------------------------------- #
+
+try:
+    import FreeCADGui as Gui
+
+    _GUI_AVAILABLE = True
+except Exception:  # console mode / no Qt
+    _GUI_AVAILABLE = False
+
+
+if _GUI_AVAILABLE:
+
+    # Keep plot windows alive: a QDialog with no Python reference is garbage
+    # collected and vanishes immediately. Pruned lazily of closed windows.
+    _OPEN_WINDOWS = []
+
+    def _register_window(win):
+        _OPEN_WINDOWS[:] = [w for w in _OPEN_WINDOWS if _is_visible(w)]
+        _OPEN_WINDOWS.append(win)
+
+    def _is_visible(win):
+        try:
+            return win.isVisible()
+        except RuntimeError:  # underlying C++ object already deleted
+            return False
+
+    def _cleanup_window(dialog):
+        """Release a plot window's resources when it is closed.
+
+        Without this a closed window leaks: its animation ``QTimer`` keeps firing
+        (redrawing a hidden canvas every 100 ms -> growing sluggishness) and its
+        matplotlib figure / frame arrays stay alive because the QDialog is owned
+        by its parent (the main window). Stops the timer, clears the figure and
+        drops our reference; combined with ``WA_DeleteOnClose`` the C++ object is
+        then destroyed too.
+        """
+        timer = getattr(dialog, "_timer", None)
+        if timer is not None:
+            try:
+                timer.stop()
+            except RuntimeError:
+                pass
+        figure = getattr(dialog, "_figure", None)
+        if figure is not None:
+            try:
+                figure.clear()
+            except Exception:
+                pass
+        try:
+            _OPEN_WINDOWS.remove(dialog)
+        except ValueError:
+            pass
+
+    class ResultsViewProvider:
+        """Tree icon for the Results group (no 3D geometry, no editor)."""
+
+        def __init__(self, vobj):
+            vobj.Proxy = self
+
+        def attach(self, vobj):
+            self.ViewObject = vobj
+            self.Object = vobj.Object
+
+        def getIcon(self):
+            return _RESULTS_ICON
+
+        def dumps(self):
+            return None
+
+        def loads(self, state):
+            return None
+
+        __getstate__ = dumps
+        __setstate__ = loads
+
+    class ResultViewProvider:
+        """Tree view provider for a result leaf; double-click opens its plot."""
+
+        def __init__(self, vobj):
+            vobj.Proxy = self
+
+        def attach(self, vobj):
+            self.ViewObject = vobj
+            self.Object = vobj.Object
+
+        def getIcon(self):
+            return _RESULT_ICON
+
+        def setEdit(self, vobj, mode=0):
+            open_result(vobj.Object)
+            return True
+
+        def doubleClicked(self, vobj):
+            open_result(vobj.Object)
+            return True
+
+        def dumps(self):
+            return None
+
+        def loads(self, state):
+            return None
+
+        __getstate__ = dumps
+        __setstate__ = loads
+
+    # ------------------------------------------------------------------ #
+    # matplotlib plumbing
+    # ------------------------------------------------------------------ #
+
+    def _qt():
+        try:
+            from PySide import QtCore, QtWidgets
+        except ImportError:
+            from PySide import QtCore
+            from PySide import QtGui as QtWidgets
+        return QtCore, QtWidgets
+
+    def _mpl():
+        """Import matplotlib's Qt6 backend, returning (FigureCanvas, Toolbar,
+        Figure). Raises on failure so callers can show an error dialog."""
+        os.environ.setdefault("QT_API", "pyside6")
+        import matplotlib
+        try:
+            matplotlib.use("QtAgg", force=False)
+        except Exception:
+            pass
+        from matplotlib.backends.backend_qtagg import (
+            FigureCanvasQTAgg, NavigationToolbar2QT,
+        )
+        from matplotlib.figure import Figure
+        return FigureCanvasQTAgg, NavigationToolbar2QT, Figure
+
+    def _load_array(workdir, key):
+        """Return the named array from ``<workdir>/results.npz`` (or None)."""
+        import numpy as np
+        try:
+            data = np.load(os.path.join(workdir, "results.npz"))
+            return data[key] if key in data.files else None
+        except Exception:
+            return None
+
+    def _make_window(title):
+        """Create a non-modal plot window with an embedded matplotlib canvas.
+
+        Returns (dialog, figure, vbox_layout) -- the caller adds extra controls
+        to the layout. Returns ``None`` if matplotlib could not be loaded.
+        """
+        _QtCore, QtWidgets = _qt()
+        try:
+            FigureCanvas, NavToolbar, Figure = _mpl()
+        except Exception as exc:
+            QtWidgets.QMessageBox.critical(
+                Gui.getMainWindow(), "Wavesim Results",
+                "Could not load matplotlib for plotting:\n{}".format(exc),
+            )
+            return None
+
+        dialog = QtWidgets.QDialog(Gui.getMainWindow())
+        dialog.setWindowTitle(title)
+        dialog.setWindowFlags(_QtCore.Qt.Window)
+        dialog.resize(640, 480)
+        # Destroy the C++ object on close so it (and its figure/canvas/timer) is
+        # freed rather than lingering as a hidden child of the main window.
+        dialog.setAttribute(_QtCore.Qt.WA_DeleteOnClose, True)
+        layout = QtWidgets.QVBoxLayout(dialog)
+
+        figure = Figure(figsize=(6, 4.5), tight_layout=True)
+        canvas = FigureCanvas(figure)
+        toolbar = NavToolbar(canvas, dialog)
+        layout.addWidget(toolbar)
+        layout.addWidget(canvas)
+
+        dialog._figure = figure   # keep refs on the dialog
+        dialog._canvas = canvas
+        dialog._timer = None      # set by the snapshot animator, if any
+        # Stop the timer / release the figure when the window is closed.
+        dialog.finished.connect(lambda _result, d=dialog: _cleanup_window(d))
+        return dialog, figure, layout
+
+    def _time_unit(obj):
+        return units.get_time_unit(active_simulation(obj.Document))
+
+    # ------------------------------------------------------------------ #
+    # Per-kind plotters
+    # ------------------------------------------------------------------ #
+
+    def open_result(obj):
+        """Dispatch a result leaf to its plot window by ResultKind."""
+        kind = str(getattr(obj, "ResultKind", ""))
+        try:
+            if kind == _KIND_ENERGY:
+                _plot_energy(obj)
+            elif kind == _KIND_PROBE:
+                _plot_probe(obj)
+            elif kind == _KIND_SNAPSHOT:
+                _plot_snapshot(obj)
+            else:
+                FreeCAD.Console.PrintWarning(
+                    "Wavesim: unknown result kind '{}'.\n".format(kind)
+                )
+        except Exception as exc:
+            _QtCore, QtWidgets = _qt()
+            FreeCAD.Console.PrintError(
+                "Wavesim: failed to plot result: {}\n".format(exc)
+            )
+            QtWidgets.QMessageBox.critical(
+                Gui.getMainWindow(), "Wavesim Results",
+                "Could not plot this result:\n{}".format(exc),
+            )
+
+    def _missing(obj):
+        _QtCore, QtWidgets = _qt()
+        QtWidgets.QMessageBox.warning(
+            Gui.getMainWindow(), "Wavesim Results",
+            "The result data is missing. The run output may have been moved "
+            "or deleted:\n{}".format(getattr(obj, "ResultsDir", "?")),
+        )
+
+    def _plot_energy(obj):
+        workdir = str(obj.ResultsDir)
+        times = _load_array(workdir, "energy_times")
+        values = _load_array(workdir, "energy_values")
+        if times is None or values is None:
+            _missing(obj)
+            return
+        unit = _time_unit(obj)
+        t = [units.time_from_si(float(v), unit) for v in times]
+
+        made = _make_window("Wavesim Results - Energy")
+        if made is None:
+            return
+        dialog, figure, _layout = made
+        ax = figure.add_subplot(111)
+        ax.plot(t, values, color="#d65a00")
+        ax.set_xlabel("time ({})".format(unit))
+        ax.set_ylabel("total energy")
+        ax.set_title("Total domain energy")
+        ax.grid(True, alpha=0.3)
+        dialog._canvas.draw()
+        dialog.show()
+        _register_window(dialog)
+
+    def _plot_probe(obj):
+        workdir = str(obj.ResultsDir)
+        key = str(obj.DataKey)
+        times = _load_array(workdir, key + "_times")
+        values = _load_array(workdir, key + "_values")
+        if times is None or values is None:
+            _missing(obj)
+            return
+        unit = _time_unit(obj)
+        comp = str(getattr(obj, "Component", "")) or "field"
+        t = [units.time_from_si(float(v), unit) for v in times]
+
+        made = _make_window("Wavesim Results - {}".format(obj.Label))
+        if made is None:
+            return
+        dialog, figure, _layout = made
+        ax = figure.add_subplot(111)
+        ax.plot(t, values, color="#1f77b4")
+        ax.set_xlabel("time ({})".format(unit))
+        ax.set_ylabel(comp)
+        ax.set_title("Probe: {} vs. time".format(comp))
+        ax.grid(True, alpha=0.3)
+        dialog._canvas.draw()
+        dialog.show()
+        _register_window(dialog)
+
+    def _plot_snapshot(obj):
+        import numpy as np
+
+        workdir = str(obj.ResultsDir)
+        key = str(obj.DataKey)
+        frames = _load_array(workdir, key + "_data")
+        times = _load_array(workdir, key + "_times")
+        if frames is None or len(frames) == 0:
+            _missing(obj)
+            return
+
+        unit = _time_unit(obj)
+        comp = str(getattr(obj, "Component", "")) or "field"
+        is_magnitude = comp.startswith("|") or comp.startswith("∣")
+
+        # Physical extent / axis labels (fall back to cell indices).
+        size = getattr(obj, "InPlaneSize", None)
+        if size is not None and size.x > 0 and size.y > 0:
+            extent = [0.0, float(size.x), 0.0, float(size.y)]
+            xlabel = "{} (mm)".format(getattr(obj, "AxisX", "x"))
+            ylabel = "{} (mm)".format(getattr(obj, "AxisY", "y"))
+        else:
+            extent = None
+            xlabel, ylabel = "cell i", "cell j"
+
+        # Symmetric colour scale for signed fields (RdBu_r); 0..max for
+        # magnitudes (inferno). Log scaling mirrors wavesim's animate_snapshots:
+        # SymLogNorm for signed fields (linear within +/-vmax/1e3, log beyond),
+        # LogNorm for magnitudes.
+        from matplotlib import colors as mcolors
+
+        vmax = float(np.nanmax(np.abs(frames))) or 1.0
+        cmap = "inferno" if is_magnitude else "RdBu_r"
+        linthresh = vmax / 1e3
+
+        def _make_norm(log):
+            if is_magnitude:
+                if log:
+                    return mcolors.LogNorm(vmin=linthresh, vmax=vmax)
+                return mcolors.Normalize(vmin=0.0, vmax=vmax)
+            if log:
+                return mcolors.SymLogNorm(
+                    linthresh=linthresh, vmin=-vmax, vmax=vmax,
+                )
+            return mcolors.Normalize(vmin=-vmax, vmax=vmax)
+
+        made = _make_window("Wavesim Results - {}".format(obj.Label))
+        if made is None:
+            return
+        dialog, figure, layout = made
+        _QtCore, QtWidgets = _qt()
+
+        ax = figure.add_subplot(111)
+        # frames[f] has shape (axis1, axis2); show axis1 horizontal, axis2
+        # vertical with a lower-left origin.
+        # Equal aspect so a square physical extent (e.g. 0..50 mm on both axes)
+        # renders square rather than being stretched to fill the axes.
+        image = ax.imshow(
+            np.asarray(frames[0]).T, origin="lower", extent=extent,
+            cmap=cmap, norm=_make_norm(False), aspect="equal",
+        )
+        figure.colorbar(image, ax=ax, label=comp)
+        ax.set_xlabel(xlabel)
+        ax.set_ylabel(ylabel)
+
+        plane = str(getattr(obj, "Plane", ""))
+        off = float(obj.Offset.Value) if hasattr(obj, "Offset") else 0.0
+        suffix = " ({} @ {:g} mm)".format(plane, off) if plane else ""
+
+        def _frame_time(idx):
+            if times is not None and idx < len(times):
+                return units.time_from_si(float(times[idx]), unit)
+            return float("nan")
+
+        def _set_title(idx):
+            ax.set_title("{}{}\nframe {}/{}  t = {:.4g} {}".format(
+                comp, suffix, idx + 1, len(frames), _frame_time(idx), unit,
+            ))
+
+        _set_title(0)
+        dialog._canvas.draw()
+
+        # --- frame controls: slider + Play + log-scale toggle ------------- #
+        controls = QtWidgets.QHBoxLayout()
+        play = QtWidgets.QPushButton("Play")
+        play.setCheckable(True)
+        slider = QtWidgets.QSlider(_QtCore.Qt.Horizontal)
+        slider.setRange(0, len(frames) - 1)
+        log_check = QtWidgets.QCheckBox("Log scale")
+        controls.addWidget(play)
+        controls.addWidget(slider, 1)
+        controls.addWidget(log_check)
+        layout.addLayout(controls)
+
+        def on_log(checked):
+            image.set_norm(_make_norm(bool(checked)))
+            dialog._canvas.draw_idle()
+
+        log_check.toggled.connect(on_log)
+
+        def show_frame(idx):
+            idx = max(0, min(int(idx), len(frames) - 1))
+            image.set_data(np.asarray(frames[idx]).T)
+            _set_title(idx)
+            dialog._canvas.draw_idle()
+
+        slider.valueChanged.connect(show_frame)
+
+        timer = _QtCore.QTimer(dialog)
+        timer.setInterval(100)  # ms between frames
+
+        def advance():
+            nxt = (slider.value() + 1) % len(frames)
+            slider.setValue(nxt)
+
+        timer.timeout.connect(advance)
+
+        def on_play(checked):
+            play.setText("Pause" if checked else "Play")
+            if checked:
+                timer.start()
+            else:
+                timer.stop()
+
+        play.toggled.connect(on_play)
+        dialog._timer = timer  # keep the timer alive with the dialog
+
+        dialog.show()
+        _register_window(dialog)

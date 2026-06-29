@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="UTF-8" standalone="no"?>
+<!-- Placeholder Wavesim workbench icon. Replace with the real artwork later. -->
+<svg xmlns="http://www.w3.org/2000/svg" width="64" height="64" viewBox="0 0 64 64">
+  <rect x="2" y="2" width="60" height="60" rx="10" ry="10"
+        fill="#1b3a5b" stroke="#7fb3ff" stroke-width="2"/>
+  <path d="M6 32 q6.5 -18 13 0 t13 0 t13 0 t13 0"
+        fill="none" stroke="#7fb3ff" stroke-width="3"
+        stroke-linecap="round" stroke-linejoin="round"/>
+  <text x="32" y="54" text-anchor="middle"
+        font-family="sans-serif" font-size="11" font-weight="bold"
+        fill="#cfe2ff">WS</text>
+</svg>

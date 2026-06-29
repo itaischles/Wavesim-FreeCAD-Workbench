@@ -1,0 +1,447 @@
+# -*- coding: utf-8 -*-
+"""Geometry voxelisation and job-from-document building (FreeCAD side).
+
+Session 3 replaces the hardcoded Session-2 material box with real CAD geometry.
+:func:`voxelize_materials` samples each Material's bodies onto a regular grid
+(one ``Shape.isInside`` test per cell centre) to fill the per-cell ``eps``/``mu``
+arrays and ``pec_mask`` the solver consumes via ``set_material_arrays``.
+:func:`build_job_from_document` derives a grid that bounds all material bodies,
+voxelises into it, and returns a job spec plus the arrays to write as
+``materials.npz``. Each future array-input concern (e.g. deferred array sources)
+gets its own descriptively-named ``.npz`` rather than growing this one.
+
+This module is FreeCAD-side: it uses ``Part``/``Shape`` (FreeCAD's bundled
+``numpy`` for the arrays) and is **not** importable by the solver Python.
+
+Coordinate convention
+---------------------
+The solver grid has its origin at cell (0, 0, 0) == physical (0, 0, 0) and maps
+a position to a cell by ``round(coord / d)`` (see ``grid.position_to_index``).
+The voxel arrays already bake in the domain origin (cell ``i`` samples world
+point ``origin + (i + 0.5)·d``), so the runner never needs the origin. Only
+point-like inputs (the source) are emitted in the solver frame — i.e. measured
+from the domain origin, not FreeCAD world coordinates.
+
+Units: FreeCAD geometry is in millimetres; the job/solver work in metres. All
+``*_m`` quantities are metres; voxelisation runs in mm and converts at the end.
+
+NOTE: this first version is intentionally simple and may be slow on fine grids
+(a Python ``isInside`` loop per cell). Flagged for later optimisation.
+"""
+
+import math
+
+import FreeCAD
+
+# Forward-slash JSON paths and mm->m conversion are the only unit handling here.
+_MM_PER_M = 1000.0
+
+
+class GridRequiredError(Exception):
+    """Raised when materials are assigned but no Grid object exists.
+
+    There is deliberately no default cell size: the run is refused so the user
+    must create a Grid (Wavesim -> Create Grid) and choose the cell sizes
+    explicitly before any voxelisation happens.
+    """
+
+
+def _gather(materials):
+    """Return ``[(shape_mm, eps, mu, pec), ...]`` for every assigned body.
+
+    One entry per body (a material with several bodies contributes several
+    entries sharing its parameters). Bodies without a solid shape are skipped.
+    """
+    entries = []
+    for mat in materials:
+        eps = float(getattr(mat, "Eps", 1.0))
+        mu = float(getattr(mat, "Mu", 1.0))
+        pec = bool(getattr(mat, "Pec", False))
+        for body in getattr(mat, "Bodies", []) or []:
+            shape = getattr(body, "Shape", None)
+            if shape is None or not getattr(shape, "Solids", None):
+                continue
+            entries.append((shape, eps, mu, pec))
+    return entries
+
+
+def _combined_bbox(entries):
+    """Union BoundBox (mm) of all entry shapes, or ``None`` if there are none."""
+    bbox = None
+    for shape, _eps, _mu, _pec in entries:
+        bb = shape.BoundBox
+        if bbox is None:
+            bbox = FreeCAD.BoundBox(bb)
+        else:
+            bbox.add(bb)
+    return bbox
+
+
+def materials_bbox_mm(materials):
+    """Union BoundBox (mm) of all solid bodies on *materials*, or ``None``."""
+    return _combined_bbox(_gather(materials))
+
+
+_AXIS_IDX = {"x": 0, "y": 1, "z": 2}
+
+
+def _expand_bbox_points(bbox, points_mm):
+    """Grow *bbox* (mm, possibly ``None``) to include each ``(x, y, z)`` point."""
+    for p in points_mm:
+        v = FreeCAD.Vector(p[0], p[1], p[2])
+        if bbox is None:
+            bbox = FreeCAD.BoundBox(v.x, v.y, v.z, v.x, v.y, v.z)
+        else:
+            bbox.add(v)
+    return bbox
+
+
+def _expand_bbox_axis(bbox, axis_offsets_mm):
+    """Grow *bbox* along single axes to include each ``(axis, value_mm)``.
+
+    Unlike a point, a snapshot slice only constrains its normal axis (its
+    in-plane extent already follows the domain), so each offset extends *bbox*
+    on one axis only. A no-op when *bbox* is ``None`` (nothing else to bound it).
+    """
+    if bbox is None:
+        return bbox
+    for axis, value in axis_offsets_mm:
+        c = bbox.Center
+        p = [c.x, c.y, c.z]
+        p[_AXIS_IDX[axis]] = value
+        bbox.add(FreeCAD.Vector(*p))
+    return bbox
+
+
+def source_points_mm(sim):
+    """World-mm positions of every point source under *sim* (empty if none)."""
+    if sim is None:
+        return []
+    from wavesim_gui import source as source_mod
+
+    pts = []
+    for src in source_mod.find_sources(sim):
+        pos = src.Position
+        pts.append((pos.x, pos.y, pos.z))
+    return pts
+
+
+def snapshot_axis_offsets(sim):
+    """``[(axis, offset_mm), ...]`` of every snapshot slice under *sim*."""
+    if sim is None:
+        return []
+    from wavesim_gui import monitors as monitors_mod
+
+    return monitors_mod.snapshot_axis_offsets(sim)
+
+
+def combined_bbox_mm(sim, materials):
+    """Material union-bbox (mm) grown to include sources and snapshot slices.
+
+    The domain auto-sizes to this combined box, so a source or snapshot slice
+    placed outside the material bounds (or in the PML) enlarges the domain to
+    contain it. Returns ``None`` when there is nothing to bound.
+    """
+    bbox = materials_bbox_mm(materials)
+    bbox = _expand_bbox_points(bbox, source_points_mm(sim))
+    bbox = _expand_bbox_axis(bbox, snapshot_axis_offsets(sim))
+    return bbox
+
+
+def _grid_extent(bbox, cell_mm, spacing_mm, pad_lo, pad_hi):
+    """Per-axis ``(counts, origin_mm)`` for the given sizing.
+
+    The inner region is the material bounds grown by ``spacing_mm`` on every
+    side and rounded up to whole cells; ``pad_lo``/``pad_hi`` add the per-side
+    PML cells outside that. The origin is the min corner of the *padded* grid.
+    """
+    exts = (bbox.XLength, bbox.YLength, bbox.ZLength)
+    mins = (bbox.XMin, bbox.YMin, bbox.ZMin)
+    counts = []
+    origin = []
+    for a in range(3):
+        inner = max(1, int(math.ceil((exts[a] + 2.0 * spacing_mm) / cell_mm[a])))
+        counts.append(inner + int(pad_lo[a]) + int(pad_hi[a]))
+        origin.append(mins[a] - spacing_mm - int(pad_lo[a]) * cell_mm[a])
+    return tuple(counts), tuple(origin)
+
+
+def _sizing_for(sim, default_padding):
+    """Resolve ``(spacing_m, pad_lo, pad_hi, domain)`` for *sim*.
+
+    Uses the Domain object's spacing and per-face PML padding when one exists;
+    otherwise falls back to the legacy uniform ``default_padding`` cells on every
+    side with no air spacing (so a document without a domain runs as before).
+    """
+    from wavesim_gui import domain as domain_mod
+
+    dom = domain_mod.find_domain(sim) if sim else None
+    if dom is not None:
+        p = domain_mod.domain_grid_params(dom)
+        return p["spacing_m"], p["pad_lo"], p["pad_hi"], dom
+    pad = (default_padding, default_padding, default_padding)
+    return 0.0, pad, pad, None
+
+
+def derive_grid_dims(sim, cell_size_m, padding_cells=8):
+    """Cheap (bbox-only) grid dims for the given cell sizes; no voxelisation.
+
+    Returns ``{Nx, Ny, Nz, dx, dy, dz}`` (spacings in metres) or ``None`` if the
+    simulation has no material-assigned geometry yet. Used by the Grid object to
+    show derived cell counts without paying for a full ``isInside`` sweep.
+    """
+    from wavesim_gui import materials as materials_mod
+
+    if sim is None:
+        return None
+    bbox = combined_bbox_mm(sim, materials_mod.find_materials(sim))
+    if bbox is None:
+        return None
+    spacing_m, pad_lo, pad_hi, _dom = _sizing_for(sim, padding_cells)
+    cell_mm = tuple(c * _MM_PER_M for c in cell_size_m)
+    (Nx, Ny, Nz), _origin = _grid_extent(
+        bbox, cell_mm, spacing_m * _MM_PER_M, pad_lo, pad_hi
+    )
+    return {
+        "Nx": Nx, "Ny": Ny, "Nz": Nz,
+        "dx": cell_size_m[0], "dy": cell_size_m[1], "dz": cell_size_m[2],
+    }
+
+
+def voxelize_materials(materials, cell_size_m, spacing_m=0.0,
+                       pad_lo=(8, 8, 8), pad_hi=(8, 8, 8),
+                       extra_points_mm=(), extra_axis_offsets=(),
+                       max_total_cells=4_000_000):
+    """Voxelise *materials* onto a regular grid bounding all their bodies.
+
+    Parameters
+    ----------
+    materials : list
+        Material document objects (see :mod:`wavesim_gui.materials`).
+    cell_size_m : tuple
+        ``(dx, dy, dz)`` cell sizes in metres, taken from the Grid object. There
+        is intentionally no auto-chosen default: the cell size is a deliberate
+        user decision, so the caller must supply one (see
+        :func:`build_job_from_document`, which refuses to run without a Grid).
+    spacing_m : float
+        Air gap (metres) added around the material bounds on every side, before
+        any PML padding. From the Domain object's ``Spacing`` (0 with no domain).
+    pad_lo, pad_hi : tuple of int
+        Per-axis PML padding in cells on the low/high side of x, y, z. From the
+        Domain's per-face boundary settings; the legacy default is 8 cells all
+        round (room for PML when no domain has been defined yet).
+    extra_points_mm : iterable of (x, y, z)
+        Extra world-mm points the grid must contain (the source positions). The
+        bounding box is grown to include them so a source outside the material
+        bounds still lands inside the grid, matching the auto-enlarged domain.
+    extra_axis_offsets : iterable of (axis, value_mm)
+        Single-axis constraints the grid must contain (snapshot slice offsets,
+        which only bound their normal axis). Grows the box on that axis only.
+    max_total_cells : int
+        Guard against an accidentally huge grid; raises ``ValueError`` above it.
+
+    Returns
+    -------
+    dict
+        ``arrays``  : the six ``eps``/``mu`` arrays + ``pec_mask`` (numpy).
+        ``grid``    : ``{Nx, Ny, Nz, dx, dy, dz}`` with spacings in metres.
+        ``origin_m``: domain min corner in FreeCAD world metres.
+        ``counts``  : ``{dielectric_cells, pec_cells}`` for a quick sanity check.
+    """
+    import numpy as np
+
+    entries = _gather(materials)
+    if not entries:
+        raise ValueError("No solid bodies are assigned to any material.")
+
+    bbox = _expand_bbox_points(_combined_bbox(entries), extra_points_mm)
+    bbox = _expand_bbox_axis(bbox, extra_axis_offsets)
+    dx_mm, dy_mm, dz_mm = (c * _MM_PER_M for c in cell_size_m)
+    cell_mm = (dx_mm, dy_mm, dz_mm)
+
+    (Nx, Ny, Nz), (ox, oy, oz) = _grid_extent(
+        bbox, cell_mm, spacing_m * _MM_PER_M, pad_lo, pad_hi
+    )
+    total = Nx * Ny * Nz
+    if total > max_total_cells:
+        raise ValueError(
+            "Voxel grid too large: {}x{}x{} = {:,} cells (limit {:,}). "
+            "Use a coarser grid or smaller geometry.".format(
+                Nx, Ny, Nz, total, max_total_cells
+            )
+        )
+
+    shape = (Nx, Ny, Nz)
+    eps_arr = np.ones(shape, dtype=np.float64)
+    mu_arr = np.ones(shape, dtype=np.float64)
+    pec_mask = np.zeros(shape, dtype=bool)
+
+    Vector = FreeCAD.Vector
+    tol = min(dx_mm, dy_mm, dz_mm) * 1.0e-6
+
+    # Cell-centre world coordinates (mm) along each axis, precomputed.
+    xs = [ox + (i + 0.5) * dx_mm for i in range(Nx)]
+    ys = [oy + (j + 0.5) * dy_mm for j in range(Ny)]
+    zs = [oz + (k + 0.5) * dz_mm for k in range(Nz)]
+
+    def cell_range(lo, hi, axis_coords):
+        """Indices of cell centres falling within [lo, hi] (a shape's bbox)."""
+        return [idx for idx, c in enumerate(axis_coords) if lo <= c <= hi]
+
+    for body_shape, eps, mu, pec in entries:
+        bb = body_shape.BoundBox
+        # Only test cells whose centre lies inside this body's bounding box.
+        i_idx = cell_range(bb.XMin, bb.XMax, xs)
+        j_idx = cell_range(bb.YMin, bb.YMax, ys)
+        k_idx = cell_range(bb.ZMin, bb.ZMax, zs)
+        for i in i_idx:
+            x = xs[i]
+            for j in j_idx:
+                y = ys[j]
+                for k in k_idx:
+                    if body_shape.isInside(Vector(x, y, zs[k]), tol, True):
+                        if pec:
+                            pec_mask[i, j, k] = True
+                        else:
+                            eps_arr[i, j, k] = eps
+                            mu_arr[i, j, k] = mu
+
+    arrays = {
+        "eps_x": eps_arr, "eps_y": eps_arr.copy(), "eps_z": eps_arr.copy(),
+        "mu_x": mu_arr, "mu_y": mu_arr.copy(), "mu_z": mu_arr.copy(),
+        "pec_mask": pec_mask,
+    }
+    return {
+        "arrays": arrays,
+        "grid": {
+            "Nx": Nx, "Ny": Ny, "Nz": Nz,
+            "dx": dx_mm / _MM_PER_M,
+            "dy": dy_mm / _MM_PER_M,
+            "dz": dz_mm / _MM_PER_M,
+        },
+        "origin_m": (ox / _MM_PER_M, oy / _MM_PER_M, oz / _MM_PER_M),
+        "counts": {
+            "dielectric_cells": int(np.count_nonzero(eps_arr != 1.0)),
+            "pec_cells": int(np.count_nonzero(pec_mask)),
+        },
+    }
+
+
+def write_materials(workdir, arrays):
+    """Save the voxelised material *arrays* to ``<workdir>/materials.npz``."""
+    import os
+
+    import numpy as np
+
+    np.savez(os.path.join(workdir, "materials.npz"), **arrays)
+
+
+def build_job_from_document(doc, steps=None, fmax=30.0e9):
+    """Build a solver job from the active simulation's materials.
+
+    Returns ``(spec, arrays)`` where *spec* is the ``job.json`` dict and *arrays*
+    is the voxelised material dict to write as ``materials.npz`` -- or ``(None, None)``
+    if there is no simulation or no material-assigned geometry, so the caller can
+    fall back to the Session-2 demo box.
+
+    Raises :class:`GridRequiredError` if materials are assigned but no Domain
+    object exists (it should always exist, created with the simulation).
+    """
+    from wavesim_gui.commands import active_simulation
+    from wavesim_gui import materials as materials_mod
+    from wavesim_gui import domain as domain_mod
+
+    sim = active_simulation(doc)
+    if sim is None:
+        return None, None
+    materials = materials_mod.find_materials(sim)
+    if not materials:
+        return None, None
+
+    # The domain (cell sizes + boundaries) is created with the simulation; its
+    # absence means a malformed document rather than something to guess around.
+    dom = domain_mod.find_domain(sim)
+    if dom is None:
+        raise GridRequiredError(
+            "Materials are assigned but the simulation has no Domain object. "
+            "Re-create the simulation (Wavesim -> New Simulation)."
+        )
+    cell_size_m = domain_mod.cell_sizes_m(dom)
+
+    # Number of time steps: derived from the simulation's maximum time and the
+    # CFL step, unless an explicit count was passed. Fall back to a fixed count
+    # for older documents that predate the MaxTime setting.
+    if steps is None:
+        max_time_s = float(getattr(sim, "MaxTime", 0.0))
+        steps = domain_mod.time_steps_for(dom, max_time_s) or 800
+
+    spacing_m, pad_lo, pad_hi, _dom = _sizing_for(sim, 8)
+    # Grow the grid to include every source position and snapshot slice, so an
+    # input outside the material bounds (or in the PML) still lands inside it.
+    vox = voxelize_materials(
+        materials, cell_size_m, spacing_m=spacing_m, pad_lo=pad_lo, pad_hi=pad_hi,
+        extra_points_mm=source_points_mm(sim),
+        extra_axis_offsets=snapshot_axis_offsets(sim),
+    )
+    grid = vox["grid"]
+    Nx, Ny, Nz = grid["Nx"], grid["Ny"], grid["Nz"]
+    dx, dy, dz = grid["dx"], grid["dy"], grid["dz"]
+    origin_m = vox["origin_m"]
+
+    # Source: the user-defined point source (Session 6), converted to the solver
+    # frame (the domain origin is already baked into the voxel arrays). With no
+    # source defined, fall back to a centre Gaussian pulse so the run still works.
+    from wavesim_gui import source as source_mod
+
+    sources = source_mod.find_sources(sim)
+    if sources:
+        source = source_mod.source_spec(sources[0], origin_m)
+    else:
+        source = {
+            "component": "Ez",
+            "x": (Nx // 2) * dx, "y": (Ny // 2) * dy, "z": (Nz // 2) * dz,
+            "fmax": fmax,
+            "amplitude": 1.0,
+        }
+
+    # Boundary: from the Domain's per-face settings when one exists, else the
+    # legacy auto heuristic (in-plane faces for a thin domain, all six otherwise;
+    # no PEC walls).
+    if dom is not None:
+        from wavesim_gui import domain as domain_mod
+
+        p = domain_mod.domain_grid_params(dom)
+        pml_faces = p["pml_faces"]
+        pec_faces = p["pec_faces"]
+        d_pml = p["d_pml"]
+    else:
+        if Nz == 1:
+            pml_faces = ["x0", "x1", "y0", "y1"]
+        else:
+            pml_faces = ["x0", "x1", "y0", "y1", "z0", "z1"]
+        pec_faces = []
+        # PML thickness: scale gently with the in-plane size, clamped to a sane
+        # band and never thicker than a quarter of the smallest absorbing axis.
+        d_pml = max(4, min(10, min(Nx, Ny) // 6))
+        d_pml = min(d_pml, min(Nx, Ny) // 4)
+
+    # Monitors: the user-defined probes/snapshots/energy (Session 7), converted to
+    # the solver frame. With none defined this still yields the always-on energy
+    # diagnostic, so a bare sim behaves as in earlier sessions.
+    from wavesim_gui import monitors as monitors_mod
+
+    monitors = monitors_mod.monitors_spec(sim, origin_m)
+
+    spec = {
+        "backend": "numba",
+        "steps": int(steps),
+        "grid": grid,
+        "boundary": {
+            "d_pml": int(d_pml),
+            "faces": pml_faces,
+            "pec_faces": pec_faces,
+        },
+        "source": source,
+        "monitors": monitors,
+    }
+    return spec, vox["arrays"]

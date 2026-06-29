@@ -3,8 +3,10 @@
 
 Session 3 replaces the hardcoded Session-2 material box with real CAD geometry.
 :func:`voxelize_materials` samples each Material's bodies onto a regular grid
-(one ``Shape.isInside`` test per cell centre) to fill the per-cell ``eps``/``mu``
-arrays and ``pec_mask`` the solver consumes via ``set_material_arrays``.
+(one planar ``Shape.slice`` per Z-layer, then a vectorised point-in-polygon test
+of that cross-section over the layer's cell centres) to fill the per-cell
+``eps``/``mu`` arrays and ``pec_mask`` the solver consumes via
+``set_material_arrays``.
 :func:`build_job_from_document` derives a grid that bounds all material bodies,
 voxelises into it, and returns a job spec plus the arrays to write as
 ``materials.npz``. Each future array-input concern (e.g. deferred array sources)
@@ -25,8 +27,10 @@ from the domain origin, not FreeCAD world coordinates.
 Units: FreeCAD geometry is in millimetres; the job/solver work in metres. All
 ``*_m`` quantities are metres; voxelisation runs in mm and converts at the end.
 
-NOTE: this first version is intentionally simple and may be slow on fine grids
-(a Python ``isInside`` loop per cell). Flagged for later optimisation.
+The voxeliser works layer by layer: one OCC planar section per Z cell-plane,
+then matplotlib's vectorised point-in-polygon over that layer's cell centres
+(matplotlib + numpy are both in FreeCAD's bundled Python). This replaces the
+original ``isInside``-per-cell sweep, which was O(N^3) BREP point queries.
 """
 
 import math
@@ -49,8 +53,8 @@ class GridRequiredError(Exception):
 class VoxelizationCancelled(Exception):
     """Raised when a voxelisation ``progress`` callback requests cancellation.
 
-    The ``isInside``-per-cell sweep runs on the GUI thread and can be slow on
-    fine grids; a caller showing a progress dialog returns truthy from the
+    The section sweep runs on the GUI thread and can still be slow on fine grids
+    with many bodies; a caller showing a progress dialog returns truthy from the
     callback to abort, which surfaces here so the caller can clean up.
     """
 
@@ -217,6 +221,41 @@ def derive_grid_dims(sim, cell_size_m, padding_cells=8):
     }
 
 
+def _layer_inside(body_shape, z_axis, z, pts, deflection):
+    """Boolean mask of which *pts* (XY, mm) lie inside *body_shape* at height *z*.
+
+    Cuts the body with the horizontal plane at *z* -- one OCC section per layer
+    instead of one ``isInside`` per cell -- turns each cross-section wire into a
+    polygon (curved edges discretised to chord tolerance *deflection*), and tests
+    every point at once with matplotlib. XOR-ing the wires applies the even-odd
+    rule, which carves holes and handles solids nested inside holes. Returns
+    ``None`` when the plane misses the solid (no section wires), so the caller can
+    leave that whole layer empty.
+    """
+    import numpy as np
+    from matplotlib.path import Path
+
+    try:
+        wires = body_shape.slice(z_axis, z)
+    except Exception:
+        return None
+    if not wires:
+        return None
+    inside = np.zeros(len(pts), dtype=bool)
+    any_wire = False
+    for w in wires:
+        try:
+            verts = w.discretize(Deflection=deflection)
+        except Exception:
+            continue
+        if len(verts) < 3:
+            continue
+        poly = np.array([(v.x, v.y) for v in verts])
+        inside ^= Path(poly).contains_points(pts)
+        any_wire = True
+    return inside if any_wire else None
+
+
 def voxelize_materials(materials, cell_size_m, spacing_m=0.0,
                        pad_lo=(8, 8, 8), pad_hi=(8, 8, 8),
                        extra_points_mm=(), extra_axis_offsets=(),
@@ -249,9 +288,9 @@ def voxelize_materials(materials, cell_size_m, spacing_m=0.0,
     max_total_cells : int
         Guard against an accidentally huge grid; raises ``ValueError`` above it.
     progress : callable, optional
-        ``progress(done, total)`` called periodically during the (slow)
-        ``isInside`` sweep, where the units are body cell-columns processed.
-        Return truthy to abort, which raises :class:`VoxelizationCancelled`.
+        ``progress(done, total)`` called after each Z-layer of the section sweep,
+        where the units are body cross-section planes processed. Return truthy to
+        abort, which raises :class:`VoxelizationCancelled`.
 
     Returns
     -------
@@ -289,23 +328,27 @@ def voxelize_materials(materials, cell_size_m, spacing_m=0.0,
     mu_arr = np.ones(shape, dtype=np.float64)
     pec_mask = np.zeros(shape, dtype=bool)
 
-    Vector = FreeCAD.Vector
+    Z_AXIS = FreeCAD.Vector(0.0, 0.0, 1.0)
     tol = min(dx_mm, dy_mm, dz_mm) * 1.0e-6
+    # Chord tolerance for turning curved section edges into polygons: a quarter
+    # of the smallest in-plane cell, so the polygon tracks curves to well below
+    # cell resolution (never below the geometric tolerance).
+    deflection = max(min(dx_mm, dy_mm) * 0.25, tol)
 
-    # Cell-centre world coordinates (mm) along each axis, precomputed.
-    xs = [ox + (i + 0.5) * dx_mm for i in range(Nx)]
-    ys = [oy + (j + 0.5) * dy_mm for j in range(Ny)]
-    zs = [oz + (k + 0.5) * dz_mm for k in range(Nz)]
+    # Cell-centre world coordinates (mm) along each axis, precomputed (numpy).
+    xs = ox + (np.arange(Nx) + 0.5) * dx_mm
+    ys = oy + (np.arange(Ny) + 0.5) * dy_mm
+    zs = oz + (np.arange(Nz) + 0.5) * dz_mm
 
     def cell_range(lo, hi, axis_coords):
         """Indices of cell centres falling within [lo, hi] (a shape's bbox)."""
-        return [idx for idx, c in enumerate(axis_coords) if lo <= c <= hi]
+        return np.nonzero((axis_coords >= lo) & (axis_coords <= hi))[0]
 
-    # Pre-plan each body's cell-index ranges so the total work (cell-columns to
-    # test) is known up front -- lets a caller show a determinate progress bar
-    # over the otherwise opaque, GUI-blocking isInside sweep.
+    # Pre-plan each body's cell-index ranges so the total work (section planes to
+    # sweep) is known up front -- lets a caller show a determinate progress bar
+    # over the otherwise opaque, GUI-blocking sweep.
     plans = []
-    total_cols = 0
+    total_layers = 0
     for body_shape, eps, mu, pec in entries:
         bb = body_shape.BoundBox
         # Only test cells whose centre lies inside this body's bounding box.
@@ -313,31 +356,33 @@ def voxelize_materials(materials, cell_size_m, spacing_m=0.0,
         j_idx = cell_range(bb.YMin, bb.YMax, ys)
         k_idx = cell_range(bb.ZMin, bb.ZMax, zs)
         plans.append((body_shape, eps, mu, pec, i_idx, j_idx, k_idx))
-        total_cols += len(i_idx) * len(j_idx)
+        total_layers += len(k_idx)
 
-    done_cols = 0
-    # Report ~200 times over the whole sweep (and always on the last column).
-    report_every = max(1, total_cols // 200)
+    done_layers = 0
     if progress is not None:
-        progress(0, total_cols)
+        progress(0, total_layers)
     for body_shape, eps, mu, pec, i_idx, j_idx, k_idx in plans:
-        for i in i_idx:
-            x = xs[i]
-            for j in j_idx:
-                y = ys[j]
-                for k in k_idx:
-                    if body_shape.isInside(Vector(x, y, zs[k]), tol, True):
-                        if pec:
-                            pec_mask[i, j, k] = True
-                        else:
-                            eps_arr[i, j, k] = eps
-                            mu_arr[i, j, k] = mu
-                done_cols += 1
-                if progress is not None and (
-                    done_cols % report_every == 0 or done_cols == total_cols
-                ):
-                    if progress(done_cols, total_cols):
-                        raise VoxelizationCancelled()
+        if len(i_idx) == 0 or len(j_idx) == 0 or len(k_idx) == 0:
+            continue
+        # XY cell centres for this body's bbox, flattened to an (M, 2) point list
+        # tested in a single vectorised call per Z-layer cross-section.
+        gx, gy = np.meshgrid(xs[i_idx], ys[j_idx], indexing="ij")
+        pts = np.column_stack([gx.ravel(), gy.ravel()])
+        shape2d = (len(i_idx), len(j_idx))
+        for k in k_idx:
+            inside = _layer_inside(body_shape, Z_AXIS, float(zs[k]),
+                                   pts, deflection)
+            if inside is not None and inside.any():
+                ii, jj = np.nonzero(inside.reshape(shape2d))
+                gi, gj = i_idx[ii], j_idx[jj]
+                if pec:
+                    pec_mask[gi, gj, k] = True
+                else:
+                    eps_arr[gi, gj, k] = eps
+                    mu_arr[gi, gj, k] = mu
+            done_layers += 1
+            if progress is not None and progress(done_layers, total_layers):
+                raise VoxelizationCancelled()
 
     arrays = {
         "eps_x": eps_arr, "eps_y": eps_arr.copy(), "eps_z": eps_arr.copy(),

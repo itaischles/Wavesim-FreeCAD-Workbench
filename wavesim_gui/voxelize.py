@@ -31,6 +31,11 @@ The voxeliser works layer by layer: one OCC planar section per Z cell-plane,
 then matplotlib's vectorised point-in-polygon over that layer's cell centres
 (matplotlib + numpy are both in FreeCAD's bundled Python). This replaces the
 original ``isInside``-per-cell sweep, which was O(N^3) BREP point queries.
+
+TEM ports need the guide to continue through the absorber, so after the sweep
+each port face's cross-section is extruded through its spacing + PML cells
+(:func:`_extrude_port_faces`); otherwise the conductors stop at the geometry and
+the mode re-reflects off the empty-vacuum PML behind the launch plane.
 """
 
 import math
@@ -256,10 +261,54 @@ def _layer_inside(body_shape, z_axis, z, pts, deflection):
     return inside if any_wire else None
 
 
+def _extrude_port_faces(arrays, port_faces):
+    """Make the material arrays invariant along each TEM port's normal axis.
+
+    For every face in *port_faces* (solver names ``'x0'``..``'z1'``) the
+    boundary-most material cross-section is copied outward across the air spacing
+    and PML cells, out to the grid edge. A waveguide mode is only guided where
+    its PEC cross-section is invariant along the propagation axis; without this
+    the conductors stop at the geometry and the PML behind a port plane is empty
+    vacuum, so the mode is unsupported there and partially re-reflects -- a port
+    that looks like a semi-open circuit. Only TEM-port faces are touched: their
+    cross-section is uniform by construction so the copy is exact, whereas doing
+    this on an arbitrary PML face could smear non-uniform geometry into the
+    absorber. Modifies *arrays* in place.
+    """
+    import numpy as np
+
+    axis_of = {"x": 0, "y": 1, "z": 2}
+    keys = ("eps_x", "eps_y", "eps_z", "mu_x", "mu_y", "mu_z", "pec_mask")
+    # A cell holds material if it is PEC or differs from vacuum eps/mu. Computed
+    # once from the original geometry so two ports on one axis both extrude the
+    # real cross-section rather than each other's fill.
+    present = arrays["pec_mask"].copy()
+    for key in ("eps_x", "eps_y", "eps_z", "mu_x", "mu_y", "mu_z"):
+        present |= arrays[key] != 1.0
+
+    for face in port_faces:
+        axis = axis_of.get(face[0])
+        if axis is None:
+            continue
+        is_high = face.endswith("1")
+        layers = present.any(axis=tuple(a for a in range(3) if a != axis))
+        filled = np.nonzero(layers)[0]
+        if filled.size == 0:
+            continue  # no geometry along this axis -- nothing to extrude
+        k = int(filled[-1] if is_high else filled[0])
+        sel = [slice(None)] * 3
+        sel[axis] = slice(k + 1, None) if is_high else slice(None, k)
+        src = [slice(None)] * 3
+        src[axis] = slice(k, k + 1)  # keep the axis (length 1) so it broadcasts
+        for key in keys:
+            arr = arrays[key]
+            arr[tuple(sel)] = arr[tuple(src)]
+
+
 def voxelize_materials(materials, cell_size_m, spacing_m=0.0,
                        pad_lo=(8, 8, 8), pad_hi=(8, 8, 8),
                        extra_points_mm=(), extra_axis_offsets=(),
-                       max_total_cells=4_000_000, progress=None):
+                       port_faces=(), max_total_cells=4_000_000, progress=None):
     """Voxelise *materials* onto a regular grid bounding all their bodies.
 
     Parameters
@@ -285,6 +334,11 @@ def voxelize_materials(materials, cell_size_m, spacing_m=0.0,
     extra_axis_offsets : iterable of (axis, value_mm)
         Single-axis constraints the grid must contain (snapshot slice offsets,
         which only bound their normal axis). Grows the box on that axis only.
+    port_faces : iterable of str
+        Solver face names (``'x0'``..``'z1'``) hosting a TEM port. Each port's
+        cross-section is extruded through the spacing + PML cells on that face
+        (see :func:`_extrude_port_faces`) so the guided mode exits the absorber
+        without re-reflecting. Empty for a run with no TEM ports.
     max_total_cells : int
         Guard against an accidentally huge grid; raises ``ValueError`` above it.
     progress : callable, optional
@@ -389,6 +443,10 @@ def voxelize_materials(materials, cell_size_m, spacing_m=0.0,
         "mu_x": mu_arr, "mu_y": mu_arr.copy(), "mu_z": mu_arr.copy(),
         "pec_mask": pec_mask,
     }
+    # Extend each TEM-port cross-section through its spacing + PML cells so a
+    # guided mode stays supported into the absorber (modifies arrays in place;
+    # done before the counts below so they reflect the extruded geometry).
+    _extrude_port_faces(arrays, port_faces)
     return {
         "arrays": arrays,
         "grid": {
@@ -453,13 +511,19 @@ def build_job_from_document(doc, steps=None, fmax=30.0e9, progress=None):
         max_time_s = float(getattr(sim, "MaxTime", 0.0))
         steps = domain_mod.time_steps_for(dom, max_time_s) or 800
 
+    from wavesim_gui import tem_source as tem_mod
+
     spacing_m, pad_lo, pad_hi, _dom = _sizing_for(sim, 8)
+    # TEM-port faces have their cross-section extruded through the spacing + PML
+    # so the guided mode exits the absorber without re-reflecting back inside.
+    port_faces = [str(t.Face) for t in tem_mod.find_tem_sources(sim)]
     # Grow the grid to include every source position and snapshot slice, so an
     # input outside the material bounds (or in the PML) still lands inside it.
     vox = voxelize_materials(
         materials, cell_size_m, spacing_m=spacing_m, pad_lo=pad_lo, pad_hi=pad_hi,
         extra_points_mm=source_points_mm(sim),
         extra_axis_offsets=snapshot_axis_offsets(sim),
+        port_faces=port_faces,
         progress=progress,
     )
     grid = vox["grid"]
@@ -473,7 +537,6 @@ def build_job_from_document(doc, steps=None, fmax=30.0e9, progress=None):
     # Gaussian pulse so a bare run still works; a TEM port is excitation enough,
     # so the fallback is skipped when one is present.
     from wavesim_gui import source as source_mod
-    from wavesim_gui import tem_source as tem_mod
 
     tem_sources = [tem_mod.tem_source_spec(t, origin_m)
                    for t in tem_mod.find_tem_sources(sim)]

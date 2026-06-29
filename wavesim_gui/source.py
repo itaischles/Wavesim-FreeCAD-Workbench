@@ -481,9 +481,9 @@ if _GUI_AVAILABLE:
         def GetResources(self):
             return {
                 "Pixmap": _SOURCE_ICON,
-                "MenuText": "Add Source",
-                "ToolTip": "Add a point source with a Gaussian-pulse excitation "
-                "to the simulation",
+                "MenuText": "Add Point Source",
+                "ToolTip": "Add a soft point source with a Gaussian-pulse "
+                "excitation to the simulation",
             }
 
         def Activated(self):

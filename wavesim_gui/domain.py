@@ -306,6 +306,43 @@ def domain_grid_params(domain):
     }
 
 
+# Face name -> the per-face boundary-condition property it controls.
+_FACE_TO_PROP = {face: prop for face, prop, _doc in _FACE_PROPS}
+
+
+def face_axis(face):
+    """The normal axis ('x'/'y'/'z') of a domain face name like ``'x0'``."""
+    return face[0]
+
+
+def face_is_high(face):
+    """True for the high-index face of its axis ('x1'/'y1'/'z1')."""
+    return face.endswith("1")
+
+
+def face_world_coord_mm(domain, face):
+    """World-mm coordinate of the *face* plane along its normal axis.
+
+    Uses the inner domain box corners (``DomainMin``/``DomainMax``), so a TEM
+    port placed on a PML face sits at the absorbing region's inner edge.
+    """
+    v = domain.DomainMax if face_is_high(face) else domain.DomainMin
+    return {"x": v.x, "y": v.y, "z": v.z}[face_axis(face)]
+
+
+def set_face_bc(domain, face, bc):
+    """Set the boundary condition (``'PML'``/``'PEC'``) on a single *face*.
+
+    A no-op for an unknown face name or a missing domain. The caller owns the
+    transaction/recompute (this only writes the property).
+    """
+    if domain is None:
+        return
+    prop = _FACE_TO_PROP.get(face)
+    if prop is not None and hasattr(domain, prop):
+        setattr(domain, prop, bc)
+
+
 def notify_materials_changed(doc):
     """Re-sync and recompute the Domain after the material set changes.
 

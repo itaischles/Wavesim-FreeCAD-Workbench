@@ -46,6 +46,15 @@ class GridRequiredError(Exception):
     """
 
 
+class VoxelizationCancelled(Exception):
+    """Raised when a voxelisation ``progress`` callback requests cancellation.
+
+    The ``isInside``-per-cell sweep runs on the GUI thread and can be slow on
+    fine grids; a caller showing a progress dialog returns truthy from the
+    callback to abort, which surfaces here so the caller can clean up.
+    """
+
+
 def _gather(materials):
     """Return ``[(shape_mm, eps, mu, pec), ...]`` for every assigned body.
 
@@ -211,7 +220,7 @@ def derive_grid_dims(sim, cell_size_m, padding_cells=8):
 def voxelize_materials(materials, cell_size_m, spacing_m=0.0,
                        pad_lo=(8, 8, 8), pad_hi=(8, 8, 8),
                        extra_points_mm=(), extra_axis_offsets=(),
-                       max_total_cells=4_000_000):
+                       max_total_cells=4_000_000, progress=None):
     """Voxelise *materials* onto a regular grid bounding all their bodies.
 
     Parameters
@@ -239,6 +248,10 @@ def voxelize_materials(materials, cell_size_m, spacing_m=0.0,
         which only bound their normal axis). Grows the box on that axis only.
     max_total_cells : int
         Guard against an accidentally huge grid; raises ``ValueError`` above it.
+    progress : callable, optional
+        ``progress(done, total)`` called periodically during the (slow)
+        ``isInside`` sweep, where the units are body cell-columns processed.
+        Return truthy to abort, which raises :class:`VoxelizationCancelled`.
 
     Returns
     -------
@@ -288,12 +301,26 @@ def voxelize_materials(materials, cell_size_m, spacing_m=0.0,
         """Indices of cell centres falling within [lo, hi] (a shape's bbox)."""
         return [idx for idx, c in enumerate(axis_coords) if lo <= c <= hi]
 
+    # Pre-plan each body's cell-index ranges so the total work (cell-columns to
+    # test) is known up front -- lets a caller show a determinate progress bar
+    # over the otherwise opaque, GUI-blocking isInside sweep.
+    plans = []
+    total_cols = 0
     for body_shape, eps, mu, pec in entries:
         bb = body_shape.BoundBox
         # Only test cells whose centre lies inside this body's bounding box.
         i_idx = cell_range(bb.XMin, bb.XMax, xs)
         j_idx = cell_range(bb.YMin, bb.YMax, ys)
         k_idx = cell_range(bb.ZMin, bb.ZMax, zs)
+        plans.append((body_shape, eps, mu, pec, i_idx, j_idx, k_idx))
+        total_cols += len(i_idx) * len(j_idx)
+
+    done_cols = 0
+    # Report ~200 times over the whole sweep (and always on the last column).
+    report_every = max(1, total_cols // 200)
+    if progress is not None:
+        progress(0, total_cols)
+    for body_shape, eps, mu, pec, i_idx, j_idx, k_idx in plans:
         for i in i_idx:
             x = xs[i]
             for j in j_idx:
@@ -305,6 +332,12 @@ def voxelize_materials(materials, cell_size_m, spacing_m=0.0,
                         else:
                             eps_arr[i, j, k] = eps
                             mu_arr[i, j, k] = mu
+                done_cols += 1
+                if progress is not None and (
+                    done_cols % report_every == 0 or done_cols == total_cols
+                ):
+                    if progress(done_cols, total_cols):
+                        raise VoxelizationCancelled()
 
     arrays = {
         "eps_x": eps_arr, "eps_y": eps_arr.copy(), "eps_z": eps_arr.copy(),
@@ -336,7 +369,7 @@ def write_materials(workdir, arrays):
     np.savez(os.path.join(workdir, "materials.npz"), **arrays)
 
 
-def build_job_from_document(doc, steps=None, fmax=30.0e9):
+def build_job_from_document(doc, steps=None, fmax=30.0e9, progress=None):
     """Build a solver job from the active simulation's materials.
 
     Returns ``(spec, arrays)`` where *spec* is the ``job.json`` dict and *arrays*
@@ -382,20 +415,29 @@ def build_job_from_document(doc, steps=None, fmax=30.0e9):
         materials, cell_size_m, spacing_m=spacing_m, pad_lo=pad_lo, pad_hi=pad_hi,
         extra_points_mm=source_points_mm(sim),
         extra_axis_offsets=snapshot_axis_offsets(sim),
+        progress=progress,
     )
     grid = vox["grid"]
     Nx, Ny, Nz = grid["Nx"], grid["Ny"], grid["Nz"]
     dx, dy, dz = grid["dx"], grid["dy"], grid["dz"]
     origin_m = vox["origin_m"]
 
-    # Source: the user-defined point source (Session 6), converted to the solver
-    # frame (the domain origin is already baked into the voxel arrays). With no
-    # source defined, fall back to a centre Gaussian pulse so the run still works.
+    # Sources: the user-defined point source (Session 6) and TEM ports (Session
+    # 9), converted to the solver frame (the domain origin is baked into the
+    # voxel arrays). With no point source and no TEM port, fall back to a centre
+    # Gaussian pulse so a bare run still works; a TEM port is excitation enough,
+    # so the fallback is skipped when one is present.
     from wavesim_gui import source as source_mod
+    from wavesim_gui import tem_source as tem_mod
+
+    tem_sources = [tem_mod.tem_source_spec(t, origin_m)
+                   for t in tem_mod.find_tem_sources(sim)]
 
     sources = source_mod.find_sources(sim)
     if sources:
         source = source_mod.source_spec(sources[0], origin_m)
+    elif tem_sources:
+        source = None
     else:
         source = {
             "component": "Ez",
@@ -442,6 +484,7 @@ def build_job_from_document(doc, steps=None, fmax=30.0e9):
             "pec_faces": pec_faces,
         },
         "source": source,
+        "tem_sources": tem_sources,
         "monitors": monitors,
     }
     return spec, vox["arrays"]

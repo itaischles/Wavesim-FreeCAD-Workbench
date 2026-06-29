@@ -49,6 +49,7 @@ _RESULT_TYPE = "Result"     # a single result leaf
 _KIND_ENERGY = "energy"
 _KIND_PROBE = "probe"
 _KIND_SNAPSHOT = "snapshot"
+_KIND_MODE = "mode"
 
 _RESULTS_GROUP = "Results"
 
@@ -292,6 +293,21 @@ def build_results(doc, sim, workdir, summary):
             extent = _snapshot_extent(sim, name)
             if extent is not None:
                 _store_snapshot_extent(leaf, *extent)
+
+        # TEM modes (one leaf per solved port mode). Each opens a figure of the
+        # mode shape plus the port's per-unit-length parameters.
+        for meta in summary.get("modes", []):
+            key = "mode_{}_{}".format(
+                meta.get("source_index", 0), meta.get("mode_index", 0)
+            )
+            if key + "_phi" not in keys:
+                continue
+            cond = meta.get("conductor_id", "?")
+            name = "{} mode (conductor {})".format(
+                meta.get("name", "TEM"), cond
+            )
+            leaf = _new_leaf(name, _KIND_MODE, key, "")
+            _store_mode_meta(leaf, meta)
     except Exception:
         doc.abortTransaction()
         raise
@@ -326,6 +342,44 @@ def _store_snapshot_extent(leaf, width, height, axis_x, axis_y, plane, offset):
         )
         leaf.setEditorMode("Offset", 1)
     leaf.Offset = "{} mm".format(offset)
+
+
+def _store_mode_meta(leaf, meta):
+    """Stash a solved TEM mode's geometry + per-unit-length parameters on a leaf.
+
+    These read-only properties carry everything the figure needs to draw the
+    mode shape (cell sizes, transverse axes, E-component keys) and to report the
+    port parameters (Z0, eps_eff, C, L, v) without re-reading ``summary.json``.
+    """
+    def _add(prop, kind, value, group="Mode"):
+        if not hasattr(leaf, prop):
+            leaf.addProperty(kind, prop, group, "")
+            leaf.setEditorMode(prop, 1)
+        setattr(leaf, prop, value)
+
+    axes = meta.get("transverse_axes", ["a", "b"])
+    _add("AxisA", "App::PropertyString", str(axes[0]))
+    _add("AxisB", "App::PropertyString", str(axes[1]))
+    _add("Da", "App::PropertyFloat", float(meta.get("da", 0.0)))
+    _add("Db", "App::PropertyFloat", float(meta.get("db", 0.0)))
+    _add("Normal", "App::PropertyString", str(meta.get("normal", "")))
+    _add("ModePosition", "App::PropertyFloat", float(meta.get("position", 0.0)))
+    _add("ConductorId", "App::PropertyInteger", int(meta.get("conductor_id", 0)))
+    _add("Ecomps", "App::PropertyString", ",".join(meta.get("Ecomps", [])))
+
+    # Per-unit-length parameters may be None (params skipped / degenerate solve);
+    # store NaN so the figure can detect and omit them.
+    def _num(value):
+        return float("nan") if value is None else float(value)
+
+    _add("Impedance", "App::PropertyFloat", _num(meta.get("impedance")))
+    _add("EpsEff", "App::PropertyFloat", _num(meta.get("eps_eff")))
+    _add("Capacitance", "App::PropertyFloat", _num(meta.get("capacitance")))
+    _add("Inductance", "App::PropertyFloat", _num(meta.get("inductance")))
+    _add("VPhase", "App::PropertyFloat", _num(meta.get("v_phase")))
+    _add("Fmax", "App::PropertyFloat", float(meta.get("fmax", 0.0)))
+    _add("Amplitude", "App::PropertyFloat", float(meta.get("amplitude", 1.0)))
+    _add("Fields", "App::PropertyString", str(meta.get("fields", "")))
 
 
 # --------------------------------------------------------------------------- #
@@ -526,6 +580,8 @@ if _GUI_AVAILABLE:
                 _plot_probe(obj)
             elif kind == _KIND_SNAPSHOT:
                 _plot_snapshot(obj)
+            elif kind == _KIND_MODE:
+                _plot_mode(obj)
             else:
                 FreeCAD.Console.PrintWarning(
                     "Wavesim: unknown result kind '{}'.\n".format(kind)
@@ -725,5 +781,119 @@ if _GUI_AVAILABLE:
         play.toggled.connect(on_play)
         dialog._timer = timer  # keep the timer alive with the dialog
 
+        dialog.show()
+        _register_window(dialog)
+
+    # ------------------------------------------------------------------ #
+    # TEM mode plotter
+    # ------------------------------------------------------------------ #
+
+    def open_first_mode(grp):
+        """Open the plot of the first TEM-mode leaf under results group *grp*.
+
+        Convenience for the "Compute Mode" flow so the solved mode pops up
+        immediately. A no-op when there is no mode leaf.
+        """
+        if grp is None:
+            return
+        for child in getattr(grp, "Group", []) or []:
+            if str(getattr(child, "ResultKind", "")) == _KIND_MODE:
+                open_result(child)
+                return
+
+    def _plot_mode(obj):
+        """Figure of a solved TEM mode: φ contours + E quiver + PEC outline.
+
+        Mirrors :func:`wavesim.viz.plot_tem_mode` but reads the raw 2D arrays
+        from ``results.npz`` (FreeCAD's Python cannot import the solver), drawing
+        with its own matplotlib. The port's per-unit-length parameters are shown
+        in an annotation box.
+        """
+        import math
+
+        import numpy as np
+
+        workdir = str(obj.ResultsDir)
+        key = str(obj.DataKey)
+        phi = _load_array(workdir, key + "_phi")
+        if phi is None:
+            _missing(obj)
+            return
+        pec = _load_array(workdir, key + "_pec")
+
+        ecomps = [c for c in str(getattr(obj, "Ecomps", "")).split(",") if c]
+        Ea = Eb = None
+        if len(ecomps) >= 2:
+            Ea = _load_array(workdir, "{}_E_{}".format(key, ecomps[0]))
+            Eb = _load_array(workdir, "{}_E_{}".format(key, ecomps[1]))
+
+        da = float(getattr(obj, "Da", 0.0)) or 1.0
+        db = float(getattr(obj, "Db", 0.0)) or 1.0
+        axis_a = str(getattr(obj, "AxisA", "a"))
+        axis_b = str(getattr(obj, "AxisB", "b"))
+
+        Na, Nb = phi.shape
+        # Cell-centre coordinates in mm (the workbench's display unit).
+        xa = (np.arange(Na) + 0.5) * da * 1.0e3
+        yb = (np.arange(Nb) + 0.5) * db * 1.0e3
+
+        made = _make_window("Wavesim Results - {}".format(obj.Label))
+        if made is None:
+            return
+        dialog, figure, _layout = made
+        ax = figure.add_subplot(111)
+
+        cf = ax.contourf(xa, yb, phi.T, levels=20, cmap="RdBu_r")
+        figure.colorbar(cf, ax=ax, pad=0.02, label="potential φ (V)")
+
+        if Ea is not None and Eb is not None:
+            step = max(1, min(Na, Nb) // 25)
+            AX, BY = np.meshgrid(xa[::step], yb[::step])
+            ax.quiver(AX, BY, Ea.T[::step, ::step], Eb.T[::step, ::step],
+                      color="k", alpha=0.7, pivot="mid")
+
+        if pec is not None and np.any(pec):
+            ax.contour(xa, yb, np.asarray(pec).T.astype(float),
+                       levels=[0.5], colors="dimgray", linewidths=1.5)
+
+        ax.set_aspect("equal")
+        ax.set_xlabel("{} (mm)".format(axis_a))
+        ax.set_ylabel("{} (mm)".format(axis_b))
+        ax.set_title(str(obj.Label))
+
+        # Annotation box: every port parameter that was computed (NaN == skipped).
+        c0 = 299792458.0
+        z0 = float(getattr(obj, "Impedance", float("nan")))
+        eps_eff = float(getattr(obj, "EpsEff", float("nan")))
+        cap = float(getattr(obj, "Capacitance", float("nan")))
+        ind = float(getattr(obj, "Inductance", float("nan")))
+        vph = float(getattr(obj, "VPhase", float("nan")))
+        fmax = float(getattr(obj, "Fmax", 0.0))
+        pos = float(getattr(obj, "ModePosition", 0.0))
+
+        lines = ["conductor {}".format(int(getattr(obj, "ConductorId", 0))),
+                 "{}-propagation @ {:.4g} mm".format(
+                     str(getattr(obj, "Normal", "")), pos * 1.0e3)]
+        if math.isfinite(z0):
+            lines.append("Z₀ = {:.2f} Ω".format(z0))
+        if math.isfinite(eps_eff):
+            lines.append("ε_eff = {:.3f}".format(eps_eff))
+        if math.isfinite(cap):
+            lines.append("C = {:.4g} pF/m".format(cap * 1.0e12))
+        if math.isfinite(ind):
+            lines.append("L = {:.4g} nH/m".format(ind * 1.0e9))
+        if math.isfinite(vph):
+            lines.append("v = {:.4g} m/s ({:.1f}% c)".format(vph, 100.0 * vph / c0))
+        if fmax > 0:
+            lines.append("f_max = {:.4g} GHz".format(fmax / 1.0e9))
+        fields = str(getattr(obj, "Fields", ""))
+        if fields:
+            lines.append("inject: {}".format(fields))
+
+        ax.text(0.02, 0.98, "\n".join(lines), transform=ax.transAxes,
+                va="top", ha="left", fontsize=8,
+                bbox=dict(boxstyle="round", facecolor="white", alpha=0.75))
+
+        dialog._canvas.draw()
         dialog.show()
         _register_window(dialog)

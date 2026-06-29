@@ -403,15 +403,26 @@ if _GUI_AVAILABLE:
             # Build from real geometry when materials are assigned; otherwise
             # fall back to the Session-2 hardcoded vacuum box. Materials without
             # a grid is a user error -- refuse rather than guess a cell size.
+            # Voxelisation runs on the GUI thread and can be slow on fine grids;
+            # show a cancelable progress dialog while it sweeps the geometry.
+            vox_dialog, vox_cb = run_mod.voxelization_progress(
+                Gui.getMainWindow(), "Wavesim Run", "Voxelizing geometry..."
+            )
             try:
                 spec, arrays = vox_mod.build_job_from_document(
-                    FreeCAD.ActiveDocument
+                    FreeCAD.ActiveDocument, progress=vox_cb
                 )
+            except vox_mod.VoxelizationCancelled:
+                vox_dialog.close()
+                FreeCAD.Console.PrintWarning("Wavesim: run cancelled.\n")
+                return
             except vox_mod.GridRequiredError as exc:
+                vox_dialog.close()
                 QtWidgets.QMessageBox.warning(
                     Gui.getMainWindow(), "Wavesim Run", str(exc)
                 )
                 return
+            vox_dialog.close()
             if spec is None:
                 spec = job_mod.build_demo_job()
                 FreeCAD.Console.PrintWarning(
@@ -476,5 +487,6 @@ if _GUI_AVAILABLE:
     from wavesim_gui import materials  # noqa: F401  (registers Wavesim_AssignMaterial)
     from wavesim_gui import domain  # noqa: F401  (registers the Domain object/VP)
     from wavesim_gui import source  # noqa: F401  (registers Wavesim_AddSource)
+    from wavesim_gui import tem_source  # noqa: F401  (registers Wavesim_AddTEMSource)
     from wavesim_gui import monitors  # noqa: F401  (registers the monitor commands)
     from wavesim_gui import results  # noqa: F401  (registers result proxies/VPs)

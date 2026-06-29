@@ -36,12 +36,62 @@ def _read_summary(workdir):
         return None
 
 
-def run_job(workdir, n_steps, parent=None):
+def voxelization_progress(parent=None, title="Wavesim",
+                          message="Voxelizing geometry..."):
+    """Return ``(dialog, callback)`` for showing voxelisation progress.
+
+    The voxeliser's ``isInside`` sweep runs on the GUI thread, so without
+    pumping events the window looks frozen. Pass *callback* as
+    :func:`voxelize.build_job_from_document`'s ``progress``: it sizes the bar on
+    the first call, advances it, processes events so the dialog paints and the
+    Cancel button works, and returns ``dialog.wasCanceled()`` to abort the
+    sweep. The caller must ``close()`` the dialog when done.
+    """
+    from PySide import QtCore
+    try:
+        from PySide import QtWidgets
+    except ImportError:
+        from PySide import QtGui as QtWidgets
+
+    dialog = QtWidgets.QProgressDialog(message, "Cancel", 0, 0, parent)
+    dialog.setWindowTitle(title)
+    dialog.setWindowModality(QtCore.Qt.WindowModal)
+    dialog.setMinimumDuration(0)
+    dialog.setAutoClose(False)
+    dialog.setAutoReset(False)
+    dialog.setMinimumWidth(420)
+    dialog.show()
+    dialog.raise_()
+    QtWidgets.QApplication.processEvents()
+
+    state = {"sized": False}
+
+    def callback(done, total):
+        if not state["sized"]:
+            dialog.setRange(0, max(1, int(total)))
+            state["sized"] = True
+        dialog.setValue(min(int(done), dialog.maximum()))
+        QtWidgets.QApplication.processEvents()
+        return dialog.wasCanceled()
+
+    return dialog, callback
+
+
+def run_job(workdir, n_steps, parent=None, message="Running FDTD simulation...",
+            busy=False):
     """Run the job in *workdir* out-of-process with a progress dialog.
 
     Returns the summary dict on success, or ``None`` if the run was cancelled or
     failed (a console message / dialog explains failures). ``n_steps`` sizes the
-    progress bar and must match the job's ``steps``.
+    progress bar and must match the job's ``steps``; *message* is the initial
+    progress dialog label (e.g. the TEM mode-solve uses its own wording).
+
+    The runner streams two kinds of feedback on stdout: ``PROGRESS n/N`` lines
+    drive the bar, and ``STATUS <text>`` lines replace the dialog label for the
+    coarse, non-numeric stages (loading the solver, factorising a TEM plane,
+    ...). Pass ``busy=True`` for a job with no meaningful step count (the TEM
+    mode-solve): the bar then runs as an animated indeterminate indicator so the
+    window visibly is not frozen while ``STATUS`` lines report the live stage.
     """
     from PySide import QtCore
     try:
@@ -70,15 +120,29 @@ def run_job(workdir, n_steps, parent=None):
     # Accumulated stderr, surfaced if the run fails.
     state = {"stderr": "", "stdout_tail": "", "cancelled": False}
 
+    # A busy (indeterminate) job uses a 0..0 range so Qt animates the bar; a
+    # normal run uses 0..n_steps and is driven by the PROGRESS lines.
+    bar_max = 0 if busy else n_steps
     progress = QtWidgets.QProgressDialog(
-        "Running FDTD simulation...", "Cancel", 0, n_steps, parent
+        message, "Cancel", 0, bar_max, parent
     )
     progress.setWindowTitle("Wavesim Run")
     progress.setWindowModality(QtCore.Qt.WindowModal)
     progress.setMinimumDuration(0)
     progress.setAutoClose(False)
     progress.setAutoReset(False)
-    progress.setValue(0)
+    # Roomier so multi-line STATUS messages are readable.
+    progress.setMinimumWidth(420)
+    # Show the dialog explicitly and paint it now. QProgressDialog only
+    # auto-shows itself from setValue(), so a busy (0..0) job that never sets a
+    # value would otherwise stay hidden while the solver blocks — the window
+    # then looks frozen until the run ends. forceShow()/processEvents make it
+    # appear immediately for both job kinds.
+    if not busy:
+        progress.setValue(0)
+    progress.show()
+    progress.raise_()
+    QtWidgets.QApplication.processEvents()
 
     loop = QtCore.QEventLoop()
 
@@ -92,7 +156,10 @@ def run_job(workdir, n_steps, parent=None):
         state["stdout_tail"] = lines.pop()  # incomplete trailing fragment
         for line in lines:
             line = line.strip()
-            if line.startswith("PROGRESS "):
+            if line.startswith("STATUS "):
+                text = line[len("STATUS "):].replace("\\n", "\n")
+                progress.setLabelText(text)
+            elif line.startswith("PROGRESS ") and not busy:
                 try:
                     done = int(line.split()[1].split("/")[0])
                     progress.setValue(min(done, n_steps))

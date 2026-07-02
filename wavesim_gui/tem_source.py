@@ -42,8 +42,8 @@ import os
 import FreeCAD
 
 from wavesim_gui.commands import active_simulation
-from wavesim_gui import units
 from wavesim_gui import domain as domain_mod
+from wavesim_gui import excitation as exc
 
 
 # --------------------------------------------------------------------------- #
@@ -69,8 +69,9 @@ _FACE_LABELS = {
     "z0": "Z min (z0)", "z1": "Z max (z1)",
 }
 
-# Excitation waveform families (only the Gaussian pulse is wired today).
-_EXCITATIONS = ["Gaussian Pulse"]
+# Excitation waveform families + object<->spec glue live in the shared
+# workbench-side catalogue :mod:`wavesim_gui.excitation`.
+_EXCITATIONS = exc.EXCITATION_LABELS
 
 # Which transverse fields to inject. Driving both E and H launches a directional
 # (one-way) wave; E only is simpler but bidirectional. Display label -> token.
@@ -101,11 +102,10 @@ class TEMSourceObject:
 
     Properties:
         ``Face``       -- domain face the port launches from ('x0'..'z1').
-        ``Excitation`` -- temporal waveform family ('Gaussian Pulse').
-        ``Fmax``       -- target maximum frequency of the pulse, in hertz (SI);
-                          edited via the panel in the simulation's frequency unit.
-        ``Amplitude``  -- peak amplitude of the waveform.
         ``Fields``     -- transverse fields injected ('EH' directional / 'E').
+        ``Excitation`` + one property per waveform parameter (Gaussian pulse,
+                          sine, rectangular, Gaussian+sine); added and kept in
+                          sync by :func:`excitation.ensure_object_props`.
 
     Hidden ``Corners`` carries the launch plane's four world-mm corners for the
     view provider; ``execute`` keeps them in sync with the domain bounds + face.
@@ -138,27 +138,9 @@ class TEMSourceObject:
             )
             obj.Fields = ["EH", "E"]
             obj.Fields = "EH"
-        if not hasattr(obj, "Excitation"):
-            obj.addProperty(
-                "App::PropertyEnumeration", "Excitation", "Excitation",
-                "Temporal waveform driving the port",
-            )
-            obj.Excitation = _EXCITATIONS
-            obj.Excitation = _EXCITATIONS[0]
-        if not hasattr(obj, "Fmax"):
-            obj.addProperty(
-                "App::PropertyFloat", "Fmax", "Excitation",
-                "Target maximum frequency of the Gaussian pulse, in hertz "
-                "(edit via the panel in the simulation's frequency unit)",
-            )
-            obj.Fmax = 30.0e9
-            obj.setEditorMode("Fmax", 1)  # read-only; edit through the panel
-        if not hasattr(obj, "Amplitude"):
-            obj.addProperty(
-                "App::PropertyFloat", "Amplitude", "Excitation",
-                "Peak amplitude of the excitation waveform",
-            )
-            obj.Amplitude = 1.0
+
+        # Excitation enum + one property per waveform parameter (shared scheme).
+        exc.ensure_object_props(obj)
 
         # Plane corners (hidden, four world-mm points) for the view provider.
         if not hasattr(obj, "Corners"):
@@ -168,8 +150,9 @@ class TEMSourceObject:
     def onDocumentRestored(self, obj):
         obj.Proxy = self
         self.Type = getattr(self, "Type", _TEM_TYPE)
-        if hasattr(obj, "Fmax"):
-            obj.setEditorMode("Fmax", 1)
+        # Re-run property setup so ports saved before the extra waveforms gain
+        # the new options + parameter properties and editor modes are re-asserted.
+        exc.ensure_object_props(obj)
 
     def execute(self, obj):
         """Size/orient the drawn launch plane to the domain bounds and face."""
@@ -270,19 +253,20 @@ def tem_source_spec(obj, origin_m):
         "name": str(obj.Label or obj.Name),
         "normal": axis,
         "position": position,
-        "fmax": float(getattr(obj, "Fmax", 0.0)),  # stored in Hz
-        "amplitude": float(getattr(obj, "Amplitude", 1.0)),
+        "excitation": exc.spec_from_object(obj),
         "fields": str(getattr(obj, "Fields", "EH")),
     }
 
 
 def _describe(obj):
-    """Short human label, e.g. ``z0 @ 30 GHz``, in the simulation's freq unit."""
+    """Short human label, e.g. ``z0, Gaussian Pulse @ 30 GHz``.
+
+    Uses the simulation's frequency unit; the rectangular pulse has no frequency.
+    """
     doc = getattr(obj, "Document", None)
     sim = active_simulation(doc) if doc is not None else None
-    unit = units.get_frequency_unit(sim)
-    value = units.freq_from_si(float(getattr(obj, "Fmax", 0.0)), unit)
-    return "{} @ {:g} {}".format(getattr(obj, "Face", "z0"), value, unit)
+    return "{}, {}".format(getattr(obj, "Face", "z0"),
+                           exc.excitation_label(obj, sim))
 
 
 # --------------------------------------------------------------------------- #
@@ -298,6 +282,9 @@ except Exception:  # console mode / no Qt
 
 
 if _GUI_AVAILABLE:
+
+    # The TEM panel reuses the point source's excitation widgets/plot mixin.
+    from wavesim_gui import source as source_mod
 
     def _build_arrow_geometry():
         """A unit arrow (shaft + head) pointing along +Y, base at the origin.
@@ -508,7 +495,7 @@ if _GUI_AVAILABLE:
         __getstate__ = dumps
         __setstate__ = loads
 
-    class TaskTEMSourcePanel:
+    class TaskTEMSourcePanel(source_mod.ExcitationParamsMixin):
         """Task panel to edit a TEM port: face, fields and excitation.
 
         "Compute Mode" solves and visualises the port mode now (out of process,
@@ -544,35 +531,12 @@ if _GUI_AVAILABLE:
                                        _FIELDS_LABELS[0])
             )
 
-            self._excitation = QtWidgets.QComboBox()
-            self._excitation.addItems(_EXCITATIONS)
-            self._excitation.setCurrentText(
-                str(getattr(obj, "Excitation", _EXCITATIONS[0]))
-            )
-
-            sim = active_simulation(obj.Document)
-            self._freq_unit = units.get_frequency_unit(sim)
-            self._fmax = QtWidgets.QDoubleSpinBox()
-            self._fmax.setRange(1.0e-9, 1.0e15)
-            self._fmax.setDecimals(6)
-            self._fmax.setSuffix(" " + self._freq_unit)
-            self._fmax.setSingleStep(1.0)
-            self._fmax.setValue(
-                units.freq_from_si(float(getattr(obj, "Fmax", 30.0e9)),
-                                   self._freq_unit)
-            )
-
-            self._amplitude = QtWidgets.QDoubleSpinBox()
-            self._amplitude.setRange(-1.0e9, 1.0e9)
-            self._amplitude.setDecimals(4)
-            self._amplitude.setSingleStep(0.1)
-            self._amplitude.setValue(float(getattr(obj, "Amplitude", 1.0)))
-
             layout.addRow("Launch face:", self._face)
             layout.addRow("Inject fields:", self._fields)
-            layout.addRow("Excitation:", self._excitation)
-            layout.addRow("Max frequency:", self._fmax)
-            layout.addRow("Amplitude:", self._amplitude)
+
+            # Excitation combo + per-waveform parameter rows + preview button
+            # (shared with the point-source panel).
+            self.build_excitation_ui(layout, QtWidgets)
 
             self._compute = QtWidgets.QPushButton("Compute Mode")
             layout.addRow(self._compute)
@@ -580,9 +544,10 @@ if _GUI_AVAILABLE:
             info = QtWidgets.QLabel(
                 "The port launches the TEM mode of the PEC cross-section on the "
                 "chosen face (which is set to PML automatically). The face must "
-                "cut at least two conductors. 'Compute Mode' solves and plots "
-                "the mode now; otherwise it is solved when you Run the "
-                "simulation. The frequency unit is set on the Simulation object."
+                "cut at least two conductors. Pick a temporal waveform and its "
+                "parameters (preview with the plot button). 'Compute Mode' solves "
+                "and plots the mode now; otherwise it is solved when you Run. "
+                "Frequency/time units are set on the Simulation object."
             )
             info.setWordWrap(True)
             layout.addRow(info)
@@ -615,9 +580,7 @@ if _GUI_AVAILABLE:
             face = self._selected_face()
             self.obj.Face = face
             self.obj.Fields = _FIELDS_TOKEN[self._fields.currentText()]
-            self.obj.Excitation = self._excitation.currentText()
-            self.obj.Fmax = units.freq_to_si(self._fmax.value(), self._freq_unit)
-            self.obj.Amplitude = self._amplitude.value()
+            self.write_excitation(self.obj)
             self.obj.Label = "TEM Source ({})".format(_describe(self.obj))
             # Absorbing port: force the launch face to PML.
             domain_mod.set_face_bc(domain_mod.find_domain(active_simulation(doc)),

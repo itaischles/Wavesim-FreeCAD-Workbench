@@ -28,9 +28,14 @@ job.json schema (Session 2)
       "steps": 1000,
       "grid":   {"Nx":.., "Ny":.., "Nz":.., "dx":.., "dy":.., "dz":..},
       "boundary": {"d_pml": 10, "faces": ["x0",...], "pec_faces": ["z0",...]} | null,
-      "source": {"component":"Ez", "x":.., "y":.., "z":.., "fmax":.., "amplitude":..} | null,
+      "source": {"component":"Ez", "x":.., "y":.., "z":..,
+                 "excitation": {"type":"gaussian"|"sine"|"rectangular"|
+                                "gaussian_sine", ...params (SI)...}} | null,
+                 # legacy jobs may instead carry flat "fmax"/"amplitude" keys
+                 # (a Gaussian pulse); see _build_waveform for the param set.
       "tem_sources": [{"name":.., "normal":"z", "position":..,
-                       "fmax":.., "amplitude":.., "fields":"EH"|"E"}, ...],
+                       "excitation": {"type":.., ...}, "fields":"EH"|"E"}, ...],
+                       # legacy entries may carry flat "fmax"/"amplitude" keys
       "mode_only": false,                     # solve TEM modes only; no FDTD run
       "monitors": {
         "energy": true,
@@ -112,6 +117,75 @@ def _emit_status(message):
 
 
 # --------------------------------------------------------------------------- #
+# Excitation waveforms — build the point source's temporal profile
+# --------------------------------------------------------------------------- #
+
+def _build_waveform(ws, s):
+    """Build the solver temporal waveform ``f(t)`` for a point-source spec *s*.
+
+    Reads the ``excitation`` sub-dict (the job.json contract shared with the
+    workbench's :mod:`wavesim_gui.excitation`). The maths is duplicated here on
+    purpose rather than importing workbench code, so the solver side stays free
+    to grow its own native waveform classes. Any callable ``f(t) -> float`` is a
+    valid waveform (see ``wavesim.sources``). Falls back to the legacy flat
+    ``fmax``/``amplitude`` Gaussian for jobs written before excitation types.
+    """
+    import math
+
+    exc = s.get("excitation")
+    if not exc:
+        return ws.GaussianPulse.for_fmax(
+            float(s["fmax"]), amplitude=float(s.get("amplitude", 1.0))
+        )
+
+    typ = exc.get("type", "gaussian")
+    amp = float(exc.get("amplitude", 1.0))
+
+    if typ == "gaussian":
+        # Reuse the solver's own pulse so a plain Gaussian stays identical to
+        # earlier runs (width = 1/(2*pi*fmax), t0 = 4*width).
+        return ws.GaussianPulse.for_fmax(
+            float(exc.get("fmax", 30.0e9)), amplitude=amp
+        )
+
+    if typ == "sine":
+        freq = float(exc.get("frequency", 30.0e9))
+        phase = math.radians(float(exc.get("phase_deg", 0.0)))
+        return lambda t: amp * math.sin(2.0 * math.pi * freq * t + phase)
+
+    if typ == "rectangular":
+        start = float(exc.get("start_time", 0.0))
+        rise = float(exc.get("rise_time", 0.0))
+        flat = float(exc.get("flat_time", 0.0))
+        fall = float(exc.get("fall_time", 0.0))
+        end = start + rise + flat + fall
+
+        def rect(t):
+            up = (1.0 if t >= start else 0.0) if rise <= 0.0 \
+                else min(max((t - start) / rise, 0.0), 1.0)
+            down = (1.0 if t <= end else 0.0) if fall <= 0.0 \
+                else min(max((end - t) / fall, 0.0), 1.0)
+            return amp * min(up, down)
+
+        return rect
+
+    if typ == "gaussian_sine":
+        fmax = max(float(exc.get("fmax", 10.0e9)), 1.0e-30)
+        width = 1.0 / (2.0 * math.pi * fmax)
+        t0 = 4.0 * width
+        freq = float(exc.get("frequency", 30.0e9))
+        phase = math.radians(float(exc.get("phase_deg", 0.0)))
+        return lambda t: (amp
+                          * math.exp(-0.5 * ((t - t0) / width) ** 2)
+                          * math.sin(2.0 * math.pi * freq * (t - t0) + phase))
+
+    # Unknown type: a unit Gaussian rather than failing the whole run.
+    return ws.GaussianPulse.for_fmax(
+        float(exc.get("fmax", 30.0e9)), amplitude=amp
+    )
+
+
+# --------------------------------------------------------------------------- #
 # TEM ports — solve each plane's transverse-static mode (Session 9)
 # --------------------------------------------------------------------------- #
 
@@ -143,10 +217,19 @@ def _solve_tem_modes(ws, np, grid, job):
     for si, t in enumerate(tem_cfg):
         normal = t.get("normal", "z")
         position = float(t.get("position", 0.0))
-        fmax = float(t.get("fmax", 0.0))
-        amplitude = float(t.get("amplitude", 1.0))
         fields = t.get("fields", "EH")
         name = t.get("name", "TEM")
+
+        # A single characteristic frequency + amplitude for the results tree
+        # (the launch waveform itself is built by _build_waveform below). Reads
+        # the excitation spec, falling back to legacy flat fmax/amplitude keys.
+        exc_spec = t.get("excitation") or {}
+        etype = exc_spec.get("type", "gaussian")
+        amplitude = float(exc_spec.get("amplitude", t.get("amplitude", 1.0)))
+        if etype in ("sine", "gaussian_sine"):
+            fmax = float(exc_spec.get("frequency", 0.0))
+        else:  # gaussian (or legacy) uses fmax; rectangular has none
+            fmax = float(exc_spec.get("fmax", t.get("fmax", 0.0)))
 
         prefix = "Port {}/{}: ".format(si + 1, n_ports) if n_ports > 1 else ""
         _emit_status(
@@ -188,12 +271,13 @@ def _solve_tem_modes(ws, np, grid, job):
             })
 
         # Launch the dominant (first) mode as a directional plane source. The
-        # mode is normalised to a 1 V drive, so the temporal pulse carries the
-        # amplitude and ``to_source`` is left at unit scale.
-        if modes and not mode_only and fmax > 0:
-            pulse = ws.GaussianPulse.for_fmax(fmax, amplitude=amplitude)
+        # mode is normalised to a 1 V drive, so the temporal waveform carries the
+        # amplitude and ``to_source`` is left at unit scale. The waveform is built
+        # from the port's excitation spec (same builder as the point source).
+        if modes and not mode_only:
+            waveform = _build_waveform(ws, t)
             plane_sources.append(
-                modes[0].to_source(pulse, amplitude=1.0, fields=fields)
+                modes[0].to_source(waveform, amplitude=1.0, fields=fields)
             )
 
     return plane_sources, mode_arrays, mode_meta
@@ -284,11 +368,9 @@ def run_job(workdir):
     sources = []
     s = job.get("source")
     if s:
-        pulse = ws.GaussianPulse.for_fmax(
-            float(s["fmax"]), amplitude=float(s.get("amplitude", 1.0))
-        )
+        waveform = _build_waveform(ws, s)
         sources.append(ws.PointSource(
-            s["component"], float(s["x"]), float(s["y"]), float(s["z"]), pulse
+            s["component"], float(s["x"]), float(s["y"]), float(s["z"]), waveform
         ))
     sources.extend(plane_sources)
 

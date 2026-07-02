@@ -6,10 +6,12 @@ A *Source* is a scripted FreeCAD DocumentObject grouped under the simulation's
 
 * the **source** -- which field component to drive ('Ex'..'Hz') and where (a
   world-coordinate position, snapped to the nearest grid cell at run time);
-* the **excitation** -- the temporal waveform. For now a Gaussian pulse defined
-  by its target maximum frequency ``Fmax`` and ``Amplitude`` (mapping to the
-  solver's ``GaussianPulse.for_fmax``). The enumeration leaves room for more
-  waveforms later.
+* the **excitation** -- the temporal waveform, chosen from a family (Gaussian
+  pulse, sine wave, rectangular pulse, Gaussian+sine) with per-family parameters.
+  The catalogue + maths live in :mod:`wavesim_gui.excitation`; the panel rebuilds
+  its parameter widgets to match the selection and can plot a preview. The chosen
+  waveform is emitted as an ``excitation`` spec dict in :func:`source_spec`, from
+  which the conda-side runner builds the actual solver waveform.
 
 This replaces the Session-2/3 hardcoded centre source: :mod:`wavesim_gui.voxelize`
 now reads the first Source under the simulation when building the job.
@@ -36,6 +38,7 @@ import FreeCAD
 
 from wavesim_gui.commands import active_simulation
 from wavesim_gui import units
+from wavesim_gui import excitation as exc
 
 
 # --------------------------------------------------------------------------- #
@@ -57,9 +60,9 @@ _SOURCES_GROUP = "Sources"
 # Field components a point source may drive.
 _COMPONENTS = ["Ex", "Ey", "Ez", "Hx", "Hy", "Hz"]
 
-# Available excitation waveforms. Only the Gaussian pulse is wired today; the
-# enumeration leaves room for CW / custom waveforms in a later session.
-_EXCITATIONS = ["Gaussian Pulse"]
+# Available excitation waveforms (labels, in panel order) + the object<->spec
+# glue live in the shared workbench-side catalogue :mod:`wavesim_gui.excitation`.
+_EXCITATIONS = exc.EXCITATION_LABELS
 
 # Green point marker colour.
 _SOURCE_COLOR = (0.10, 0.90, 0.20)
@@ -77,11 +80,18 @@ class SourceObject:
     Properties:
         ``Component``  -- field component driven ('Ex'..'Hz').
         ``Position``   -- injection point, world coordinates (mm).
-        ``Excitation`` -- temporal waveform family ('Gaussian Pulse').
-        ``Fmax``       -- target maximum frequency of the pulse, stored in hertz
-                          (SI). Edited via the source panel in the simulation's
-                          frequency unit; read-only in the property editor.
-        ``Amplitude``  -- peak amplitude of the waveform.
+        ``Excitation`` -- temporal waveform family (Gaussian Pulse, Sine Wave,
+                          Rectangular Pulse, Gaussian + Sine).
+        ``Amplitude``  -- peak amplitude of the waveform (all families).
+        ``Fmax``       -- Gaussian bandwidth (and Gaussian+Sine envelope BW), Hz.
+        ``Frequency``  -- carrier frequency of the sine / Gaussian+Sine, Hz.
+        ``PhaseDeg``   -- carrier phase offset of the sine / Gaussian+Sine, deg.
+        ``StartTime``/``RiseTime``/``FlatTime``/``FallTime`` -- rectangular-pulse
+                          trapezoid timings, seconds.
+
+    Frequencies/times are stored in SI (Hz / s) and edited via the source panel
+    in the simulation's display units; the parameters used by the active
+    Excitation are read-only in the property editor and the rest are hidden.
     """
 
     def __init__(self, obj):
@@ -109,35 +119,15 @@ class SourceObject:
                 "Injection point in world coordinates (mm), snapped to the "
                 "nearest grid cell",
             )
-        if not hasattr(obj, "Excitation"):
-            obj.addProperty(
-                "App::PropertyEnumeration", "Excitation", "Excitation",
-                "Temporal waveform driving the source",
-            )
-            obj.Excitation = _EXCITATIONS
-            obj.Excitation = _EXCITATIONS[0]
-        if not hasattr(obj, "Fmax"):
-            obj.addProperty(
-                "App::PropertyFloat", "Fmax", "Excitation",
-                "Target maximum frequency of the Gaussian pulse, in hertz "
-                "(edit via the source panel in the simulation's frequency unit)",
-            )
-            obj.Fmax = 30.0e9
-            obj.setEditorMode("Fmax", 1)  # read-only; edit through the panel
-        if not hasattr(obj, "Amplitude"):
-            obj.addProperty(
-                "App::PropertyFloat", "Amplitude", "Excitation",
-                "Peak amplitude of the excitation waveform",
-            )
-            obj.Amplitude = 1.0
+        exc.ensure_object_props(obj)
 
     def onDocumentRestored(self, obj):
         obj.Proxy = self
         self.Type = getattr(self, "Type", _SOURCE_TYPE)
-        # Editor modes are runtime-only; re-assert Fmax as read-only after reload
-        # so it stays edited through the unit-aware panel rather than as raw Hz.
-        if hasattr(obj, "Fmax"):
-            obj.setEditorMode("Fmax", 1)
+        # Re-run property setup so sources saved before the extra waveforms were
+        # added gain the new Excitation options + parameter properties, and so
+        # the runtime-only editor modes are re-asserted after reload.
+        exc.ensure_object_props(obj)
 
     def execute(self, obj):
         # Pure data object; the ViewProvider draws the marker from Position.
@@ -191,7 +181,9 @@ def source_spec(source, origin_m):
 
     *origin_m* is the domain min corner in FreeCAD world metres (from the
     voxeliser). The stored ``Position`` is world mm; the solver frame measures
-    from the domain origin, so we subtract it after converting to metres.
+    from the domain origin, so we subtract it after converting to metres. The
+    temporal waveform is carried in the ``excitation`` sub-dict (see
+    :mod:`wavesim_gui.excitation`); the runner builds the solver waveform from it.
     """
     pos = source.Position
     x = pos.x / _MM_PER_M - origin_m[0]
@@ -200,18 +192,20 @@ def source_spec(source, origin_m):
     return {
         "component": str(source.Component),
         "x": x, "y": y, "z": z,
-        "fmax": float(getattr(source, "Fmax", 0.0)),  # stored in Hz
-        "amplitude": float(getattr(source, "Amplitude", 1.0)),
+        "excitation": exc.spec_from_object(source),
     }
 
 
 def _describe(obj):
-    """Short human label for a source in the simulation's unit, e.g. ``Ez @ 30 GHz``."""
+    """Short human label for a source, e.g. ``Ez, Gaussian Pulse @ 30 GHz``.
+
+    Appends the characteristic frequency (in the simulation's unit) for the
+    waveforms that have one; the rectangular pulse has none.
+    """
     doc = getattr(obj, "Document", None)
     sim = active_simulation(doc) if doc is not None else None
-    unit = units.get_frequency_unit(sim)
-    value = units.freq_from_si(float(getattr(obj, "Fmax", 0.0)), unit)
-    return "{} @ {:g} {}".format(getattr(obj, "Component", "Ez"), value, unit)
+    return "{}, {}".format(getattr(obj, "Component", "Ez"),
+                           exc.excitation_label(obj, sim))
 
 
 def default_position_mm(sim):
@@ -251,6 +245,236 @@ except Exception:  # console mode / no Qt
 
 
 if _GUI_AVAILABLE:
+
+    # ------------------------------------------------------------------ #
+    # Excitation preview plot (FreeCAD-side matplotlib, mirroring results.py)
+    # ------------------------------------------------------------------ #
+
+    # Keep preview windows alive: a QDialog with no Python reference is garbage
+    # collected and vanishes immediately.
+    _PLOT_WINDOWS = []
+
+    def _qt():
+        try:
+            from PySide import QtCore, QtWidgets
+        except ImportError:
+            from PySide import QtCore
+            from PySide import QtGui as QtWidgets
+        return QtCore, QtWidgets
+
+    def _mpl():
+        """Import matplotlib's Qt6 backend; raises on failure."""
+        os.environ.setdefault("QT_API", "pyside6")
+        import matplotlib
+        try:
+            matplotlib.use("QtAgg", force=False)
+        except Exception:
+            pass
+        from matplotlib.backends.backend_qtagg import (
+            FigureCanvasQTAgg, NavigationToolbar2QT,
+        )
+        from matplotlib.figure import Figure
+        return FigureCanvasQTAgg, NavigationToolbar2QT, Figure
+
+    def _show_excitation_plot(spec, t_max_s, time_unit):
+        """Open a non-modal window plotting excitation *spec* over ``[0, t_max]``.
+
+        *t_max_s* is the simulation window (``MaxTime``); when unset a sensible
+        span for the waveform is used. The x-axis is drawn in *time_unit*.
+        """
+        import numpy as np
+
+        QtCore, QtWidgets = _qt()
+        try:
+            FigureCanvas, NavToolbar, Figure = _mpl()
+        except Exception as exc_err:
+            QtWidgets.QMessageBox.critical(
+                Gui.getMainWindow(), "Wavesim Source",
+                "Could not load matplotlib for plotting:\n{}".format(exc_err),
+            )
+            return
+
+        if t_max_s <= 0.0:
+            t_max_s = exc.suggested_tmax(spec)
+        t = np.linspace(0.0, t_max_s, 2000)
+        y = exc.evaluate(spec, t)
+        scale = units.time_from_si(1.0, time_unit)  # SI seconds -> display unit
+
+        dialog = QtWidgets.QDialog(Gui.getMainWindow())
+        dialog.setWindowTitle("Excitation preview")
+        dialog.setWindowFlags(QtCore.Qt.Window)
+        dialog.resize(640, 480)
+        dialog.setAttribute(QtCore.Qt.WA_DeleteOnClose, True)
+        layout = QtWidgets.QVBoxLayout(dialog)
+
+        figure = Figure(figsize=(6, 4.5), tight_layout=True)
+        canvas = FigureCanvas(figure)
+        layout.addWidget(NavToolbar(canvas, dialog))
+        layout.addWidget(canvas)
+
+        ax = figure.add_subplot(111)
+        ax.plot(t * scale, y)
+        ax.set_xlabel("time ({})".format(time_unit))
+        ax.set_ylabel("amplitude")
+        ax.set_title(exc.label_for_type(spec.get("type", exc.GAUSSIAN)))
+        ax.grid(True, alpha=0.3)
+        canvas.draw_idle()
+
+        dialog._figure = figure  # keep refs on the dialog
+        dialog._canvas = canvas
+
+        def _cleanup(_result, d=dialog):
+            try:
+                d._figure.clear()
+            except Exception:
+                pass
+            try:
+                _PLOT_WINDOWS.remove(d)
+            except ValueError:
+                pass
+
+        dialog.finished.connect(_cleanup)
+        _PLOT_WINDOWS[:] = [w for w in _PLOT_WINDOWS if _plot_win_visible(w)]
+        _PLOT_WINDOWS.append(dialog)
+        dialog.show()
+
+    def _plot_win_visible(win):
+        try:
+            return win.isVisible()
+        except RuntimeError:  # underlying C++ object already deleted
+            return False
+
+    class ExcitationParamsMixin:
+        """Shared excitation combo + dynamic parameter widgets + preview plot.
+
+        Reused by both the point-source and TEM-source task panels. The host
+        panel must set ``self.obj`` first, then call ``build_excitation_ui`` while
+        constructing its form (it appends the Excitation combo, a parameter block
+        that rebuilds per waveform, and a preview-plot button), and call
+        ``write_excitation`` inside its own open transaction to persist the values.
+        """
+
+        def build_excitation_ui(self, layout, QtWidgets):
+            self._QtWidgets = QtWidgets
+            sim = active_simulation(self.obj.Document)
+            self._freq_unit = units.get_frequency_unit(sim)
+            self._time_unit = units.get_time_unit(sim)
+            # SI value cache for every parameter, seeded from the object so
+            # switching waveforms mid-edit keeps previously entered values.
+            self._values = {
+                key: float(getattr(self.obj, prop, exc.ALL_PARAMS[key][1]))
+                for key, prop in exc.PROP_FOR_KEY.items()
+            }
+
+            self._excitation = QtWidgets.QComboBox()
+            self._excitation.addItems(_EXCITATIONS)
+            self._excitation.setCurrentText(
+                str(getattr(self.obj, "Excitation", _EXCITATIONS[0]))
+            )
+            layout.addRow("Excitation:", self._excitation)
+
+            # Container whose rows are rebuilt to match the selected waveform's
+            # parameter set (see :data:`excitation.PARAMS`).
+            self._params_widget = QtWidgets.QWidget()
+            self._params_form = QtWidgets.QFormLayout(self._params_widget)
+            self._params_form.setContentsMargins(0, 0, 0, 0)
+            self._param_spins = {}  # key -> (spin, to_si_callable)
+            layout.addRow(self._params_widget)
+
+            self._plot_button = QtWidgets.QPushButton("Plot excitation vs. time…")
+            layout.addRow(self._plot_button)
+
+            self._rebuild_params()
+            self._excitation.currentTextChanged.connect(self._rebuild_params)
+            self._plot_button.clicked.connect(self._plot)
+
+        def _current_type(self):
+            return exc.type_for_label(self._excitation.currentText())
+
+        def _make_param_spin(self, kind, si_value):
+            """Return ``(spin, to_si)`` for a parameter of the given *kind*.
+
+            The spin box shows the value in the simulation's display unit (for
+            frequency/time) or raw (amplitude/phase); ``to_si`` converts its
+            current value back to the SI base stored on the object.
+            """
+            spin = self._QtWidgets.QDoubleSpinBox()
+            if kind == exc.KIND_FREQ:
+                spin.setRange(1.0e-9, 1.0e15)
+                spin.setDecimals(6)
+                spin.setSuffix(" " + self._freq_unit)
+                spin.setSingleStep(1.0)
+                spin.setValue(units.freq_from_si(si_value, self._freq_unit))
+                to_si = lambda v: units.freq_to_si(v, self._freq_unit)
+            elif kind == exc.KIND_TIME:
+                spin.setRange(0.0, 1.0e12)
+                spin.setDecimals(6)
+                spin.setSuffix(" " + self._time_unit)
+                spin.setSingleStep(0.1)
+                spin.setValue(units.time_from_si(si_value, self._time_unit))
+                to_si = lambda v: units.time_to_si(v, self._time_unit)
+            elif kind == exc.KIND_PHASE:
+                spin.setRange(-360.0, 360.0)
+                spin.setDecimals(2)
+                spin.setSuffix(" deg")
+                spin.setSingleStep(5.0)
+                spin.setValue(si_value)
+                to_si = lambda v: v
+            else:  # KIND_AMP
+                spin.setRange(-1.0e9, 1.0e9)
+                spin.setDecimals(4)
+                spin.setSingleStep(0.1)
+                spin.setValue(si_value)
+                to_si = lambda v: v
+            return spin, to_si
+
+        def _save_param_values(self):
+            """Persist the currently shown spins into the SI value cache."""
+            for key, (spin, to_si) in self._param_spins.items():
+                self._values[key] = float(to_si(spin.value()))
+
+        def _rebuild_params(self, *_):
+            """Rebuild the parameter rows to match the selected waveform."""
+            self._save_param_values()
+            while self._params_form.rowCount():
+                self._params_form.removeRow(0)
+            self._param_spins = {}
+            for key, label, kind, _default in exc.PARAMS[self._current_type()]:
+                si_value = self._values.get(key, exc.ALL_PARAMS[key][1])
+                spin, to_si = self._make_param_spin(kind, si_value)
+                self._params_form.addRow(label + ":", spin)
+                self._param_spins[key] = (spin, to_si)
+
+        def _spec_from_widgets(self):
+            """Return the excitation spec (SI) for the current widget state."""
+            self._save_param_values()
+            typ = self._current_type()
+            spec = {"type": typ}
+            for key in exc.param_keys(typ):
+                spec[key] = float(self._values.get(key, exc.ALL_PARAMS[key][1]))
+            return spec
+
+        def _plot(self, *_):
+            """Open a preview window plotting the excitation vs. time."""
+            sim = active_simulation(self.obj.Document)
+            t_max_s = float(getattr(sim, "MaxTime", 0.0)) if sim else 0.0
+            _show_excitation_plot(
+                self._spec_from_widgets(), t_max_s, self._time_unit
+            )
+
+        def write_excitation(self, obj):
+            """Persist Excitation + every parameter from the widgets onto *obj*.
+
+            Writes all waveforms' parameters (not just the active one), so values
+            entered under other waveforms are preserved. Call inside an open
+            transaction; refreshes the property-editor visibility afterwards.
+            """
+            self._save_param_values()
+            obj.Excitation = self._excitation.currentText()
+            for key, prop in exc.PROP_FOR_KEY.items():
+                if key in self._values and hasattr(obj, prop):
+                    setattr(obj, prop, float(self._values[key]))
+            exc.sync_visibility(obj)
 
     class SourceViewProvider:
         """Coin view provider drawing the source as a green point marker.
@@ -325,7 +549,7 @@ if _GUI_AVAILABLE:
         __getstate__ = dumps
         __setstate__ = loads
 
-    class TaskSourcePanel:
+    class TaskSourcePanel(ExcitationParamsMixin):
         """Task-tab panel to edit a source's component, position and excitation.
 
         ``accept`` writes the widget values back onto the object; ``reject``
@@ -367,47 +591,19 @@ if _GUI_AVAILABLE:
             self._y = pos_spin(float(pos.y))
             self._z = pos_spin(float(pos.z))
 
-            self._excitation = QtWidgets.QComboBox()
-            self._excitation.addItems(_EXCITATIONS)
-            self._excitation.setCurrentText(
-                str(getattr(obj, "Excitation", _EXCITATIONS[0]))
-            )
-
-            # Frequency is shown in the simulation's frequency unit, which is a
-            # fixed (display-only) suffix here -- it is chosen in the Simulation
-            # panel, not editable per source.
-            sim = active_simulation(obj.Document)
-            self._freq_unit = units.get_frequency_unit(sim)
-            self._fmax = QtWidgets.QDoubleSpinBox()
-            self._fmax.setRange(1.0e-9, 1.0e15)
-            self._fmax.setDecimals(6)
-            self._fmax.setSuffix(" " + self._freq_unit)
-            self._fmax.setSingleStep(1.0)
-            self._fmax.setValue(
-                units.freq_from_si(
-                    float(getattr(obj, "Fmax", 30.0e9)), self._freq_unit
-                )
-            )
-
-            self._amplitude = QtWidgets.QDoubleSpinBox()
-            self._amplitude.setRange(-1.0e9, 1.0e9)
-            self._amplitude.setDecimals(4)
-            self._amplitude.setSingleStep(0.1)
-            self._amplitude.setValue(float(getattr(obj, "Amplitude", 1.0)))
-
             layout.addRow("Field component:", self._component)
             layout.addRow("Position X:", self._x)
             layout.addRow("Position Y:", self._y)
             layout.addRow("Position Z:", self._z)
-            layout.addRow("Excitation:", self._excitation)
-            layout.addRow("Max frequency:", self._fmax)
-            layout.addRow("Amplitude:", self._amplitude)
+
+            # Excitation combo + per-waveform parameter rows + preview button.
+            self.build_excitation_ui(layout, QtWidgets)
 
             info = QtWidgets.QLabel(
                 "The source softly injects the chosen field component at the "
-                "given point (snapped to the nearest grid cell). The Gaussian "
-                "pulse's bandwidth is set by the max frequency. The frequency "
-                "unit is set on the Simulation object."
+                "given point (snapped to the nearest grid cell). Pick a temporal "
+                "waveform and its parameters; use the plot button to preview it. "
+                "Frequency/time units are set on the Simulation object."
             )
             info.setWordWrap(True)
             layout.addRow(info)
@@ -438,9 +634,7 @@ if _GUI_AVAILABLE:
             self.obj.Position = FreeCAD.Vector(
                 self._x.value(), self._y.value(), self._z.value()
             )
-            self.obj.Excitation = self._excitation.currentText()
-            self.obj.Fmax = units.freq_to_si(self._fmax.value(), self._freq_unit)
-            self.obj.Amplitude = self._amplitude.value()
+            self.write_excitation(self.obj)
             self.obj.Label = "Source ({})".format(_describe(self.obj))
             doc.commitTransaction()
             doc.recompute()
@@ -482,8 +676,8 @@ if _GUI_AVAILABLE:
             return {
                 "Pixmap": _SOURCE_ICON,
                 "MenuText": "Add Point Source",
-                "ToolTip": "Add a soft point source with a Gaussian-pulse "
-                "excitation to the simulation",
+                "ToolTip": "Add a soft point source with a selectable temporal "
+                "excitation (Gaussian, sine, rectangular, Gaussian+sine)",
             }
 
         def Activated(self):

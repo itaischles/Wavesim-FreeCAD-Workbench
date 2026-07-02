@@ -17,8 +17,11 @@ Rendering
 ---------
 The domain draws as two *wireframe* boxes (edges only, no fill, so neither
 obscures the other or the geometry): the inner domain box and the outer box the
-PML layers occupy, in two colours. Both are drawn by one object, so the single
-"eye" visibility toggle next to Domain shows/hides them together.
+PML layers occupy, in two colours. Alongside them are three fully-transparent
+*cell grids* (thin lines spaced ``Dx``/``Dy``/``Dz``) on the domain's three min
+faces, so the meshing resolution is visible. All of these are drawn by one
+object, so the single "eye" visibility toggle next to Domain shows/hides them
+together.
 
 :func:`domain_grid_params` is the single source of truth mapping the per-face
 settings to the per-side PML padding (cells), the PML ``faces`` tuple and the PEC
@@ -67,6 +70,11 @@ _BC_CHOICES = ["PML", "PEC"]
 _DOMAIN_COLOR = (0.30, 0.55, 1.00)
 _PML_COLOR = (1.00, 0.45, 0.10)
 
+# Faint grey for the cell-grid planes; cap on lines per axis so a fine grid on a
+# large domain can't lock up the viewport.
+_GRID_COLOR = (0.55, 0.55, 0.55)
+_MAX_GRID_LINES = 400
+
 
 # --------------------------------------------------------------------------- #
 # Document-object model
@@ -79,6 +87,8 @@ class DomainObject:
         ``Dx`` / ``Dy`` / ``Dz`` -- cell sizes (editable).
         ``Nx`` / ``Ny`` / ``Nz`` -- derived cell counts (read-only).
         ``Spacing``              -- air gap added around the material bounds.
+        ``Background``           -- Material filling empty voxels (the default
+                                    medium); vacuum when unset.
         ``PMLThickness``         -- PML depth in cells, on every PML face.
         ``BoundaryX/Y/Z Min/Max`` -- per-face boundary condition (PML | PEC).
 
@@ -123,6 +133,12 @@ class DomainObject:
                 "Air gap added around the material bounds on every side",
             )
             obj.Spacing = "5 mm"
+        if not hasattr(obj, "Background"):
+            obj.addProperty(
+                "App::PropertyLink", "Background", "Domain",
+                "Material filling every empty voxel (the background medium); "
+                "vacuum when unset. Pick any Material under the simulation.",
+            )
         if not hasattr(obj, "PMLThickness"):
             obj.addProperty(
                 "App::PropertyInteger", "PMLThickness", "Boundary",
@@ -225,6 +241,13 @@ def find_domain(sim):
         if is_domain(child):
             return child
     return None
+
+
+def background_material(domain):
+    """Return the Domain's background (empty-voxel) Material, or None for vacuum."""
+    if domain is None:
+        return None
+    return getattr(domain, "Background", None)
 
 
 def cell_sizes_m(obj):
@@ -463,9 +486,27 @@ if _GUI_AVAILABLE:
             psep.addChild(self._pml_lines)
             root.addChild(psep)
 
+            # Three fully-transparent cell grids (thin lines spaced dx/dy/dz) on
+            # the domain's min faces, so the meshing is visible. They live under
+            # this same display-mode root, so the Domain "eye" toggle hides them
+            # together with the boxes.
+            self._grid_color = coin.SoBaseColor()
+            self._grid_color.rgb.setValue(*_GRID_COLOR)
+            gstyle = coin.SoDrawStyle()
+            gstyle.lineWidth = 1
+            self._grid_coords = coin.SoCoordinate3()
+            self._grid_lines = coin.SoIndexedLineSet()
+            gsep = coin.SoSeparator()
+            gsep.addChild(self._grid_color)
+            gsep.addChild(gstyle)
+            gsep.addChild(self._grid_coords)
+            gsep.addChild(self._grid_lines)
+            root.addChild(gsep)
+
             self._root = root
             vobj.addDisplayMode(root, "Wireframe")
             self._rebuild()
+            self._rebuild_grid()
 
         def _fill(self, coords, lines, mn, mx):
             """Set *coords*/*lines* to a box, or clear them when degenerate."""
@@ -492,9 +533,80 @@ if _GUI_AVAILABLE:
             self._fill(self._pml_coords, self._pml_lines,
                        obj.PmlMin, obj.PmlMax)
 
+        def _grid_segments(self, mn, mx, dx, dy, dz):
+            """Line segments for the three orthogonal cell grids on the min faces.
+
+            Returns ``(points, indices)`` for an ``SoIndexedLineSet``: an XY grid
+            at ``z = mn.z`` (lines every dx and dy), a YZ grid at ``x = mn.x``
+            (dy/dz) and an XZ grid at ``y = mn.y`` (dx/dz). Line counts per axis
+            are clamped to :data:`_MAX_GRID_LINES`.
+            """
+            pts = []
+            idx = []
+
+            def add_line(p0, p1):
+                a = len(pts)
+                pts.append(p0)
+                pts.append(p1)
+                idx.extend([a, a + 1, -1])
+
+            def ticks(lo, hi, step):
+                if step <= 0.0:
+                    return [lo, hi]
+                n = min(int(math.floor((hi - lo) / step + 1e-9)), _MAX_GRID_LINES)
+                vals = [lo + i * step for i in range(n + 1)]
+                if vals[-1] < hi - 1e-9:
+                    vals.append(hi)  # always close on the domain face
+                return vals
+
+            xs = ticks(mn.x, mx.x, dx)
+            ys = ticks(mn.y, mx.y, dy)
+            zs = ticks(mn.z, mx.z, dz)
+
+            # XY grid at z = mn.z
+            for x in xs:
+                add_line((x, mn.y, mn.z), (x, mx.y, mn.z))
+            for y in ys:
+                add_line((mn.x, y, mn.z), (mx.x, y, mn.z))
+            # YZ grid at x = mn.x
+            for y in ys:
+                add_line((mn.x, y, mn.z), (mn.x, y, mx.z))
+            for z in zs:
+                add_line((mn.x, mn.y, z), (mn.x, mx.y, z))
+            # XZ grid at y = mn.y
+            for x in xs:
+                add_line((x, mn.y, mn.z), (x, mn.y, mx.z))
+            for z in zs:
+                add_line((mn.x, mn.y, z), (mx.x, mn.y, z))
+            return pts, idx
+
+        def _rebuild_grid(self):
+            obj = getattr(self, "Object", None)
+            if obj is None:
+                return
+            mn, mx = obj.DomainMin, obj.DomainMax
+            coords, lines = self._grid_coords, self._grid_lines
+            if (mn - mx).Length < 1.0e-9:
+                if lines.coordIndex.getNum():
+                    lines.coordIndex.deleteValues(0)
+                if coords.point.getNum():
+                    coords.point.deleteValues(0)
+                return
+            pts, idx = self._grid_segments(
+                mn, mx, float(obj.Dx.Value), float(obj.Dy.Value), float(obj.Dz.Value)
+            )
+            coords.point.setValues(0, len(pts), pts)
+            if coords.point.getNum() > len(pts):
+                coords.point.deleteValues(len(pts))
+            lines.coordIndex.setValues(0, len(idx), idx)
+            if lines.coordIndex.getNum() > len(idx):
+                lines.coordIndex.deleteValues(len(idx))
+
         def updateData(self, obj, prop):
             if prop in ("DomainMin", "DomainMax", "PmlMin", "PmlMax"):
                 self._rebuild()
+            if prop in ("DomainMin", "DomainMax", "Dx", "Dy", "Dz"):
+                self._rebuild_grid()
 
         def getDisplayModes(self, vobj):
             return ["Wireframe"]
@@ -526,7 +638,7 @@ if _GUI_AVAILABLE:
         __setstate__ = loads
 
     class TaskDomainPanel:
-        """Task-tab panel: cell sizes, spacing, PML thickness, per-face BCs."""
+        """Task-tab panel: cell sizes, spacing, background, PML, per-face BCs."""
 
         def __init__(self, obj):
             try:
@@ -574,12 +686,33 @@ if _GUI_AVAILABLE:
             self._dpml.setSuffix(" cells")
             self._dpml.setValue(int(getattr(obj, "PMLThickness", 8)))
 
+            # Background (empty-voxel) material: a dropdown of the simulation's
+            # materials, with a leading vacuum entry for "unset". Index 0 maps to
+            # None (vacuum); index i maps to self._materials[i - 1].
+            from wavesim_gui.commands import active_simulation
+            from wavesim_gui import materials as materials_mod
+
+            sim = active_simulation(obj.Document)
+            self._materials = materials_mod.find_materials(sim) if sim else []
+            self._background = QtWidgets.QComboBox()
+            self._background.addItem("Vacuum (eps=1, mu=1)")
+            for mat in self._materials:
+                self._background.addItem(mat.Label)
+            current_bg = getattr(obj, "Background", None)
+            bg_index = 0
+            for i, mat in enumerate(self._materials, start=1):
+                if mat is current_bg:
+                    bg_index = i
+                    break
+            self._background.setCurrentIndex(bg_index)
+
             layout.addRow(self._cubic)
             layout.addRow("Cell size dx:", self._dx)
             layout.addRow("Cell size dy:", self._dy)
             layout.addRow("Cell size dz:", self._dz)
             layout.addRow("Cell counts:", self._counts)
             layout.addRow("Air spacing:", self._spacing)
+            layout.addRow("Background material:", self._background)
             layout.addRow("PML thickness:", self._dpml)
 
             self._combos = {}
@@ -606,17 +739,44 @@ if _GUI_AVAILABLE:
 
             self._cubic.toggled.connect(self._on_cubic)
             self._dx.valueChanged.connect(self._mirror_cubic)
+            # Recompute the derived cell counts live as the cell sizes change,
+            # before OK is pressed, so the user sees the grid resolution update.
+            self._dx.valueChanged.connect(self._update_counts)
+            self._dy.valueChanged.connect(self._update_counts)
+            self._dz.valueChanged.connect(self._update_counts)
             self._on_cubic(self._cubic.isChecked())
 
             self.form = form
 
-        def _counts_text(self):
-            nx = int(getattr(self.obj, "Nx", 0))
-            ny = int(getattr(self.obj, "Ny", 0))
-            nz = int(getattr(self.obj, "Nz", 0))
+        def _counts_text(self, dims=None):
+            if dims is not None:
+                nx, ny, nz = dims["Nx"], dims["Ny"], dims["Nz"]
+            else:
+                nx = int(getattr(self.obj, "Nx", 0))
+                ny = int(getattr(self.obj, "Ny", 0))
+                nz = int(getattr(self.obj, "Nz", 0))
             if nx and ny and nz:
                 return "{} x {} x {}  ({:,} cells)".format(nx, ny, nz, nx * ny * nz)
             return "(assign material geometry to size the grid)"
+
+        def _update_counts(self, *_):
+            """Recompute the derived cell counts from the spin-box cell sizes.
+
+            Mirrors what ``execute`` derives, but uses the (possibly uncommitted)
+            spin-box values so the count label tracks edits immediately. Falls
+            back to the stored counts if the cheap bbox derivation is unavailable.
+            """
+            from wavesim_gui.commands import active_simulation
+            from wavesim_gui import voxelize as vox
+
+            sim = active_simulation(self.obj.Document)
+            cell_m = (
+                self._dx.value() / _MM_PER_M,
+                self._dy.value() / _MM_PER_M,
+                self._dz.value() / _MM_PER_M,
+            )
+            dims = vox.derive_grid_dims(sim, cell_m) if sim else None
+            self._counts.setText(self._counts_text(dims))
 
         def _on_cubic(self, checked):
             self._dy.setEnabled(not checked)
@@ -636,6 +796,10 @@ if _GUI_AVAILABLE:
             self.obj.Dz = "{} mm".format(self._dz.value())
             self.obj.Spacing = "{} mm".format(self._spacing.value())
             self.obj.PMLThickness = int(self._dpml.value())
+            bg_index = self._background.currentIndex()
+            self.obj.Background = (
+                None if bg_index == 0 else self._materials[bg_index - 1]
+            )
             for prop, combo in self._combos.items():
                 setattr(self.obj, prop, combo.currentText())
             doc.commitTransaction()

@@ -342,6 +342,9 @@ def run_job(workdir):
         if done % progress_every == 0 or done == n_steps:
             _emit_progress(done, n_steps)
 
+    # Replace the last setup STATUS (solver load / TEM mode build) so the dialog
+    # label reflects what is actually happening while the bar advances.
+    _emit_status("Running FDTD simulation ({} time steps)...".format(n_steps))
     t0 = time.perf_counter()
     sim.run(n_steps, callback=callback)
     wall_time = time.perf_counter() - t0

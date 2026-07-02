@@ -25,7 +25,9 @@ Rendering
 ---------
 The source draws as a translucent teal plane on the chosen face spanning the
 domain box (mirroring the snapshot monitor's plane), so the launch plane is
-visible and the standard "eye" toggle shows/hides it.
+visible and the standard "eye" toggle shows/hides it. A matching teal arrow,
+anchored to a plane corner and kept at a fixed on-screen size, shows the
+direction of energy flow -- always *into* the simulation domain.
 
 Units: FreeCAD geometry/properties are in millimetres; the solver works in
 metres. :func:`tem_source_spec` converts the face plane's position to metres and
@@ -82,6 +84,9 @@ _PORT_BC = "PML"
 # Translucent teal plane, distinct from the orange monitor / green point source.
 _TEM_COLOR = (0.0, 0.80, 0.80)
 _TEM_TRANSPARENCY = 0.6
+
+# Energy-flow arrow: kept at a fixed on-screen length (pixels) regardless of zoom.
+_ARROW_PIXELS = 90.0
 
 _MM_PER_M = 1000.0
 _AXIS_IDX = {"x": 0, "y": 1, "z": 2}
@@ -205,6 +210,22 @@ def _face_corners(mn, mx, face):
     return [(mn.x, mn.y, z), (mx.x, mn.y, z), (mx.x, mx.y, z), (mn.x, mx.y, z)]
 
 
+def _flow_direction(face):
+    """Unit vector of energy flow *into* the domain from the launch *face*.
+
+    A port on a low face (``x0``/``y0``/``z0``) radiates in the +axis direction;
+    one on a high face radiates in the -axis direction. Either way the wave
+    flows inward, away from the absorbing PML face it launches from.
+    """
+    axis = face[0]
+    sign = 1.0 if face.endswith("0") else -1.0
+    return {
+        "x": (sign, 0.0, 0.0),
+        "y": (0.0, sign, 0.0),
+        "z": (0.0, 0.0, sign),
+    }[axis]
+
+
 # --------------------------------------------------------------------------- #
 # Lookup helpers & job serialisation
 # --------------------------------------------------------------------------- #
@@ -278,6 +299,36 @@ except Exception:  # console mode / no Qt
 
 if _GUI_AVAILABLE:
 
+    def _build_arrow_geometry():
+        """A unit arrow (shaft + head) pointing along +Y, base at the origin.
+
+        Nominal total length 1.0; the view provider's SoScale stretches it to a
+        fixed pixel size and an SoRotation aims it along the energy-flow
+        direction. Coin's SoCylinder/SoCone are centred on the origin with their
+        axis along +Y, so each is translated up by half its height to stack.
+        """
+        from pivy import coin
+
+        sep = coin.SoSeparator()
+
+        shaft_t = coin.SoTranslation()
+        shaft_t.translation.setValue(0.0, 0.35, 0.0)
+        sep.addChild(shaft_t)
+        shaft = coin.SoCylinder()
+        shaft.radius = 0.04
+        shaft.height = 0.7
+        sep.addChild(shaft)
+
+        head_t = coin.SoTranslation()
+        head_t.translation.setValue(0.0, 0.5, 0.0)  # 0.35 -> 0.85 (head centre)
+        sep.addChild(head_t)
+        head = coin.SoCone()
+        head.bottomRadius = 0.12
+        head.height = 0.3
+        sep.addChild(head)
+
+        return sep
+
     class TEMSourceViewProvider:
         """Coin view provider drawing the port as a translucent teal plane."""
 
@@ -320,9 +371,62 @@ if _GUI_AVAILABLE:
             border.addChild(self._border_lines)
             root.addChild(border)
 
+            # Energy-flow arrow, anchored to a plane corner, pointing into the
+            # domain. A callback rescales it every frame so it keeps a constant
+            # on-screen size; the SoScale it writes feeds Coin's element stack so
+            # bounding boxes stay correct.
+            arrow = coin.SoSeparator()
+            acolor = coin.SoBaseColor()
+            acolor.rgb.setValue(*_TEM_COLOR)
+            arrow.addChild(acolor)
+            self._arrow_pos = coin.SoTranslation()
+            arrow.addChild(self._arrow_pos)
+            self._arrow_cb = coin.SoCallback()
+            self._arrow_cb.setCallback(self._scale_arrow_cb)
+            arrow.addChild(self._arrow_cb)
+            self._arrow_scale = coin.SoScale()
+            self._arrow_scale.scaleFactor.setValue(0.0, 0.0, 0.0)
+            arrow.addChild(self._arrow_scale)
+            self._arrow_rot = coin.SoRotation()
+            arrow.addChild(self._arrow_rot)
+            arrow.addChild(_build_arrow_geometry())
+            self._arrow_on = False
+            root.addChild(arrow)
+
             self._root = root
             vobj.addDisplayMode(root, "Plane")
             self._rebuild()
+
+        def _scale_arrow_cb(self, user, action):
+            """Keep the arrow a fixed pixel length by setting its SoScale.
+
+            Runs only for the GL render action (the others have no view volume).
+            Reads the current view volume, viewport and model matrix from the
+            traversal state to map :data:`_ARROW_PIXELS` to world units at the
+            arrow's anchor, which works for both perspective and orthographic
+            cameras.
+            """
+            from pivy import coin
+
+            if not getattr(self, "_arrow_on", False):
+                return
+            if not action.isOfType(coin.SoGLRenderAction.getClassTypeId()):
+                return
+            state = action.getState()
+            vv = coin.SoViewVolumeElement.get(state)
+            vp = coin.SoViewportRegionElement.get(state)
+            mm = coin.SoModelMatrixElement.get(state)
+            height_px = float(vp.getViewportSizePixels()[1])
+            if height_px <= 0.0:
+                return
+            world = mm.multVecMatrix(coin.SbVec3f(0.0, 0.0, 0.0))
+            size = vv.getWorldToScreenScale(world, _ARROW_PIXELS / height_px)
+            # Only write the field when the size meaningfully changed: setting it
+            # every frame would notify the scene graph and spin a redraw loop.
+            last = getattr(self, "_arrow_last_size", 0.0)
+            if size > 0.0 and abs(size - last) > 1e-6 * max(size, last):
+                self._arrow_last_size = size
+                self._arrow_scale.scaleFactor.setValue(size, size, size)
 
         def _clear(self):
             if self._coords.point.getNum():
@@ -332,8 +436,14 @@ if _GUI_AVAILABLE:
                 self._border_coords.point.deleteValues(0)
             if self._border_lines.coordIndex.getNum():
                 self._border_lines.coordIndex.deleteValues(0)
+            # Collapse the arrow (the scale callback no-ops while off).
+            self._arrow_on = False
+            self._arrow_last_size = 0.0
+            self._arrow_scale.scaleFactor.setValue(0.0, 0.0, 0.0)
 
         def _rebuild(self):
+            from pivy import coin
+
             obj = getattr(self, "Object", None)
             if obj is None:
                 return
@@ -356,8 +466,17 @@ if _GUI_AVAILABLE:
             if self._border_lines.coordIndex.getNum() > len(edges):
                 self._border_lines.coordIndex.deleteValues(len(edges))
 
+            # Anchor the arrow to the first plane corner and point it into the
+            # domain along the face normal.
+            self._arrow_pos.translation.setValue(*pts[0])
+            d = _flow_direction(str(obj.Face))
+            self._arrow_rot.rotation.setValue(
+                coin.SbRotation(coin.SbVec3f(0.0, 1.0, 0.0), coin.SbVec3f(*d))
+            )
+            self._arrow_on = True
+
         def updateData(self, obj, prop):
-            if prop == "Corners":
+            if prop in ("Corners", "Face"):
                 self._rebuild()
 
         def getDisplayModes(self, vobj):

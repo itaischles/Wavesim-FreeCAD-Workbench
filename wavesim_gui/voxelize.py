@@ -12,6 +12,9 @@ voxelises into it, and returns a job spec plus the arrays to write as
 ``materials.npz``. Each future array-input concern (e.g. deferred array sources)
 gets its own descriptively-named ``.npz`` rather than growing this one.
 
+Empty voxels are filled with the Domain's chosen *background* Material (its
+eps/mu/PEC), defaulting to vacuum; bodies overwrite the cells they cover.
+
 This module is FreeCAD-side: it uses ``Part``/``Shape`` (FreeCAD's bundled
 ``numpy`` for the arrays) and is **not** importable by the solver Python.
 
@@ -261,7 +264,7 @@ def _layer_inside(body_shape, z_axis, z, pts, deflection):
     return inside if any_wire else None
 
 
-def _extrude_port_faces(arrays, port_faces):
+def _extrude_port_faces(arrays, port_faces, bg_eps=1.0, bg_mu=1.0, bg_pec=False):
     """Make the material arrays invariant along each TEM port's normal axis.
 
     For every face in *port_faces* (solver names ``'x0'``..``'z1'``) the
@@ -274,17 +277,23 @@ def _extrude_port_faces(arrays, port_faces):
     cross-section is uniform by construction so the copy is exact, whereas doing
     this on an arbitrary PML face could smear non-uniform geometry into the
     absorber. Modifies *arrays* in place.
+
+    ``bg_eps``/``bg_mu``/``bg_pec`` describe the background medium so "has
+    geometry" is detected relative to it (a non-vacuum background otherwise marks
+    every cell as filled).
     """
     import numpy as np
 
     axis_of = {"x": 0, "y": 1, "z": 2}
     keys = ("eps_x", "eps_y", "eps_z", "mu_x", "mu_y", "mu_z", "pec_mask")
-    # A cell holds material if it is PEC or differs from vacuum eps/mu. Computed
+    # A cell holds geometry if it differs from the background medium. Computed
     # once from the original geometry so two ports on one axis both extrude the
     # real cross-section rather than each other's fill.
-    present = arrays["pec_mask"].copy()
-    for key in ("eps_x", "eps_y", "eps_z", "mu_x", "mu_y", "mu_z"):
-        present |= arrays[key] != 1.0
+    present = arrays["pec_mask"] != bool(bg_pec)
+    for key in ("eps_x", "eps_y", "eps_z"):
+        present |= arrays[key] != bg_eps
+    for key in ("mu_x", "mu_y", "mu_z"):
+        present |= arrays[key] != bg_mu
 
     for face in port_faces:
         axis = axis_of.get(face[0])
@@ -308,7 +317,8 @@ def _extrude_port_faces(arrays, port_faces):
 def voxelize_materials(materials, cell_size_m, spacing_m=0.0,
                        pad_lo=(8, 8, 8), pad_hi=(8, 8, 8),
                        extra_points_mm=(), extra_axis_offsets=(),
-                       port_faces=(), max_total_cells=4_000_000, progress=None):
+                       port_faces=(), bg_eps=1.0, bg_mu=1.0, bg_pec=False,
+                       max_total_cells=4_000_000, progress=None):
     """Voxelise *materials* onto a regular grid bounding all their bodies.
 
     Parameters
@@ -339,6 +349,11 @@ def voxelize_materials(materials, cell_size_m, spacing_m=0.0,
         cross-section is extruded through the spacing + PML cells on that face
         (see :func:`_extrude_port_faces`) so the guided mode exits the absorber
         without re-reflecting. Empty for a run with no TEM ports.
+    bg_eps, bg_mu, bg_pec : float / float / bool
+        The background medium filling every "empty" voxel -- the eps/mu/PEC of
+        the Domain's chosen background Material (vacuum: ``1.0, 1.0, False``).
+        The arrays start filled with these; bodies overwrite the cells they
+        cover.
     max_total_cells : int
         Guard against an accidentally huge grid; raises ``ValueError`` above it.
     progress : callable, optional
@@ -378,9 +393,10 @@ def voxelize_materials(materials, cell_size_m, spacing_m=0.0,
         )
 
     shape = (Nx, Ny, Nz)
-    eps_arr = np.ones(shape, dtype=np.float64)
-    mu_arr = np.ones(shape, dtype=np.float64)
-    pec_mask = np.zeros(shape, dtype=bool)
+    # Start every voxel as the background medium; bodies overwrite their cells.
+    eps_arr = np.full(shape, float(bg_eps), dtype=np.float64)
+    mu_arr = np.full(shape, float(bg_mu), dtype=np.float64)
+    pec_mask = np.full(shape, bool(bg_pec), dtype=bool)
 
     Z_AXIS = FreeCAD.Vector(0.0, 0.0, 1.0)
     tol = min(dx_mm, dy_mm, dz_mm) * 1.0e-6
@@ -434,6 +450,8 @@ def voxelize_materials(materials, cell_size_m, spacing_m=0.0,
                 else:
                     eps_arr[gi, gj, k] = eps
                     mu_arr[gi, gj, k] = mu
+                    # A dielectric body overrides a PEC background at its cells.
+                    pec_mask[gi, gj, k] = False
             done_layers += 1
             if progress is not None and progress(done_layers, total_layers):
                 raise VoxelizationCancelled()
@@ -446,7 +464,8 @@ def voxelize_materials(materials, cell_size_m, spacing_m=0.0,
     # Extend each TEM-port cross-section through its spacing + PML cells so a
     # guided mode stays supported into the absorber (modifies arrays in place;
     # done before the counts below so they reflect the extruded geometry).
-    _extrude_port_faces(arrays, port_faces)
+    _extrude_port_faces(arrays, port_faces, bg_eps=bg_eps, bg_mu=bg_mu,
+                        bg_pec=bg_pec)
     return {
         "arrays": arrays,
         "grid": {
@@ -457,7 +476,7 @@ def voxelize_materials(materials, cell_size_m, spacing_m=0.0,
         },
         "origin_m": (ox / _MM_PER_M, oy / _MM_PER_M, oz / _MM_PER_M),
         "counts": {
-            "dielectric_cells": int(np.count_nonzero(eps_arr != 1.0)),
+            "dielectric_cells": int(np.count_nonzero(eps_arr != float(bg_eps))),
             "pec_cells": int(np.count_nonzero(pec_mask)),
         },
     }
@@ -493,6 +512,11 @@ def build_job_from_document(doc, steps=None, fmax=30.0e9, progress=None):
     materials = materials_mod.find_materials(sim)
     if not materials:
         return None, None
+    # Materials may exist (every new simulation seeds Vacuum + PEC) without any
+    # bodies assigned yet. With nothing to voxelise, behave like an empty
+    # document so the caller falls back to the demo box rather than erroring.
+    if not _gather(materials):
+        return None, None
 
     # The domain (cell sizes + boundaries) is created with the simulation; its
     # absence means a malformed document rather than something to guess around.
@@ -517,6 +541,12 @@ def build_job_from_document(doc, steps=None, fmax=30.0e9, progress=None):
     # TEM-port faces have their cross-section extruded through the spacing + PML
     # so the guided mode exits the absorber without re-reflecting back inside.
     port_faces = [str(t.Face) for t in tem_mod.find_tem_sources(sim)]
+    # Background (empty-voxel) medium: the Domain's chosen background Material,
+    # defaulting to vacuum when unset.
+    bg_mat = domain_mod.background_material(dom)
+    bg_eps = float(getattr(bg_mat, "Eps", 1.0)) if bg_mat is not None else 1.0
+    bg_mu = float(getattr(bg_mat, "Mu", 1.0)) if bg_mat is not None else 1.0
+    bg_pec = bool(getattr(bg_mat, "Pec", False)) if bg_mat is not None else False
     # Grow the grid to include every source position and snapshot slice, so an
     # input outside the material bounds (or in the PML) still lands inside it.
     vox = voxelize_materials(
@@ -524,6 +554,7 @@ def build_job_from_document(doc, steps=None, fmax=30.0e9, progress=None):
         extra_points_mm=source_points_mm(sim),
         extra_axis_offsets=snapshot_axis_offsets(sim),
         port_faces=port_faces,
+        bg_eps=bg_eps, bg_mu=bg_mu, bg_pec=bg_pec,
         progress=progress,
     )
     grid = vox["grid"]

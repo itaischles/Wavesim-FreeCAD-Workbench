@@ -354,7 +354,14 @@ if _GUI_AVAILABLE:
                 # The domain is a singleton created with the simulation; it
                 # starts empty and auto-sizes once material geometry is assigned.
                 from wavesim_gui import domain as domain_mod
-                domain_mod.create_domain(doc, sim)
+                domain = domain_mod.create_domain(doc, sim)
+
+                # Seed the two materials nearly every simulation needs, and make
+                # Vacuum the domain's default background (empty-voxel) medium.
+                from wavesim_gui import materials as materials_mod
+                vacuum, _pec = materials_mod.create_default_materials(doc, sim)
+                if hasattr(domain, "Background"):
+                    domain.Background = vacuum
             except Exception:
                 doc.abortTransaction()
                 raise

@@ -44,6 +44,10 @@ _MATERIALS_GROUP = "Materials"
 _DEFAULT_MATERIAL_COLOR = (0.30, 0.60, 0.90)
 _DEFAULT_BODY_COLOR = (0.80, 0.80, 0.80)
 
+# Colours for the two materials seeded with every new simulation.
+_VACUUM_COLOR = (0.75, 0.90, 1.00)
+_PEC_COLOR = (0.78, 0.78, 0.82)
+
 
 # --------------------------------------------------------------------------- #
 # Document-object model
@@ -209,6 +213,40 @@ def _detach_body(body, keep):
         bodies = getattr(mat, "Bodies", []) or []
         if body in bodies:
             mat.Bodies = [b for b in bodies if b is not body]
+
+
+def create_material(doc, sim, label, eps=1.0, mu=1.0, pec=False, color=None):
+    """Create a Material under *sim* with the given parameters and return it.
+
+    Attaches the tree view provider when a GUI is available, so it works both
+    from the New Material command and when seeding default materials in console
+    mode. The caller owns the transaction/recompute.
+    """
+    mat = doc.addObject("App::FeaturePython", "Material")
+    MaterialObject(mat)
+    mat.Pec = bool(pec)
+    mat.Eps = float(eps)
+    mat.Mu = float(mu)
+    if color is not None:
+        mat.Color = color
+    mat.Label = label
+    if _GUI_AVAILABLE and mat.ViewObject is not None:
+        MaterialViewProvider(mat.ViewObject)
+    materials_group(sim).addObject(mat)
+    return mat
+
+
+def create_default_materials(doc, sim):
+    """Seed a new simulation with the standard Vacuum and PEC materials.
+
+    Returns ``(vacuum, pec)``. Called by New Simulation so every document starts
+    with the two materials users almost always need; Vacuum also becomes the
+    Domain's default background (empty-voxel) medium.
+    """
+    vacuum = create_material(doc, sim, "Vacuum", eps=1.0, mu=1.0, pec=False,
+                             color=_VACUUM_COLOR)
+    pec = create_material(doc, sim, "PEC", pec=True, color=_PEC_COLOR)
+    return vacuum, pec
 
 
 # --------------------------------------------------------------------------- #

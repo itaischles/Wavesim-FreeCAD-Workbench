@@ -12,6 +12,7 @@ reused (and tested) independently of the command wiring.
 
 import json
 import os
+import time
 
 import FreeCAD
 
@@ -24,6 +25,60 @@ _WB_DIR = os.path.join(
     FreeCAD.getUserAppDataDir(), "Mod", "wavesim-workbench"
 )
 RUNNER_PATH = os.path.join(_WB_DIR, "runner.py")
+
+
+def _format_duration(seconds):
+    """Return a compact human-readable duration like ``1h 03m 05s``.
+
+    Sub-minute times keep one decimal (``4.2s``) so short runs still show
+    something meaningful; longer times drop to whole units.
+    """
+    seconds = max(0.0, float(seconds))
+    if seconds < 60.0:
+        return "{:.1f}s".format(seconds)
+    total = int(round(seconds))
+    hours, rem = divmod(total, 3600)
+    minutes, secs = divmod(rem, 60)
+    if hours:
+        return "{}h {:02d}m {:02d}s".format(hours, minutes, secs)
+    return "{}m {:02d}s".format(minutes, secs)
+
+
+def _progress_label(state, done, n_steps):
+    """Compose the multi-line progress-dialog label with a live ETA.
+
+    Keeps the latest coarse ``STATUS`` text (``state["status"]``) on the first
+    line and appends step count, percent, throughput and an estimated time to
+    completion built from the wall-clock rate since the first PROGRESS line.
+    ``state`` carries the anchor (``step_t0``/``step_done0``) between calls.
+    """
+    now = time.perf_counter()
+    if state["step_t0"] is None:
+        state["step_t0"] = now
+        state["step_done0"] = done
+
+    n_steps = max(1, int(n_steps))
+    done = max(0, min(int(done), n_steps))
+    pct = 100.0 * done / n_steps
+
+    lines = [state["status"], "Step {:,} / {:,}  ({:.1f}%)".format(
+        done, n_steps, pct)]
+
+    elapsed = now - state["step_t0"]
+    stepped = done - state["step_done0"]
+    if stepped > 0 and elapsed > 0.0:
+        rate = stepped / elapsed
+        remaining = n_steps - done
+        eta = remaining / rate if rate > 0 else 0.0
+        lines.append(
+            "Elapsed {} · ~{} remaining · {:,.0f} steps/s".format(
+                _format_duration(elapsed), _format_duration(eta), rate)
+        )
+    else:
+        lines.append("Elapsed {} · estimating time remaining...".format(
+            _format_duration(elapsed)))
+
+    return "\n".join(lines)
 
 
 def _read_summary(workdir):
@@ -117,8 +172,15 @@ def run_job(workdir, n_steps, parent=None, message="Running FDTD simulation...",
     process = QtCore.QProcess(parent)
     process.setProcessChannelMode(QtCore.QProcess.SeparateChannels)
 
-    # Accumulated stderr, surfaced if the run fails.
-    state = {"stderr": "", "stdout_tail": "", "cancelled": False}
+    # Accumulated stderr, surfaced if the run fails. ``status`` holds the latest
+    # coarse STATUS label so PROGRESS updates can re-append the live ETA line
+    # under it; ``step_t0``/``step_done0`` anchor the throughput estimate to the
+    # first PROGRESS line of the time-stepping loop (so solver load / TEM
+    # factorisation time doesn't drag the rate down).
+    state = {
+        "stderr": "", "stdout_tail": "", "cancelled": False,
+        "status": message, "step_t0": None, "step_done0": 0,
+    }
 
     # A busy (indeterminate) job uses a 0..0 range so Qt animates the bar; a
     # normal run uses 0..n_steps and is driven by the PROGRESS lines.
@@ -158,13 +220,15 @@ def run_job(workdir, n_steps, parent=None, message="Running FDTD simulation...",
             line = line.strip()
             if line.startswith("STATUS "):
                 text = line[len("STATUS "):].replace("\\n", "\n")
+                state["status"] = text
                 progress.setLabelText(text)
             elif line.startswith("PROGRESS ") and not busy:
                 try:
                     done = int(line.split()[1].split("/")[0])
-                    progress.setValue(min(done, n_steps))
                 except (ValueError, IndexError):
-                    pass
+                    continue
+                progress.setValue(min(done, n_steps))
+                progress.setLabelText(_progress_label(state, done, n_steps))
 
     def on_stderr():
         state["stderr"] += bytes(process.readAllStandardError()).decode(

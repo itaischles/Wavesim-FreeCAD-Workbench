@@ -34,8 +34,13 @@ job.json schema (Session 2)
                  # legacy jobs may instead carry flat "fmax"/"amplitude" keys
                  # (a Gaussian pulse); see _build_waveform for the param set.
       "tem_sources": [{"name":.., "normal":"z", "position":..,
+                       "direction": 1.0|-1.0,   # +/-normal launch (into domain)
+                       "conductor_id": 0,       # which solved mode to launch:
+                                                # a conductor label (see summary
+                                                # "modes"), 0/absent = dominant
                        "excitation": {"type":.., ...}, "fields":"EH"|"E"}, ...],
                        # legacy entries may carry flat "fmax"/"amplitude" keys
+                       # and omit "direction" (defaults to +normal / low face)
       "mode_only": false,                     # solve TEM modes only; no FDTD run
       "monitors": {
         "energy": true,
@@ -270,15 +275,46 @@ def _solve_tem_modes(ws, np, grid, job):
                 "fmax": fmax, "amplitude": amplitude, "fields": fields,
             })
 
-        # Launch the dominant (first) mode as a directional plane source. The
-        # mode is normalised to a 1 V drive, so the temporal waveform carries the
-        # amplitude and ``to_source`` is left at unit scale. The waveform is built
-        # from the port's excitation spec (same builder as the point source).
+        # Launch one mode as a directional plane source. By default that is the
+        # dominant (first) mode; a non-zero ``conductor_id`` selects the mode whose
+        # energized conductor carries that label (as shown in summary["modes"] /
+        # the results tree), falling back to the dominant mode with a warning if no
+        # such mode was found. The mode is normalised to a 1 V drive, so the
+        # temporal waveform carries the amplitude and ``to_source`` is left at unit
+        # scale. The waveform is built from the port's excitation spec (same
+        # builder as the point source).
         if modes and not mode_only:
+            wanted = int(t.get("conductor_id", 0))
+            chosen = modes[0]
+            if wanted > 0:
+                match = next(
+                    (m for m in modes if m.conductor_id == wanted), None
+                )
+                if match is None:
+                    sys.stderr.write(
+                        "wavesim: TEM port '{}' requested conductor {} but only "
+                        "conductors {} were solved; launching conductor {} "
+                        "instead.\n".format(
+                            name, wanted,
+                            [m.conductor_id for m in modes],
+                            modes[0].conductor_id,
+                        )
+                    )
+                else:
+                    chosen = match
             waveform = _build_waveform(ws, t)
-            plane_sources.append(
-                modes[0].to_source(waveform, amplitude=1.0, fields=fields)
-            )
+            src = chosen.to_source(waveform, amplitude=1.0, fields=fields)
+            # ``to_source`` builds H = (n̂ × E)/η for +normal propagation, so the
+            # wave always flows toward +normal. A port on a high face launches
+            # *into* the domain along -normal (direction < 0): flip H to reverse
+            # the Poynting vector S = E × H (E-only launches are bidirectional,
+            # so the sign is moot there and there is no H to flip).
+            direction = float(t.get("direction", 1.0))
+            if direction < 0 and getattr(src, "profiles", None):
+                for comp in list(src.profiles):
+                    if comp.startswith("H"):
+                        src.profiles[comp] = -src.profiles[comp]
+            plane_sources.append(src)
 
     return plane_sources, mode_arrays, mode_meta
 

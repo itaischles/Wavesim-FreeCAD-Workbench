@@ -138,6 +138,14 @@ class TEMSourceObject:
             )
             obj.Fields = ["EH", "E"]
             obj.Fields = "EH"
+        if not hasattr(obj, "Conductor"):
+            obj.addProperty(
+                "App::PropertyInteger", "Conductor", "Port",
+                "Which solved TEM mode to launch: the conductor label of the "
+                "energized conductor (shown in the results tree after 'Compute "
+                "Mode'). 0 = the dominant (first) mode.",
+            )
+            obj.Conductor = 0
 
         # Excitation enum + one property per waveform parameter (shared scheme).
         exc.ensure_object_props(obj)
@@ -150,6 +158,16 @@ class TEMSourceObject:
     def onDocumentRestored(self, obj):
         obj.Proxy = self
         self.Type = getattr(self, "Type", _TEM_TYPE)
+        # Back-fill the conductor-selection property on ports saved before it
+        # existed (defaults to the dominant mode, the old behaviour).
+        if not hasattr(obj, "Conductor"):
+            obj.addProperty(
+                "App::PropertyInteger", "Conductor", "Port",
+                "Which solved TEM mode to launch: the conductor label of the "
+                "energized conductor (shown in the results tree after 'Compute "
+                "Mode'). 0 = the dominant (first) mode.",
+            )
+            obj.Conductor = 0
         # Re-run property setup so ports saved before the extra waveforms gain
         # the new options + parameter properties and editor modes are re-asserted.
         exc.ensure_object_props(obj)
@@ -249,10 +267,16 @@ def tem_source_spec(obj, origin_m):
     axis = domain_mod.face_axis(face)
     world_mm = domain_mod.face_world_coord_mm(dom, face) if dom is not None else 0.0
     position = world_mm / _MM_PER_M - origin_m[_AXIS_IDX[axis]]
+    # Propagation sign along ``normal`` for the launch to flow *into* the domain:
+    # +1 from a low face (x0/y0/z0), -1 from a high face (x1/y1/z1). The solver's
+    # mode profiles assume +normal propagation, so the runner flips H when this is
+    # negative (mirrors _flow_direction, which aims the viewport arrow).
     return {
         "name": str(obj.Label or obj.Name),
         "normal": axis,
         "position": position,
+        "direction": 1.0 if face.endswith("0") else -1.0,
+        "conductor_id": int(getattr(obj, "Conductor", 0)),
         "excitation": exc.spec_from_object(obj),
         "fields": str(getattr(obj, "Fields", "EH")),
     }
@@ -531,8 +555,17 @@ if _GUI_AVAILABLE:
                                        _FIELDS_LABELS[0])
             )
 
+            # Which solved mode to launch, by energized-conductor label. 0 means
+            # the dominant (first) mode; other values match the "conductor N"
+            # nodes the results tree lists after Compute Mode.
+            self._conductor = QtWidgets.QSpinBox()
+            self._conductor.setRange(0, 999)
+            self._conductor.setSpecialValueText("Dominant (first mode)")
+            self._conductor.setValue(int(getattr(obj, "Conductor", 0)))
+
             layout.addRow("Launch face:", self._face)
             layout.addRow("Inject fields:", self._fields)
+            layout.addRow("Energize conductor:", self._conductor)
 
             # Excitation combo + per-waveform parameter rows + preview button
             # (shared with the point-source panel).
@@ -546,7 +579,11 @@ if _GUI_AVAILABLE:
                 "chosen face (which is set to PML automatically). The face must "
                 "cut at least two conductors. Pick a temporal waveform and its "
                 "parameters (preview with the plot button). 'Compute Mode' solves "
-                "and plots the mode now; otherwise it is solved when you Run. "
+                "and plots the mode(s) now; otherwise it is solved when you Run. "
+                "With several conductors on the face (e.g. two coax cross-sections), "
+                "Compute Mode lists one 'conductor N' mode per signal conductor in "
+                "the results tree — set 'Energize conductor' to that N to drive "
+                "that conductor (0 launches the dominant mode). "
                 "Frequency/time units are set on the Simulation object."
             )
             info.setWordWrap(True)
@@ -580,6 +617,7 @@ if _GUI_AVAILABLE:
             face = self._selected_face()
             self.obj.Face = face
             self.obj.Fields = _FIELDS_TOKEN[self._fields.currentText()]
+            self.obj.Conductor = int(self._conductor.value())
             self.write_excitation(self.obj)
             self.obj.Label = "TEM Source ({})".format(_describe(self.obj))
             # Absorbing port: force the launch face to PML.

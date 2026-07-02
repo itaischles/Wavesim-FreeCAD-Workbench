@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """Diagnostic monitors for the Wavesim workbench (Session 7).
 
-Three kinds of monitor are scripted FreeCAD DocumentObjects grouped under the
+Five kinds of monitor are scripted FreeCAD DocumentObjects grouped under the
 simulation's "Monitors" child group, each mapping onto one of the solver's
 monitor dataclasses (:mod:`wavesim.monitors`):
 
@@ -14,6 +14,16 @@ monitor dataclasses (:mod:`wavesim.monitors`):
   always perpendicular to z; its position along z is editable.)
 * **Energy** (``EnergyMonitor``) -- the whole-domain total-energy diagnostic. It
   has no location, so it is a tree-only object with no 3D representation.
+* **Voltage** (``VoltageMonitor``) -- records V(t) = ∫E·dl along an *open*
+  curve, integrated from the curve's first vertex to its last.
+* **Current** (``CurrentMonitor``) -- records I(t) = ∮H·dl around a *closed*
+  curve (Ampère's law; the solver closes an open path automatically).
+
+The voltage/current monitors take their integration path from a **sketch**: the
+user draws an open/closed curve sketch, adds the monitor, then drags the sketch
+onto the monitor in the model tree (mirroring how bodies are assigned to
+Materials). The sketch is claimed as a tree child of the monitor and its curve
+is discretised into a polyline for the solver at job-build time.
 
 Like every scripted ViewProvider these carry the standard ``Visibility`` property,
 so the tree's "eye" toggle shows/hides each monitor's marker/plane. Double-clicking
@@ -24,8 +34,9 @@ Point/plane positions are stored in mm; :func:`probe_spec` / :func:`snapshot_spe
 convert to metres and into the solver frame (measured from the domain origin) for
 the runner, mirroring :func:`wavesim_gui.source.source_spec`.
 
-Importing this module registers ``Wavesim_AddProbe``, ``Wavesim_AddSnapshot`` and
-``Wavesim_AddEnergyMonitor`` with ``Gui.addCommand`` when a GUI is available.
+Importing this module registers ``Wavesim_AddProbe``, ``Wavesim_AddSnapshot``,
+``Wavesim_AddEnergyMonitor``, ``Wavesim_AddVoltageMonitor`` and
+``Wavesim_AddCurrentMonitor`` with ``Gui.addCommand`` when a GUI is available.
 """
 
 import os
@@ -51,6 +62,8 @@ _TYPE_PROP = "WavesimType"
 _PROBE_TYPE = "Probe"
 _SNAPSHOT_TYPE = "Snapshot"
 _ENERGY_TYPE = "EnergyMonitor"
+_VOLTAGE_TYPE = "VoltageMonitor"
+_CURRENT_TYPE = "CurrentMonitor"
 
 # Name of the child group (created by CommandNewSimulation) holding monitors.
 _MONITORS_GROUP = "Monitors"
@@ -283,6 +296,53 @@ class EnergyObject:
     __setstate__ = loads
 
 
+class PathMonitorObject:
+    """``Proxy`` shared by the Voltage and Current line-integral monitors.
+
+    Both integrate a field along a curve drawn as a sketch (voltage: E along an
+    open curve, current: H around a closed one); the only per-kind difference is
+    the ``WavesimType`` marker, so one proxy class serves both.
+
+    Properties:
+        ``Sketch`` -- link to the sketch (or any edge-carrying object) whose
+                      curve is the integration path. Assigned by dragging the
+                      sketch onto the monitor in the model tree.
+    """
+
+    def __init__(self, obj, type_name):
+        self.Type = type_name
+        obj.Proxy = self
+        _add_type_marker(obj, type_name)
+
+        if not hasattr(obj, "Sketch"):
+            obj.addProperty(
+                "App::PropertyLink", "Sketch", "Monitor",
+                "Sketch whose curve is the integration path (drag a sketch "
+                "from the tree onto this monitor to assign it)",
+            )
+
+    def onDocumentRestored(self, obj):
+        obj.Proxy = self
+        # Recover the kind from the identity marker if the pickled state is gone.
+        self.Type = getattr(self, "Type", None) or getattr(
+            obj, _TYPE_PROP, _VOLTAGE_TYPE
+        )
+
+    def execute(self, obj):
+        pass
+
+    def dumps(self):
+        return {"Type": getattr(self, "Type", _VOLTAGE_TYPE)}
+
+    def loads(self, state):
+        if isinstance(state, dict):
+            self.Type = state.get("Type", _VOLTAGE_TYPE)
+        return None
+
+    __getstate__ = dumps
+    __setstate__ = loads
+
+
 # --------------------------------------------------------------------------- #
 # Lookup helpers
 # --------------------------------------------------------------------------- #
@@ -340,6 +400,45 @@ def find_snapshots(sim):
 def find_energy_monitors(sim):
     """Return all Energy monitors under the Simulation container *sim*."""
     return _find(sim, is_energy_monitor)
+
+
+def is_voltage_monitor(obj):
+    """Return True if *obj* is a Wavesim Voltage monitor."""
+    return _is_type(obj, _VOLTAGE_TYPE)
+
+
+def is_current_monitor(obj):
+    """Return True if *obj* is a Wavesim Current monitor."""
+    return _is_type(obj, _CURRENT_TYPE)
+
+
+def find_voltage_monitors(sim):
+    """Return all Voltage monitors under the Simulation container *sim*."""
+    return _find(sim, is_voltage_monitor)
+
+
+def find_current_monitors(sim):
+    """Return all Current monitors under the Simulation container *sim*."""
+    return _find(sim, is_current_monitor)
+
+
+def path_monitor_points_mm(sim):
+    """World-mm bbox corners of every voltage/current monitor curve under *sim*.
+
+    Feeds the domain auto-sizing (like source points and snapshot offsets), so a
+    monitor curve outside the material bounds enlarges the domain to contain it
+    rather than having its quadrature points clipped to the grid edge.
+    """
+    pts = []
+    for mon in find_voltage_monitors(sim) + find_current_monitors(sim):
+        sketch = getattr(mon, "Sketch", None)
+        shape = getattr(sketch, "Shape", None) if sketch is not None else None
+        if shape is None or not getattr(shape, "Edges", None):
+            continue
+        bb = shape.BoundBox
+        pts.append((bb.XMin, bb.YMin, bb.ZMin))
+        pts.append((bb.XMax, bb.YMax, bb.ZMax))
+    return pts
 
 
 def snapshot_axis_offsets(sim):
@@ -411,19 +510,109 @@ def snapshot_spec(snap, origin_m):
     }
 
 
+def _path_deflection_mm(sim):
+    """Chordal tolerance (mm) for discretising monitor curves.
+
+    A quarter of the smallest domain cell keeps the polyline well below the grid
+    resolution (the solver further subdivides each segment to half-cell steps).
+    Falls back to 0.5 mm when no domain exists yet.
+    """
+    from wavesim_gui import domain as domain_mod
+
+    dom = domain_mod.find_domain(sim)
+    if dom is not None:
+        try:
+            return 0.25 * min(
+                float(dom.Dx.Value), float(dom.Dy.Value), float(dom.Dz.Value)
+            )
+        except Exception:
+            pass
+    return 0.5
+
+
+def _monitor_path_mm(mon, deflection_mm):
+    """Ordered world-mm vertices of *mon*'s linked sketch curve, or ``None``.
+
+    The sketch's edges are sorted into connected wires; the longest wire is
+    discretised to the given chordal tolerance. Vertex order (and so the sign of
+    the recorded integral) follows the wire's own direction.
+    """
+    sketch = getattr(mon, "Sketch", None)
+    shape = getattr(sketch, "Shape", None) if sketch is not None else None
+    edges = list(getattr(shape, "Edges", []) or []) if shape is not None else []
+    if not edges:
+        return None
+    import Part
+
+    wires = []
+    for group in Part.sortEdges(edges):
+        try:
+            wires.append(Part.Wire(group))
+        except Exception:
+            continue
+    if not wires:
+        return None
+    if len(wires) > 1:
+        FreeCAD.Console.PrintWarning(
+            "Wavesim: sketch '{}' on monitor '{}' has {} disconnected curves; "
+            "using the longest.\n".format(sketch.Label, mon.Label, len(wires))
+        )
+    wire = max(wires, key=lambda w: w.Length)
+    return wire.discretize(Deflection=max(float(deflection_mm), 1.0e-6))
+
+
+def _path_spec(mon, origin_m, deflection_mm):
+    """Return the ``job.json`` dict for a voltage/current monitor, or ``None``.
+
+    The path is the discretised sketch curve in solver-frame metres. Monitors
+    without an assigned (or empty) sketch are skipped with a warning so the run
+    still proceeds.
+    """
+    pts = _monitor_path_mm(mon, deflection_mm)
+    if pts is None or len(pts) < 2:
+        FreeCAD.Console.PrintWarning(
+            "Wavesim: monitor '{}' has no sketch curve assigned (drag a sketch "
+            "onto it in the tree); skipping it.\n".format(mon.Label)
+        )
+        return None
+    return {
+        "name": str(mon.Label or mon.Name),
+        "path": [
+            [
+                p.x / _MM_PER_M - origin_m[0],
+                p.y / _MM_PER_M - origin_m[1],
+                p.z / _MM_PER_M - origin_m[2],
+            ]
+            for p in pts
+        ],
+    }
+
+
 def monitors_spec(sim, origin_m):
     """Return the ``job.json`` ``monitors`` dict for the simulation *sim*.
 
     ``energy`` is on when an explicit Energy monitor exists, or when no monitors
     are defined at all (preserving the always-on energy diagnostic of earlier
-    sessions). When the user has defined only probes/snapshots, energy is left
-    off so the job records exactly what was asked for.
+    sessions). When the user has defined only probes/snapshots/voltages/currents,
+    energy is left off so the job records exactly what was asked for.
     """
     probes = [probe_spec(p, origin_m) for p in find_probes(sim)]
     snapshots = [snapshot_spec(s, origin_m) for s in find_snapshots(sim)]
+    deflection = _path_deflection_mm(sim)
+    voltages = [
+        s for s in (_path_spec(m, origin_m, deflection)
+                    for m in find_voltage_monitors(sim)) if s
+    ]
+    currents = [
+        s for s in (_path_spec(m, origin_m, deflection)
+                    for m in find_current_monitors(sim)) if s
+    ]
     energy_objs = find_energy_monitors(sim)
-    energy = bool(energy_objs) or not (probes or snapshots)
-    return {"energy": energy, "probes": probes, "snapshots": snapshots}
+    energy = bool(energy_objs) or not (probes or snapshots or voltages or currents)
+    return {
+        "energy": energy, "probes": probes, "snapshots": snapshots,
+        "voltages": voltages, "currents": currents,
+    }
 
 
 def _probe_label(obj):
@@ -438,6 +627,14 @@ def _snapshot_label(obj):
         getattr(obj, "Component", "Ez"), plane, axis, off_mm,
         int(getattr(obj, "EveryNSteps", 20)),
     )
+
+
+def _path_monitor_label(obj):
+    kind = "Voltage" if is_voltage_monitor(obj) else "Current"
+    sketch = getattr(obj, "Sketch", None)
+    if sketch is not None:
+        return "{} Monitor ({})".format(kind, sketch.Label)
+    return "{} Monitor (no curve)".format(kind)
 
 
 # --------------------------------------------------------------------------- #
@@ -651,6 +848,82 @@ if _GUI_AVAILABLE:
 
         def getIcon(self):
             return _MONITOR_ICON
+
+        def dumps(self):
+            return None
+
+        def loads(self, state):
+            return None
+
+        __getstate__ = dumps
+        __setstate__ = loads
+
+    def _is_curve_object(obj):
+        """True if *obj* carries a curve Shape (edges, no solids) -- a sketch,
+        Draft wire, etc. -- and so can serve as a monitor integration path."""
+        shape = getattr(obj, "Shape", None)
+        if shape is None or getattr(shape, "Solids", None):
+            return False
+        return bool(getattr(shape, "Edges", None))
+
+    def _after_path_changed(doc):
+        """Recompute and re-size the domain after a monitor's curve changes."""
+        from wavesim_gui import domain as domain_mod
+        domain_mod.notify_domain_inputs_changed(doc)
+
+    class PathMonitorViewProvider:
+        """Tree view provider for voltage/current monitors.
+
+        No 3D geometry of its own -- the linked sketch *is* the curve, and it is
+        claimed as a tree child of the monitor. Assignment mirrors Materials:
+        drag a sketch onto the monitor to attach it, drag it off to detach.
+        """
+
+        def __init__(self, vobj):
+            vobj.Proxy = self
+
+        def attach(self, vobj):
+            self.ViewObject = vobj
+            self.Object = vobj.Object
+
+        def getIcon(self):
+            return _MONITOR_ICON
+
+        def claimChildren(self):
+            obj = getattr(self, "Object", None)
+            sketch = getattr(obj, "Sketch", None) if obj is not None else None
+            return [sketch] if sketch is not None else []
+
+        # -- Drag & drop: attach the path sketch by dropping it here --------- #
+
+        def canDragObjects(self):
+            return True
+
+        def canDragObject(self, obj):
+            return True
+
+        def dragObject(self, vobj, obj):
+            """Detach the sketch when it is dragged off the monitor."""
+            mon = vobj.Object
+            if getattr(mon, "Sketch", None) is obj:
+                mon.Sketch = None
+                mon.Label = _path_monitor_label(mon)
+                _after_path_changed(mon.Document)
+
+        def canDropObjects(self):
+            return True
+
+        def canDropObject(self, obj):
+            return _is_curve_object(obj)
+
+        def dropObject(self, vobj, obj):
+            """Attach the dropped sketch as this monitor's integration path."""
+            mon = vobj.Object
+            if not _is_curve_object(obj):
+                return
+            mon.Sketch = obj
+            mon.Label = _path_monitor_label(mon)
+            _after_path_changed(mon.Document)
 
         def dumps(self):
             return None
@@ -1015,6 +1288,76 @@ if _GUI_AVAILABLE:
         def IsActive(self):
             return active_simulation(FreeCAD.ActiveDocument) is not None
 
+    class _CommandAddPathMonitor:
+        """Shared Activated/IsActive for the voltage and current commands."""
+
+        _TYPE = _VOLTAGE_TYPE       # overridden per subclass
+        _TRANSACTION = "Wavesim: Add Monitor"
+        _HINT = ""
+
+        def Activated(self):
+            doc = FreeCAD.ActiveDocument
+            sim = _require_simulation()
+            if sim is None:
+                return
+            doc.openTransaction(self._TRANSACTION)
+            try:
+                mon = doc.addObject("App::FeaturePython", self._TYPE)
+                PathMonitorObject(mon, self._TYPE)
+                mon.Label = _path_monitor_label(mon)
+                if mon.ViewObject is not None:
+                    PathMonitorViewProvider(mon.ViewObject)
+                monitors_group(sim).addObject(mon)
+            except Exception:
+                doc.abortTransaction()
+                raise
+            doc.commitTransaction()
+            doc.recompute()
+            FreeCAD.Console.PrintMessage(self._HINT)
+
+        def IsActive(self):
+            return active_simulation(FreeCAD.ActiveDocument) is not None
+
+    class CommandAddVoltageMonitor(_CommandAddPathMonitor):
+        """Add a voltage monitor; the user then drags its path sketch onto it."""
+
+        _TYPE = _VOLTAGE_TYPE
+        _TRANSACTION = "Wavesim: Add Voltage Monitor"
+        _HINT = (
+            "Wavesim: drag an open-curve sketch from the model tree onto the "
+            "Voltage Monitor to set its integration path (V = ∫E·dl from the "
+            "curve's start to its end).\n"
+        )
+
+        def GetResources(self):
+            return {
+                "Pixmap": _MONITOR_ICON,
+                "MenuText": "Add Voltage Monitor",
+                "ToolTip": "Record the voltage V(t) = ∫E·dl along an open "
+                "sketch curve (drag the sketch onto the monitor in the tree)",
+            }
+
+    class CommandAddCurrentMonitor(_CommandAddPathMonitor):
+        """Add a current monitor; the user then drags its loop sketch onto it."""
+
+        _TYPE = _CURRENT_TYPE
+        _TRANSACTION = "Wavesim: Add Current Monitor"
+        _HINT = (
+            "Wavesim: drag a closed-curve sketch from the model tree onto the "
+            "Current Monitor to set its integration loop (I = ∮H·dl, positive "
+            "by the right-hand rule along the curve direction).\n"
+        )
+
+        def GetResources(self):
+            return {
+                "Pixmap": _MONITOR_ICON,
+                "MenuText": "Add Current Monitor",
+                "ToolTip": "Record the current I(t) = ∮H·dl around a closed "
+                "sketch curve (drag the sketch onto the monitor in the tree)",
+            }
+
     Gui.addCommand("Wavesim_AddProbe", CommandAddProbe())
     Gui.addCommand("Wavesim_AddSnapshot", CommandAddSnapshot())
     Gui.addCommand("Wavesim_AddEnergyMonitor", CommandAddEnergyMonitor())
+    Gui.addCommand("Wavesim_AddVoltageMonitor", CommandAddVoltageMonitor())
+    Gui.addCommand("Wavesim_AddCurrentMonitor", CommandAddCurrentMonitor())

@@ -156,15 +156,26 @@ def snapshot_axis_offsets(sim):
     return monitors_mod.snapshot_axis_offsets(sim)
 
 
-def combined_bbox_mm(sim, materials):
-    """Material union-bbox (mm) grown to include sources and snapshot slices.
+def path_monitor_points_mm(sim):
+    """Bbox corners (mm) of every voltage/current monitor curve under *sim*."""
+    if sim is None:
+        return []
+    from wavesim_gui import monitors as monitors_mod
 
-    The domain auto-sizes to this combined box, so a source or snapshot slice
-    placed outside the material bounds (or in the PML) enlarges the domain to
-    contain it. Returns ``None`` when there is nothing to bound.
+    return monitors_mod.path_monitor_points_mm(sim)
+
+
+def combined_bbox_mm(sim, materials):
+    """Material union-bbox (mm) grown to include sources and monitor geometry.
+
+    The domain auto-sizes to this combined box, so a source, snapshot slice or
+    voltage/current monitor curve placed outside the material bounds (or in the
+    PML) enlarges the domain to contain it. Returns ``None`` when there is
+    nothing to bound.
     """
     bbox = materials_bbox_mm(materials)
     bbox = _expand_bbox_points(bbox, source_points_mm(sim))
+    bbox = _expand_bbox_points(bbox, path_monitor_points_mm(sim))
     bbox = _expand_bbox_axis(bbox, snapshot_axis_offsets(sim))
     return bbox
 

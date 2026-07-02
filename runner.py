@@ -36,7 +36,9 @@ job.json schema (Session 2)
         "energy": true,
         "probes":    [{"name":.., "component":"Ez", "x":.., "y":.., "z":..}, ...],
         "snapshots": [{"name":.., "component":"Ez", "normal":"z",
-                       "position":.., "every_N_steps":20}, ...]
+                       "position":.., "every_N_steps":20}, ...],
+        "voltages":  [{"name":.., "path": [[x,y,z], ...]}, ...],
+        "currents":  [{"name":.., "path": [[x,y,z], ...]}, ...]
       }
     }
 
@@ -315,11 +317,23 @@ def run_job(workdir):
             ),
         ))
 
+    # Line-integral monitors: V = int E.dl / I = loop-int H.dl along a polyline
+    # of solver-frame vertices (discretised from a sketch on the FreeCAD side).
+    voltages = []  # (name, VoltageMonitor)
+    for v in mon_cfg.get("voltages", []):
+        voltages.append((v.get("name", "voltage"), ws.VoltageMonitor(v["path"])))
+
+    currents = []  # (name, CurrentMonitor)
+    for c in mon_cfg.get("currents", []):
+        currents.append((c.get("name", "current"), ws.CurrentMonitor(c["path"])))
+
     all_monitors = []
     if energy is not None:
         all_monitors.append(energy)
     all_monitors.extend(m for _name, m in probes)
     all_monitors.extend(m for _name, m in snapshots)
+    all_monitors.extend(m for _name, m in voltages)
+    all_monitors.extend(m for _name, m in currents)
 
     sim = ws.Simulation(
         grid,
@@ -375,6 +389,19 @@ def run_job(workdir):
             "frames": len(mon.snapshots),
         })
 
+    # Voltage/current line integrals: one time series each, keyed by index.
+    voltage_meta = []
+    for idx, (name, mon) in enumerate(voltages):
+        result_arrays["voltage_{}_times".format(idx)] = np.asarray(mon.times)
+        result_arrays["voltage_{}_values".format(idx)] = np.asarray(mon.values)
+        voltage_meta.append({"name": name})
+
+    current_meta = []
+    for idx, (name, mon) in enumerate(currents):
+        result_arrays["current_{}_times".format(idx)] = np.asarray(mon.times)
+        result_arrays["current_{}_values".format(idx)] = np.asarray(mon.values)
+        current_meta.append({"name": name})
+
     np.savez(os.path.join(workdir, "results.npz"), **result_arrays)
 
     summary = {
@@ -396,6 +423,10 @@ def run_job(workdir):
         summary["probes"] = probe_meta
     if snapshot_meta:
         summary["snapshots"] = snapshot_meta
+    if voltage_meta:
+        summary["voltages"] = voltage_meta
+    if current_meta:
+        summary["currents"] = current_meta
     if mode_meta:
         summary["modes"] = mode_meta
     with open(os.path.join(workdir, "summary.json"), "w", encoding="utf-8") as handle:

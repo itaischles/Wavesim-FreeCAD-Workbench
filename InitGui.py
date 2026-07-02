@@ -54,6 +54,8 @@ class WavesimWorkbench(Gui.Workbench):
             self.command_list.append("Wavesim_AddProbe")
             self.command_list.append("Wavesim_AddSnapshot")
             self.command_list.append("Wavesim_AddEnergyMonitor")
+            self.command_list.append("Wavesim_AddVoltageMonitor")
+            self.command_list.append("Wavesim_AddCurrentMonitor")
             self.command_list.append("Wavesim_Run")
         except Exception as exc:
             FreeCAD.Console.PrintError(

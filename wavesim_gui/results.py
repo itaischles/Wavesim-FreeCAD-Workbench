@@ -6,6 +6,7 @@ Simulation tree holding one leaf object per monitor that produced data:
 
 * **Energy** -- the total-domain energy time series.
 * **Probe**  -- a single field component (or magnitude) at one point vs. time.
+* **Voltage** / **Current** -- line-integral (V = ∫E·dl / I = ∮H·dl) time series.
 * **Snapshot** -- a stack of 2D field slices animated over time.
 
 Each leaf is self-contained: it stores the run's output directory and the key
@@ -50,6 +51,8 @@ _KIND_ENERGY = "energy"
 _KIND_PROBE = "probe"
 _KIND_SNAPSHOT = "snapshot"
 _KIND_MODE = "mode"
+_KIND_VOLTAGE = "voltage"
+_KIND_CURRENT = "current"
 
 _RESULTS_GROUP = "Results"
 
@@ -279,6 +282,14 @@ def build_results(doc, sim, workdir, summary):
                 "{} ({})".format(name, comp) if comp else name,
                 _KIND_PROBE, "probe_{}".format(idx), comp,
             )
+
+        # Voltage/current line integrals (one time series each).
+        for kind, prefix in ((_KIND_VOLTAGE, "voltage"), (_KIND_CURRENT, "current")):
+            for idx, meta in enumerate(summary.get(prefix + "s", [])):
+                if "{}_{}_values".format(prefix, idx) not in keys:
+                    continue
+                name = meta.get("name") or "{} {}".format(prefix.title(), idx)
+                _new_leaf(name, kind, "{}_{}".format(prefix, idx))
 
         # Snapshots (frame stacks). Capture the slice's physical extent from the
         # producing monitor so the animation can be drawn in millimetres.
@@ -578,6 +589,10 @@ if _GUI_AVAILABLE:
                 _plot_energy(obj)
             elif kind == _KIND_PROBE:
                 _plot_probe(obj)
+            elif kind == _KIND_VOLTAGE:
+                _plot_voltage(obj)
+            elif kind == _KIND_CURRENT:
+                _plot_current(obj)
             elif kind == _KIND_SNAPSHOT:
                 _plot_snapshot(obj)
             elif kind == _KIND_MODE:
@@ -604,31 +619,12 @@ if _GUI_AVAILABLE:
             "or deleted:\n{}".format(getattr(obj, "ResultsDir", "?")),
         )
 
-    def _plot_energy(obj):
-        workdir = str(obj.ResultsDir)
-        times = _load_array(workdir, "energy_times")
-        values = _load_array(workdir, "energy_values")
-        if times is None or values is None:
-            _missing(obj)
-            return
-        unit = _time_unit(obj)
-        t = [units.time_from_si(float(v), unit) for v in times]
+    def _plot_series(obj, ylabel, title, color):
+        """1D time-series plot shared by the energy/probe/voltage/current leaves.
 
-        made = _make_window("Wavesim Results - Energy")
-        if made is None:
-            return
-        dialog, figure, _layout = made
-        ax = figure.add_subplot(111)
-        ax.plot(t, values, color="#d65a00")
-        ax.set_xlabel("time ({})".format(unit))
-        ax.set_ylabel("total energy")
-        ax.set_title("Total domain energy")
-        ax.grid(True, alpha=0.3)
-        dialog._canvas.draw()
-        dialog.show()
-        _register_window(dialog)
-
-    def _plot_probe(obj):
+        Reads ``<DataKey>_times`` / ``<DataKey>_values`` from the leaf's
+        ``results.npz`` and draws them in a non-modal window.
+        """
         workdir = str(obj.ResultsDir)
         key = str(obj.DataKey)
         times = _load_array(workdir, key + "_times")
@@ -637,7 +633,6 @@ if _GUI_AVAILABLE:
             _missing(obj)
             return
         unit = _time_unit(obj)
-        comp = str(getattr(obj, "Component", "")) or "field"
         t = [units.time_from_si(float(v), unit) for v in times]
 
         made = _make_window("Wavesim Results - {}".format(obj.Label))
@@ -645,14 +640,31 @@ if _GUI_AVAILABLE:
             return
         dialog, figure, _layout = made
         ax = figure.add_subplot(111)
-        ax.plot(t, values, color="#1f77b4")
+        ax.plot(t, values, color=color)
         ax.set_xlabel("time ({})".format(unit))
-        ax.set_ylabel(comp)
-        ax.set_title("Probe: {} vs. time".format(comp))
+        ax.set_ylabel(ylabel)
+        ax.set_title(title)
         ax.grid(True, alpha=0.3)
         dialog._canvas.draw()
         dialog.show()
         _register_window(dialog)
+
+    def _plot_energy(obj):
+        _plot_series(obj, "total energy", "Total domain energy", "#d65a00")
+
+    def _plot_probe(obj):
+        comp = str(getattr(obj, "Component", "")) or "field"
+        _plot_series(obj, comp, "Probe: {} vs. time".format(comp), "#1f77b4")
+
+    def _plot_voltage(obj):
+        _plot_series(
+            obj, "voltage (V)", "Voltage: ∫E·dl vs. time", "#2ca02c"
+        )
+
+    def _plot_current(obj):
+        _plot_series(
+            obj, "current (A)", "Current: ∮H·dl vs. time", "#9467bd"
+        )
 
     def _plot_snapshot(obj):
         import numpy as np

@@ -165,17 +165,33 @@ def path_monitor_points_mm(sim):
     return monitors_mod.path_monitor_points_mm(sim)
 
 
+def spice_line_port_points_mm(sim):
+    """World-mm endpoints of every SPICE line port's curve under *sim*."""
+    if sim is None:
+        return []
+    from wavesim_gui import spice_port as spice_mod
+
+    pts = []
+    for port in spice_mod.find_spice_line_ports(sim):
+        ends = spice_mod._line_endpoints_mm(port)
+        if ends is not None:
+            pts.append((ends[0].x, ends[0].y, ends[0].z))
+            pts.append((ends[1].x, ends[1].y, ends[1].z))
+    return pts
+
+
 def combined_bbox_mm(sim, materials):
     """Material union-bbox (mm) grown to include sources and monitor geometry.
 
-    The domain auto-sizes to this combined box, so a source, snapshot slice or
-    voltage/current monitor curve placed outside the material bounds (or in the
-    PML) enlarges the domain to contain it. Returns ``None`` when there is
-    nothing to bound.
+    The domain auto-sizes to this combined box, so a source, snapshot slice,
+    voltage/current monitor curve or SPICE line port placed outside the material
+    bounds (or in the PML) enlarges the domain to contain it. Returns ``None``
+    when there is nothing to bound.
     """
     bbox = materials_bbox_mm(materials)
     bbox = _expand_bbox_points(bbox, source_points_mm(sim))
     bbox = _expand_bbox_points(bbox, path_monitor_points_mm(sim))
+    bbox = _expand_bbox_points(bbox, spice_line_port_points_mm(sim))
     bbox = _expand_bbox_axis(bbox, snapshot_axis_offsets(sim))
     return bbox
 
@@ -551,7 +567,12 @@ def build_job_from_document(doc, steps=None, fmax=30.0e9, progress=None):
     spacing_m, pad_lo, pad_hi, _dom = _sizing_for(sim, 8)
     # TEM-port faces have their cross-section extruded through the spacing + PML
     # so the guided mode exits the absorber without re-reflecting back inside.
+    from wavesim_gui import spice_port as spice_mod
+
     port_faces = [str(t.Face) for t in tem_mod.find_tem_sources(sim)]
+    # SPICE TEM ports launch a guided mode too, so extrude their cross-sections
+    # through the absorber as well.
+    port_faces += [str(p.Face) for p in spice_mod.find_spice_tem_ports(sim)]
     # Background (empty-voxel) medium: the Domain's chosen background Material,
     # defaulting to vacuum when unset.
     bg_mat = domain_mod.background_material(dom)
@@ -579,14 +600,28 @@ def build_job_from_document(doc, steps=None, fmax=30.0e9, progress=None):
     # Gaussian pulse so a bare run still works; a TEM port is excitation enough,
     # so the fallback is skipped when one is present.
     from wavesim_gui import source as source_mod
+    from wavesim_gui import spice_port as spice_mod
 
     tem_sources = [tem_mod.tem_source_spec(t, origin_m)
                    for t in tem_mod.find_tem_sources(sim)]
 
+    # SPICE co-simulation ports (line + TEM); drop any that could not serialise
+    # (e.g. a line port with no curve assigned).
+    spice_ports = [
+        s for s in (
+            [spice_mod.spice_line_port_spec(p, origin_m)
+             for p in spice_mod.find_spice_line_ports(sim)]
+            + [spice_mod.spice_tem_port_spec(p, origin_m)
+               for p in spice_mod.find_spice_tem_ports(sim)]
+        ) if s
+    ]
+
     sources = source_mod.find_sources(sim)
     if sources:
         source = source_mod.source_spec(sources[0], origin_m)
-    elif tem_sources:
+    elif tem_sources or spice_ports:
+        # A TEM source or a (driven) SPICE port is excitation enough; skip the
+        # centre-Gaussian fallback.
         source = None
     else:
         source = {
@@ -635,6 +670,7 @@ def build_job_from_document(doc, steps=None, fmax=30.0e9, progress=None):
         },
         "source": source,
         "tem_sources": tem_sources,
+        "spice_ports": spice_ports,
         "monitors": monitors,
     }
     return spec, vox["arrays"]

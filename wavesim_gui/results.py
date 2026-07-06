@@ -53,6 +53,8 @@ _KIND_SNAPSHOT = "snapshot"
 _KIND_MODE = "mode"
 _KIND_VOLTAGE = "voltage"
 _KIND_CURRENT = "current"
+_KIND_SPICE_V = "spice_v"   # SPICE co-simulation port voltage V(t)
+_KIND_SPICE_I = "spice_i"   # SPICE co-simulation port current I(t)
 
 _RESULTS_GROUP = "Results"
 
@@ -290,6 +292,16 @@ def build_results(doc, sim, workdir, summary):
                     continue
                 name = meta.get("name") or "{} {}".format(prefix.title(), idx)
                 _new_leaf(name, kind, "{}_{}".format(prefix, idx))
+
+        # SPICE co-simulation ports: a voltage and a current time series each.
+        for idx, meta in enumerate(summary.get("spice_ports", [])):
+            name = meta.get("name") or "SPICE Port {}".format(idx)
+            if "spice_{}v_values".format(idx) in keys:
+                _new_leaf("{} voltage".format(name), _KIND_SPICE_V,
+                          "spice_{}v".format(idx))
+            if "spice_{}i_values".format(idx) in keys:
+                _new_leaf("{} current".format(name), _KIND_SPICE_I,
+                          "spice_{}i".format(idx))
 
         # Snapshots (frame stacks). Capture the slice's physical extent from the
         # producing monitor so the animation can be drawn in millimetres.
@@ -594,6 +606,10 @@ if _GUI_AVAILABLE:
                 _plot_voltage(obj)
             elif kind == _KIND_CURRENT:
                 _plot_current(obj)
+            elif kind == _KIND_SPICE_V:
+                _plot_spice_voltage(obj)
+            elif kind == _KIND_SPICE_I:
+                _plot_spice_current(obj)
             elif kind == _KIND_SNAPSHOT:
                 _plot_snapshot(obj)
             elif kind == _KIND_MODE:
@@ -665,6 +681,16 @@ if _GUI_AVAILABLE:
     def _plot_current(obj):
         _plot_series(
             obj, "current (A)", "Current: ∮H·dl vs. time", "#9467bd"
+        )
+
+    def _plot_spice_voltage(obj):
+        _plot_series(
+            obj, "voltage (V)", "SPICE port voltage vs. time", "#2ca02c"
+        )
+
+    def _plot_spice_current(obj):
+        _plot_series(
+            obj, "current (A)", "SPICE port current vs. time", "#9467bd"
         )
 
     def _plot_snapshot(obj):

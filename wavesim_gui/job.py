@@ -44,6 +44,9 @@ def write_job(workdir, job):
     """
     job = dict(job)
     job.setdefault("wavesim_path", wavesim_settings.get_wavesim_path())
+    # Path to the ngspice shared library for SPICE co-simulation ports (empty
+    # when unset -> the solver falls back to PySpice's own library search).
+    job.setdefault("ngspice_dll", wavesim_settings.get_ngspice_dll())
     job_path = os.path.join(workdir, "job.json")
     with open(job_path, "w", encoding="utf-8") as handle:
         json.dump(job, handle, indent=2)

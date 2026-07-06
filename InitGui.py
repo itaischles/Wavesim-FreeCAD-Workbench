@@ -51,6 +51,8 @@ class WavesimWorkbench(Gui.Workbench):
             self.command_list.append("Wavesim_AssignMaterial")
             self.command_list.append("Wavesim_AddSource")
             self.command_list.append("Wavesim_AddTEMSource")
+            self.command_list.append("Wavesim_AddSpiceLinePort")
+            self.command_list.append("Wavesim_AddSpiceTEMPort")
             self.command_list.append("Wavesim_AddProbe")
             self.command_list.append("Wavesim_AddSnapshot")
             self.command_list.append("Wavesim_AddEnergyMonitor")

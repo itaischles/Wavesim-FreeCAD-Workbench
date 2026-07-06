@@ -45,6 +45,10 @@ DEFAULTS = {
     "wavesim_results": os.path.join(
         FreeCAD.getUserAppDataDir(), "wavesim_results"
     ),
+    # Optional path to the ngspice shared library (ngspice.dll / libngspice.so)
+    # used for SPICE co-simulation ports. Empty means "let PySpice find it"
+    # (its own search / NGSPICE_LIBRARY_PATH / bundled DLL).
+    "ngspice_dll": "",
 }
 
 # Environment variable that overrides each key when the stored value is absent.
@@ -52,6 +56,7 @@ _ENV_OVERRIDES = {
     "wavesim_python": "WAVESIM_PYTHON",
     "wavesim_path": "WAVESIM_PATH",
     "wavesim_results": "WAVESIM_RESULTS",
+    "ngspice_dll": "WAVESIM_NGSPICE_DLL",
 }
 
 
@@ -130,6 +135,15 @@ def get_results_path():
     return get("wavesim_results")
 
 
+def get_ngspice_dll():
+    """Path to the ngspice shared library for SPICE co-simulation ports.
+
+    Empty when unset — the solver then falls back to PySpice's own library
+    search (``NGSPICE_LIBRARY_PATH`` / the bundled DLL).
+    """
+    return get("ngspice_dll")
+
+
 # --------------------------------------------------------------------------- #
 # GUI
 # --------------------------------------------------------------------------- #
@@ -180,6 +194,7 @@ if _GUI_AVAILABLE:
             self._python_edit = QtWidgets.QLineEdit(current["wavesim_python"])
             self._path_edit = QtWidgets.QLineEdit(current["wavesim_path"])
             self._results_edit = QtWidgets.QLineEdit(current["wavesim_results"])
+            self._ngspice_edit = QtWidgets.QLineEdit(current["ngspice_dll"])
 
             form.addRow(
                 "Solver Python interpreter:",
@@ -200,6 +215,13 @@ if _GUI_AVAILABLE:
                 self._row(
                     self._results_edit,
                     self._browse_results,
+                ),
+            )
+            form.addRow(
+                "ngspice.dll (optional):",
+                self._row(
+                    self._ngspice_edit,
+                    self._browse_ngspice,
                 ),
             )
             layout.addLayout(form)
@@ -264,11 +286,24 @@ if _GUI_AVAILABLE:
             if chosen:
                 self._results_edit.setText(chosen)
 
+        def _browse_ngspice(self):
+            start = self._ngspice_edit.text() or os.path.expanduser("~")
+            chosen, _ = QtWidgets.QFileDialog.getOpenFileName(
+                self,
+                "Select the ngspice shared library",
+                os.path.dirname(start),
+                "ngspice library (ngspice*.dll libngspice*.so *.dll *.so);;"
+                "All files (*)",
+            )
+            if chosen:
+                self._ngspice_edit.setText(chosen)
+
         def accept(self):
             """Validate and persist before closing."""
             python_path = self._python_edit.text().strip()
             repo_path = self._path_edit.text().strip()
             results_path = self._results_edit.text().strip()
+            ngspice_dll = self._ngspice_edit.text().strip()
 
             warnings = []
             if not os.path.isfile(python_path):
@@ -289,6 +324,14 @@ if _GUI_AVAILABLE:
                 )
             if not results_path:
                 warnings.append("The results output folder is empty.")
+            # ngspice.dll is optional (only needed for SPICE ports); warn only
+            # when a path is given but does not point at a file.
+            if ngspice_dll and not os.path.isfile(ngspice_dll):
+                warnings.append(
+                    "The ngspice library path does not exist:\n{}".format(
+                        ngspice_dll
+                    )
+                )
 
             if warnings:
                 answer = QtWidgets.QMessageBox.warning(
@@ -308,6 +351,7 @@ if _GUI_AVAILABLE:
                     "wavesim_python": python_path,
                     "wavesim_path": repo_path,
                     "wavesim_results": results_path,
+                    "ngspice_dll": ngspice_dll,
                 }
             ):
                 FreeCAD.Console.PrintMessage(

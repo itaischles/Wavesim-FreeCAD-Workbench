@@ -41,6 +41,14 @@ job.json schema (Session 2)
                        "excitation": {"type":.., ...}, "fields":"EH"|"E"}, ...],
                        # legacy entries may carry flat "fmax"/"amplitude" keys
                        # and omit "direction" (defaults to +normal / low face)
+      "ngspice_dll": "<path to ngspice.dll>", # optional; library_path for all
+                                              # SPICE ports (else PySpice search)
+      "spice_ports": [                        # SPICE co-simulation ports
+        {"kind":"line", "name":.., "netlist":"<path>", "nodes":["port1p","0"],
+         "p0":[x,y,z], "p1":[x,y,z], "sign":1.0, "uic":false},
+        {"kind":"tem",  "name":.., "netlist":"<path>", "nodes":["port1p","0"],
+         "normal":"z", "position":.., "direction":1.0|-1.0, "conductor_id":0,
+         "directional":true, "sign":1.0, "uic":false}, ...],
       "mode_only": false,                     # solve TEM modes only; no FDTD run
       "monitors": {
         "energy": true,
@@ -67,6 +75,21 @@ field profiles into ``results.npz`` (keys ``mode_<si>_<mi>_phi`` / ``_pec`` /
 ``_E_<comp>``) with its per-unit-length parameters under ``summary["modes"]``.
 With ``mode_only`` true the runner solves and saves the modes and skips the FDTD
 time-stepping entirely (used by the workbench's "Compute Mode" button).
+
+SPICE co-simulation ports
+-------------------------
+Each ``spice_ports`` entry couples one FDTD lumped port to a user ngspice netlist
+in lockstep (:class:`wavesim.sources.SpicePort`). A ``kind:"line"`` port is a
+straight ``p0 -> p1`` line; a ``kind:"tem"`` port drives a solved TEM mode of the
+named plane (solved alongside the ``tem_sources`` modes, so it shows in the
+results tree and honours ``mode_only``). The ngspice shared library is taken from
+``ngspice_dll`` (falling back to a per-port ``library_path`` / PySpice's own
+search). Each port records its port V(t)/I(t) into ``results.npz`` (keys
+``spice_<idx>_times`` / ``_voltages`` / ``_currents``) with names under
+``summary["spice_ports"]``. One netlist drives one port; several ports run
+independent ngspice instances. (The port series are stored as two
+``_times``/``_values`` pairs — ``spice_<idx>v_*`` for voltage, ``spice_<idx>i_*``
+for current.)
 """
 
 import json
@@ -199,42 +222,79 @@ def _f(value):
     return None if value is None else float(value)
 
 
-def _solve_tem_modes(ws, np, grid, job):
-    """Solve the TEM modes of every ``tem_sources`` plane on *grid*.
+def _choose_mode(modes, wanted, name):
+    """Pick the mode whose energized conductor is *wanted* (0 = dominant).
 
-    Returns ``(plane_sources, mode_arrays, mode_meta)``:
-
-    * ``plane_sources`` — directional :class:`PlaneSource` launchers (one per
-      port, built from the port's dominant mode) to add to the FDTD run; empty
-      when ``mode_only`` is set.
-    * ``mode_arrays`` — the 2D field profiles to drop into ``results.npz``
-      (``mode_<si>_<mi>_phi`` / ``_pec`` / ``_E_<comp>``).
-    * ``mode_meta`` — per-mode metadata (identity + per-unit-length parameters)
-      for ``summary["modes"]`` and the workbench results tree.
+    Falls back to the dominant (first) mode with an stderr note when no mode
+    carries the requested conductor label.
     """
-    tem_cfg = job.get("tem_sources") or []
+    chosen = modes[0]
+    if wanted > 0:
+        match = next((m for m in modes if m.conductor_id == wanted), None)
+        if match is None:
+            sys.stderr.write(
+                "wavesim: port '{}' requested conductor {} but only conductors "
+                "{} were solved; using conductor {} instead.\n".format(
+                    name, wanted, [m.conductor_id for m in modes],
+                    modes[0].conductor_id,
+                )
+            )
+        else:
+            chosen = match
+    return chosen
+
+
+def _solve_all_modes(ws, np, grid, job):
+    """Solve the TEM modes of every TEM-source and SPICE-TEM-port plane.
+
+    Returns ``(plane_sources, spice_modes, mode_arrays, mode_meta)``:
+
+    * ``plane_sources`` — directional :class:`PlaneSource` launchers for the
+      ``tem_sources`` (one per port, the chosen mode); empty when ``mode_only``.
+    * ``spice_modes`` — ``{job_spice_index: TEMMode}`` giving the chosen mode for
+      each ``kind:"tem"`` SPICE port, consumed by :func:`_build_spice_ports`;
+      empty when ``mode_only`` (no FDTD to drive).
+    * ``mode_arrays`` — the 2D field profiles for ``results.npz``
+      (``mode_<si>_<mi>_phi`` / ``_pec`` / ``_E_<comp>``).
+    * ``mode_meta`` — per-mode metadata for ``summary["modes"]``.
+    """
     mode_only = bool(job.get("mode_only", False))
+
+    # Every plane needing a mode solve: TEM sources first, then SPICE TEM ports.
+    # ``spice_index`` is the entry's index in job["spice_ports"] (None for TEM
+    # sources) so the chosen mode can be handed back to _build_spice_ports.
+    planes = []  # (kind, cfg, spice_index)
+    for t in job.get("tem_sources") or []:
+        planes.append(("tem_source", t, None))
+    for idx, p in enumerate(job.get("spice_ports") or []):
+        if p.get("kind") == "tem":
+            planes.append(("spice", p, idx))
+
     plane_sources = []
+    spice_modes = {}
     mode_arrays = {}
     mode_meta = []
 
-    n_ports = len(tem_cfg)
-    for si, t in enumerate(tem_cfg):
+    n_ports = len(planes)
+    for si, (kind, t, spice_index) in enumerate(planes):
         normal = t.get("normal", "z")
         position = float(t.get("position", 0.0))
-        fields = t.get("fields", "EH")
         name = t.get("name", "TEM")
 
-        # A single characteristic frequency + amplitude for the results tree
-        # (the launch waveform itself is built by _build_waveform below). Reads
-        # the excitation spec, falling back to legacy flat fmax/amplitude keys.
-        exc_spec = t.get("excitation") or {}
-        etype = exc_spec.get("type", "gaussian")
-        amplitude = float(exc_spec.get("amplitude", t.get("amplitude", 1.0)))
-        if etype in ("sine", "gaussian_sine"):
-            fmax = float(exc_spec.get("frequency", 0.0))
-        else:  # gaussian (or legacy) uses fmax; rectangular has none
-            fmax = float(exc_spec.get("fmax", t.get("fmax", 0.0)))
+        # Characteristic frequency/amplitude/fields for the results tree. SPICE
+        # ports have no waveform (the circuit drives them), so they carry none.
+        if kind == "spice":
+            fmax, amplitude = 0.0, 1.0
+            fields = "EH" if t.get("directional", True) else "E"
+        else:
+            exc_spec = t.get("excitation") or {}
+            etype = exc_spec.get("type", "gaussian")
+            amplitude = float(exc_spec.get("amplitude", t.get("amplitude", 1.0)))
+            if etype in ("sine", "gaussian_sine"):
+                fmax = float(exc_spec.get("frequency", 0.0))
+            else:  # gaussian (or legacy) uses fmax; rectangular has none
+                fmax = float(exc_spec.get("fmax", t.get("fmax", 0.0)))
+            fields = t.get("fields", "EH")
 
         prefix = "Port {}/{}: ".format(si + 1, n_ports) if n_ports > 1 else ""
         _emit_status(
@@ -273,50 +333,131 @@ def _solve_tem_modes(ws, np, grid, job):
                 "inductance": _f(mode.inductance),
                 "v_phase": _f(mode.v_phase),
                 "fmax": fmax, "amplitude": amplitude, "fields": fields,
+                "spice": kind == "spice",
             })
 
-        # Launch one mode as a directional plane source. By default that is the
-        # dominant (first) mode; a non-zero ``conductor_id`` selects the mode whose
-        # energized conductor carries that label (as shown in summary["modes"] /
-        # the results tree), falling back to the dominant mode with a warning if no
-        # such mode was found. The mode is normalised to a 1 V drive, so the
-        # temporal waveform carries the amplitude and ``to_source`` is left at unit
-        # scale. The waveform is built from the port's excitation spec (same
-        # builder as the point source).
-        if modes and not mode_only:
-            wanted = int(t.get("conductor_id", 0))
-            chosen = modes[0]
-            if wanted > 0:
-                match = next(
-                    (m for m in modes if m.conductor_id == wanted), None
-                )
-                if match is None:
-                    sys.stderr.write(
-                        "wavesim: TEM port '{}' requested conductor {} but only "
-                        "conductors {} were solved; launching conductor {} "
-                        "instead.\n".format(
-                            name, wanted,
-                            [m.conductor_id for m in modes],
-                            modes[0].conductor_id,
-                        )
-                    )
-                else:
-                    chosen = match
-            waveform = _build_waveform(ws, t)
-            src = chosen.to_source(waveform, amplitude=1.0, fields=fields)
-            # ``to_source`` builds H = (n̂ × E)/η for +normal propagation, so the
-            # wave always flows toward +normal. A port on a high face launches
-            # *into* the domain along -normal (direction < 0): flip H to reverse
-            # the Poynting vector S = E × H (E-only launches are bidirectional,
-            # so the sign is moot there and there is no H to flip).
-            direction = float(t.get("direction", 1.0))
-            if direction < 0 and getattr(src, "profiles", None):
-                for comp in list(src.profiles):
-                    if comp.startswith("H"):
-                        src.profiles[comp] = -src.profiles[comp]
-            plane_sources.append(src)
+        if not modes or mode_only:
+            continue
 
-    return plane_sources, mode_arrays, mode_meta
+        chosen = _choose_mode(modes, int(t.get("conductor_id", 0)), name)
+        if kind == "spice":
+            # Hand the chosen mode to _build_spice_ports; the circuit drives it.
+            spice_modes[spice_index] = chosen
+            continue
+
+        # TEM source: launch the chosen mode as a directional plane source. It is
+        # normalised to a 1 V drive, so the temporal waveform carries the
+        # amplitude and ``to_source`` is left at unit scale.
+        waveform = _build_waveform(ws, t)
+        src = chosen.to_source(waveform, amplitude=1.0, fields=fields)
+        # ``to_source`` builds H = (n̂ × E)/η for +normal propagation, so the
+        # wave always flows toward +normal. A port on a high face launches
+        # *into* the domain along -normal (direction < 0): flip H to reverse the
+        # Poynting vector S = E × H (E-only launches are bidirectional, so the
+        # sign is moot there and there is no H to flip).
+        direction = float(t.get("direction", 1.0))
+        if direction < 0 and getattr(src, "profiles", None):
+            for comp in list(src.profiles):
+                if comp.startswith("H"):
+                    src.profiles[comp] = -src.profiles[comp]
+        plane_sources.append(src)
+
+    return plane_sources, spice_modes, mode_arrays, mode_meta
+
+
+# --------------------------------------------------------------------------- #
+# SPICE co-simulation ports — build one SpicePort per spice_ports entry
+# --------------------------------------------------------------------------- #
+
+def _prepare_ngspice_library(job):
+    """Make the configured ``ngspice.dll`` and its sibling DLLs loadable.
+
+    PySpice loads ``ngspice.dll`` by full path via cffi, which on modern Windows
+    does **not** add the DLL's own directory to the search path. ngspice ships a
+    co-located dependency (``libomp140.x86_64.dll``, the OpenMP runtime), so the
+    load otherwise fails with ``OSError`` 0x7e (``ERROR_MOD_NOT_FOUND``). Put the
+    DLL's directory on the search path and pre-load its sibling DLLs so the later
+    cffi load resolves them. A no-op when no ngspice path is configured or on
+    platforms without ``os.add_dll_directory`` (non-Windows).
+    """
+    dll = job.get("ngspice_dll")
+    if not dll or not os.path.isfile(dll):
+        return
+    d = os.path.dirname(os.path.abspath(dll))
+    add_dll_dir = getattr(os, "add_dll_directory", None)
+    if add_dll_dir is not None:  # Windows, Python 3.8+
+        try:
+            add_dll_dir(d)
+        except OSError:
+            pass
+    os.environ["PATH"] = d + os.pathsep + os.environ.get("PATH", "")
+    # Pre-load every sibling DLL so ngspice finds each already in the process
+    # (the loader resolves an import against modules already loaded by name).
+    try:
+        import ctypes
+
+        for name in os.listdir(d):
+            if name.lower().endswith(".dll") and name.lower() != "ngspice.dll":
+                try:
+                    ctypes.CDLL(os.path.join(d, name))
+                except OSError:
+                    pass
+    except Exception:
+        pass
+
+
+def _build_spice_ports(ws, job, spice_modes):
+    """Build a :class:`SpicePort` for each ``spice_ports`` entry.
+
+    Returns a list of ``(name, SpicePort)``. Line ports come straight from their
+    ``p0``/``p1``; TEM ports drive the mode chosen in :func:`_solve_all_modes`
+    (passed in *spice_modes*, keyed by job-spice index). Ports whose netlist file
+    is missing — or whose TEM mode failed to solve — are skipped with a note so
+    the rest of the run still proceeds.
+    """
+    lib = job.get("ngspice_dll") or None
+    if job.get("spice_ports"):
+        _prepare_ngspice_library(job)
+    ports = []
+    for idx, e in enumerate(job.get("spice_ports") or []):
+        name = e.get("name", "spice")
+        netlist = e.get("netlist") or ""
+        if not netlist or not os.path.isfile(netlist):
+            _emit_status(
+                "SPICE port '{}': netlist not found ({}); skipping.".format(
+                    name, netlist or "unset"
+                )
+            )
+            sys.stderr.write(
+                "wavesim: SPICE port '{}' netlist not found: {!r}; skipping.\n"
+                .format(name, netlist)
+            )
+            continue
+        nodes = tuple(e.get("nodes", ("port1p", "0")))
+        sign = float(e.get("sign", 1.0))
+        uic = bool(e.get("uic", False))
+        if e.get("kind") == "tem":
+            mode = spice_modes.get(idx)
+            if mode is None:
+                sys.stderr.write(
+                    "wavesim: SPICE TEM port '{}' has no solved mode "
+                    "(needs >=2 PEC conductors on the plane); skipping.\n"
+                    .format(name)
+                )
+                continue
+            port = ws.SpicePort(
+                mode=mode, netlist=netlist, nodes=nodes,
+                directional=bool(e.get("directional", True)),
+                library_path=lib, sign=sign, uic=uic,
+            )
+        else:
+            port = ws.SpicePort(
+                p0=tuple(e["p0"]), p1=tuple(e["p1"]),
+                netlist=netlist, nodes=nodes,
+                library_path=lib, sign=sign, uic=uic,
+            )
+        ports.append((name, port))
+    return ports
 
 
 # --------------------------------------------------------------------------- #
@@ -368,7 +509,9 @@ def run_job(workdir):
     # TEM ports: solve each port plane's transverse mode. Done before the FDTD
     # setup so the solved modes can be launched as directional plane sources
     # (and so a mode-only request can return without building the time loop).
-    plane_sources, mode_arrays, mode_meta = _solve_tem_modes(ws, np, grid, job)
+    plane_sources, spice_modes, mode_arrays, mode_meta = _solve_all_modes(
+        ws, np, grid, job
+    )
 
     if job.get("mode_only", False):
         _emit_status("Saving mode results...")
@@ -409,6 +552,12 @@ def run_job(workdir):
             s["component"], float(s["x"]), float(s["y"]), float(s["z"]), waveform
         ))
     sources.extend(plane_sources)
+
+    # SPICE co-simulation ports: one live ngspice instance each, driven in
+    # lockstep with the FDTD loop. Kept aside so their port records can be saved
+    # and their ngspice instances torn down after the run.
+    spice_ports = _build_spice_ports(ws, job, spice_modes)
+    sources.extend(port for _name, port in spice_ports)
 
     # Monitors. The energy monitor is whole-domain; probes and snapshots
     # (Session 7) are point/plane recorders described in the job. All locations
@@ -520,6 +669,22 @@ def run_job(workdir):
         result_arrays["current_{}_values".format(idx)] = np.asarray(mon.values)
         current_meta.append({"name": name})
 
+    # SPICE ports: the co-simulated port V(t)/I(t) recorded by each SpicePort,
+    # saved as two ``_times``/``_values`` series (voltage 'v', current 'i') so the
+    # results tree can reuse the shared 1-D plotter. Then tear down ngspice.
+    spice_meta = []
+    for idx, (name, port) in enumerate(spice_ports):
+        times = np.asarray(port.times)
+        result_arrays["spice_{}v_times".format(idx)] = times
+        result_arrays["spice_{}v_values".format(idx)] = np.asarray(port.voltages)
+        result_arrays["spice_{}i_times".format(idx)] = times
+        result_arrays["spice_{}i_values".format(idx)] = np.asarray(port.currents)
+        spice_meta.append({"name": name})
+        try:
+            port.close()
+        except Exception:
+            pass
+
     np.savez(os.path.join(workdir, "results.npz"), **result_arrays)
 
     summary = {
@@ -545,6 +710,8 @@ def run_job(workdir):
         summary["voltages"] = voltage_meta
     if current_meta:
         summary["currents"] = current_meta
+    if spice_meta:
+        summary["spice_ports"] = spice_meta
     if mode_meta:
         summary["modes"] = mode_meta
     with open(os.path.join(workdir, "summary.json"), "w", encoding="utf-8") as handle:

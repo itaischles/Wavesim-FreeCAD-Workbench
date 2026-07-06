@@ -705,9 +705,13 @@ if _GUI_AVAILABLE:
                 "before computing a mode.",
             )
             return
-        if not spec.get("tem_sources"):
+        # A SPICE TEM port also defines a plane to solve, so accept either.
+        has_spice_tem = any(
+            p.get("kind") == "tem" for p in spec.get("spice_ports") or []
+        )
+        if not spec.get("tem_sources") and not has_spice_tem:
             QtWidgets.QMessageBox.warning(
-                main, "Wavesim Mode Solve", "No TEM source to solve.",
+                main, "Wavesim Mode Solve", "No TEM port to solve.",
             )
             return
 

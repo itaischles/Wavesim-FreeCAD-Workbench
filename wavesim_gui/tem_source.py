@@ -667,9 +667,10 @@ if _GUI_AVAILABLE:
         """Solve the document's TEM port mode(s) out of process (no FDTD run).
 
         Builds the usual voxelised job, flags it ``mode_only``, runs the
-        conda-side runner, then (re)builds the Results tree and opens the first
-        solved mode. *focus_obj* is the TEM source that triggered the solve (used
-        only to scope warnings); all defined ports are solved together.
+        conda-side runner, then (re)builds the Results tree and opens the solved
+        mode of *focus_obj* -- the TEM/SPICE port whose panel triggered the solve.
+        All defined ports are solved together, so without this the first port's
+        mode would pop up regardless of which panel the user clicked from.
         """
         try:
             from PySide import QtWidgets
@@ -735,7 +736,14 @@ if _GUI_AVAILABLE:
             return
 
         grp = results_mod.build_results(doc, sim, workdir, summary)
-        results_mod.open_first_mode(grp)
+        # All ports are solved together; open the mode of the port whose panel
+        # triggered the solve (matched by name, the same key the runner records
+        # in summary["modes"]) so a multi-port document shows the requested mode.
+        focus_name = None
+        if focus_obj is not None:
+            focus_name = str(getattr(focus_obj, "Label", "")
+                             or getattr(focus_obj, "Name", ""))
+        results_mod.open_first_mode(grp, focus_name)
 
     class CommandAddTEMSource:
         """Create a TEM port Source on a domain face and open its editor."""

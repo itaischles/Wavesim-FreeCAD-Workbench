@@ -373,6 +373,7 @@ def _store_mode_meta(leaf, meta):
     _add("AxisB", "App::PropertyString", str(axes[1]))
     _add("Da", "App::PropertyFloat", float(meta.get("da", 0.0)))
     _add("Db", "App::PropertyFloat", float(meta.get("db", 0.0)))
+    _add("PortName", "App::PropertyString", str(meta.get("name", "")))
     _add("Normal", "App::PropertyString", str(meta.get("normal", "")))
     _add("ModePosition", "App::PropertyFloat", float(meta.get("position", 0.0)))
     _add("ConductorId", "App::PropertyInteger", int(meta.get("conductor_id", 0)))
@@ -800,18 +801,29 @@ if _GUI_AVAILABLE:
     # TEM mode plotter
     # ------------------------------------------------------------------ #
 
-    def open_first_mode(grp):
-        """Open the plot of the first TEM-mode leaf under results group *grp*.
+    def open_first_mode(grp, port_name=None):
+        """Open the plot of a TEM-mode leaf under results group *grp*.
 
         Convenience for the "Compute Mode" flow so the solved mode pops up
-        immediately. A no-op when there is no mode leaf.
+        immediately. When *port_name* is given (the port whose panel triggered
+        the solve), the first mode leaf belonging to that port is opened so a
+        multi-port document shows the mode the user asked for rather than
+        whichever port happens to be solved first; otherwise the first mode leaf
+        of any port is opened. A no-op when there is no matching mode leaf.
         """
         if grp is None:
             return
-        for child in getattr(grp, "Group", []) or []:
-            if str(getattr(child, "ResultKind", "")) == _KIND_MODE:
-                open_result(child)
-                return
+        modes = [
+            child for child in getattr(grp, "Group", []) or []
+            if str(getattr(child, "ResultKind", "")) == _KIND_MODE
+        ]
+        if port_name:
+            for child in modes:
+                if str(getattr(child, "PortName", "")) == str(port_name):
+                    open_result(child)
+                    return
+        if modes:
+            open_result(modes[0])
 
     def _plot_mode(obj):
         """Figure of a solved TEM mode: φ contours + E quiver + PEC outline.

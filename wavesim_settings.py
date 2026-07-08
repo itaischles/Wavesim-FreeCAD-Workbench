@@ -49,6 +49,13 @@ DEFAULTS = {
     # used for SPICE co-simulation ports. Empty means "let PySpice find it"
     # (its own search / NGSPICE_LIBRARY_PATH / bundled DLL).
     "ngspice_dll": "",
+    # Which solver update-kernel backend to request. 'auto' (the default) lets
+    # the conda-side runner pick the fastest available — the CUDA GPU backend
+    # when a CUDA-capable card is present, else the multicore 'numba' CPU
+    # backend. 'cuda'/'numba'/'numpy' force a specific backend. FreeCAD's Python
+    # cannot detect the GPU (it can't import numba/cuda), so the actual choice
+    # for 'auto' is resolved by runner.py on the solver side.
+    "backend": "auto",
 }
 
 # Environment variable that overrides each key when the stored value is absent.
@@ -57,6 +64,7 @@ _ENV_OVERRIDES = {
     "wavesim_path": "WAVESIM_PATH",
     "wavesim_results": "WAVESIM_RESULTS",
     "ngspice_dll": "WAVESIM_NGSPICE_DLL",
+    "backend": "WAVESIM_BACKEND",
 }
 
 
@@ -144,6 +152,16 @@ def get_ngspice_dll():
     return get("ngspice_dll")
 
 
+def get_backend():
+    """Solver backend to request in job.json.
+
+    One of ``'auto'`` (default), ``'cuda'``, ``'numba'`` or ``'numpy'``. ``'auto'``
+    is resolved solver-side by ``runner.py`` — it becomes the CUDA GPU backend
+    when a card is present, else the multicore ``numba`` backend.
+    """
+    return get("backend") or "auto"
+
+
 # --------------------------------------------------------------------------- #
 # GUI
 # --------------------------------------------------------------------------- #
@@ -178,6 +196,16 @@ if _GUI_AVAILABLE:
     # FreeCAD ships this themed icon; falls back gracefully if unavailable.
     _SETTINGS_ICON = "preferences-general"
 
+    # (stored value, display label) for the backend combo. 'auto' first so it is
+    # the default selection; the GPU is only usable when a CUDA card + toolkit
+    # are installed in the solver's conda environment.
+    _BACKEND_CHOICES = [
+        ("auto", "Automatic (CUDA GPU if available, else Numba)"),
+        ("cuda", "CUDA GPU (NVIDIA)"),
+        ("numba", "Numba (multicore CPU)"),
+        ("numpy", "NumPy (reference)"),
+    ]
+
     class SettingsDialog(QtWidgets.QDialog):
         """Modal dialog to view and edit the workbench solver paths."""
 
@@ -195,6 +223,14 @@ if _GUI_AVAILABLE:
             self._path_edit = QtWidgets.QLineEdit(current["wavesim_path"])
             self._results_edit = QtWidgets.QLineEdit(current["wavesim_results"])
             self._ngspice_edit = QtWidgets.QLineEdit(current["ngspice_dll"])
+
+            # Backend picker. 'auto' lets the solver side choose the GPU when
+            # present; the explicit entries force a single backend.
+            self._backend_combo = QtWidgets.QComboBox()
+            for value, label in _BACKEND_CHOICES:
+                self._backend_combo.addItem(label, value)
+            idx = self._backend_combo.findData(current["backend"])
+            self._backend_combo.setCurrentIndex(idx if idx >= 0 else 0)
 
             form.addRow(
                 "Solver Python interpreter:",
@@ -224,6 +260,7 @@ if _GUI_AVAILABLE:
                     self._browse_ngspice,
                 ),
             )
+            form.addRow("Solver backend:", self._backend_combo)
             layout.addLayout(form)
 
             hint = QtWidgets.QLabel(
@@ -304,6 +341,7 @@ if _GUI_AVAILABLE:
             repo_path = self._path_edit.text().strip()
             results_path = self._results_edit.text().strip()
             ngspice_dll = self._ngspice_edit.text().strip()
+            backend = self._backend_combo.currentData() or "auto"
 
             warnings = []
             if not os.path.isfile(python_path):
@@ -352,6 +390,7 @@ if _GUI_AVAILABLE:
                     "wavesim_path": repo_path,
                     "wavesim_results": results_path,
                     "ngspice_dll": ngspice_dll,
+                    "backend": backend,
                 }
             ):
                 FreeCAD.Console.PrintMessage(

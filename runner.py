@@ -24,7 +24,11 @@ job.json schema (Session 2)
 ---------------------------
     {
       "wavesim_path": "<repo dir>",          # optional; else WAVESIM_PATH env
-      "backend": "numba",                     # 'numba' | 'numpy'
+      "backend": "auto",                      # 'auto'|'cuda'|'numba'|'numpy'
+                                              # 'auto' -> 'cuda' when a CUDA GPU
+                                              # is present, else 'numba' (see
+                                              # _resolve_backend). The GPU path
+                                              # allocates the grid as float32.
       "steps": 1000,
       "grid":   {"Nx":.., "Ny":.., "Nz":.., "dx":.., "dy":.., "dz":..},
       "boundary": {"d_pml": 10, "faces": ["x0",...], "pec_faces": ["z0",...]} | null,
@@ -142,6 +146,45 @@ def _emit_status(message):
     """
     sys.stdout.write("STATUS {}\n".format(message.replace("\n", "\\n")))
     sys.stdout.flush()
+
+
+# --------------------------------------------------------------------------- #
+# Backend selection — pick the fastest available update-kernel backend
+# --------------------------------------------------------------------------- #
+
+def _cuda_available():
+    """Return ``True`` when a CUDA GPU usable by the solver is present.
+
+    Probes numba's CUDA driver binding. ``wavesim.backend_cuda`` forces the
+    legacy ctypes binding on import (the default native one is blocked by
+    Windows Smart App Control on some machines); mirror that here so the probe
+    uses the same binding the run will. Any import or driver error is swallowed
+    and treated as "no GPU", so a machine without CUDA simply falls back to the
+    CPU backend instead of failing the run.
+    """
+    os.environ.setdefault("NUMBA_CUDA_USE_NVIDIA_BINDING", "0")
+    try:
+        from numba import cuda
+        return bool(cuda.is_available())
+    except Exception:
+        return False
+
+
+def _resolve_backend(requested):
+    """Resolve a job's requested backend string to a concrete backend name.
+
+    ``'auto'`` (the workbench default) becomes ``'cuda'`` when a CUDA GPU is
+    available, else ``'numba'`` (the multithreaded CPU backend). An explicit
+    ``'numpy'``/``'numba'``/``'cuda'`` is honoured unchanged, so a user can force
+    the CPU path on a GPU box, or demand the GPU and get a clear solver error if
+    it is missing. FreeCAD's Python cannot make this choice (it cannot import
+    numba), which is why the ``'auto'`` sentinel is resolved here on the solver
+    side rather than when the job is written.
+    """
+    requested = (requested or "auto").lower()
+    if requested != "auto":
+        return requested
+    return "cuda" if _cuda_available() else "numba"
 
 
 # --------------------------------------------------------------------------- #
@@ -476,6 +519,15 @@ def run_job(workdir):
     job = _load_job(workdir)
     _ensure_wavesim_importable(job)
 
+    # Resolve the update-kernel backend before allocating the grid: the CUDA GPU
+    # path wants float32 field/material arrays for good throughput on consumer
+    # cards, so the choice drives the grid dtype. Mode-only jobs never run the
+    # FDTD loop (the backend is unused) and their mode solve is more accurate in
+    # double precision, so they stay float64 / numba regardless.
+    mode_only = bool(job.get("mode_only", False))
+    backend = "numba" if mode_only else _resolve_backend(job.get("backend", "auto"))
+    field_dtype = np.float32 if backend == "cuda" else np.float64
+
     # Importing the solver pulls in numba/scipy and, on a cold interpreter, can
     # take several seconds — tell the user so the GUI does not look hung.
     _emit_status("Loading solver (first run may compile, please wait)...")
@@ -486,7 +538,7 @@ def run_job(workdir):
     dy = float(g.get("dy", dx))
     dz = float(g.get("dz", dx))
     grid = ws.create_grid(
-        int(g["Nx"]), int(g["Ny"]), int(g["Nz"]), dx, dy, dz
+        int(g["Nx"]), int(g["Ny"]), int(g["Nz"]), dx, dy, dz, dtype=field_dtype
     )
     grid = ws.set_vacuum(grid)
 
@@ -496,10 +548,19 @@ def run_job(workdir):
     if os.path.isfile(materials_path):
         data = np.load(materials_path)
         pec_mask = data["pec_mask"] if "pec_mask" in data.files else None
+        # Cast to the grid's dtype so the field and material arrays stay
+        # matched — the CUDA backend keys its per-cell arithmetic and scalar
+        # coefficients off the field dtype, so a float32 grid needs float32
+        # eps/mu to do genuine single-precision math (the arrays are written as
+        # float64 by the FreeCAD-side voxeliser).
         grid = ws.set_material_arrays(
             grid,
-            data["eps_x"], data["eps_y"], data["eps_z"],
-            data["mu_x"], data["mu_y"], data["mu_z"],
+            data["eps_x"].astype(field_dtype, copy=False),
+            data["eps_y"].astype(field_dtype, copy=False),
+            data["eps_z"].astype(field_dtype, copy=False),
+            data["mu_x"].astype(field_dtype, copy=False),
+            data["mu_y"].astype(field_dtype, copy=False),
+            data["mu_z"].astype(field_dtype, copy=False),
             pec_mask=pec_mask,
         )
         if pec_mask is not None:
@@ -608,7 +669,7 @@ def run_job(workdir):
         sources=sources,
         monitors=all_monitors,
         pec_faces=pec_faces,
-        backend=job.get("backend", "numba"),
+        backend=backend,
     )
 
     n_steps = int(job["steps"])
@@ -624,8 +685,15 @@ def run_job(workdir):
             _emit_progress(done, n_steps)
 
     # Replace the last setup STATUS (solver load / TEM mode build) so the dialog
-    # label reflects what is actually happening while the bar advances.
-    _emit_status("Running FDTD simulation ({} time steps)...".format(n_steps))
+    # label reflects what is actually happening while the bar advances — naming
+    # the resolved backend so an 'auto' job makes clear whether the GPU is in use.
+    backend_label = {
+        "cuda": "CUDA GPU (float32)",
+        "numba": "Numba (multicore CPU)",
+        "numpy": "NumPy (reference)",
+    }.get(backend, backend)
+    _emit_status("Running FDTD simulation on {} ({} time steps)...".format(
+        backend_label, n_steps))
     t0 = time.perf_counter()
     sim.run(n_steps, callback=callback)
     wall_time = time.perf_counter() - t0

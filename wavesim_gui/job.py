@@ -47,6 +47,10 @@ def write_job(workdir, job):
     # Path to the ngspice shared library for SPICE co-simulation ports (empty
     # when unset -> the solver falls back to PySpice's own library search).
     job.setdefault("ngspice_dll", wavesim_settings.get_ngspice_dll())
+    # Solver backend ('auto' -> the runner picks the CUDA GPU when present, else
+    # numba). Stamped here so every job route (real runs, mode solves, the demo)
+    # honours the configured backend without each builder repeating it.
+    job.setdefault("backend", wavesim_settings.get_backend())
     job_path = os.path.join(workdir, "job.json")
     with open(job_path, "w", encoding="utf-8") as handle:
         json.dump(job, handle, indent=2)
@@ -66,7 +70,7 @@ def build_demo_job(steps=800):
     cx = (Nx // 2) * dx
     cy = (Ny // 2) * dx
     return {
-        "backend": "numba",
+        # backend is stamped by write_job from settings (default 'auto').
         "steps": int(steps),
         "grid": {"Nx": Nx, "Ny": Ny, "Nz": Nz, "dx": dx, "dy": dx, "dz": dx},
         "boundary": {"d_pml": 10, "faces": ["x0", "x1", "y0", "y1"]},

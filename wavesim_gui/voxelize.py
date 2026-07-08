@@ -660,7 +660,8 @@ def build_job_from_document(doc, steps=None, fmax=30.0e9, progress=None):
     monitors = monitors_mod.monitors_spec(sim, origin_m)
 
     spec = {
-        "backend": "numba",
+        # backend is stamped by job.write_job from settings (default 'auto',
+        # which the runner resolves to the CUDA GPU when one is available).
         "steps": int(steps),
         "grid": grid,
         "boundary": {

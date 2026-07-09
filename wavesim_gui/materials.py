@@ -341,30 +341,34 @@ if _GUI_AVAILABLE:
         __setstate__ = loads
 
     class TaskMaterialPanel:
-        """Task-tab panel to edit a Material's name, colour and parameters.
+        """Task-tab panel to create or edit a Material's name/colour/parameters.
 
-        Shown via ``Gui.Control.showDialog``. ``accept`` writes the widget
-        values back onto the object; ``reject`` removes the object when it was
-        created fresh for this edit (so a cancelled creation leaves no trace).
-        Bodies are not edited here -- they are attached by dragging them onto the
-        material in the tree.
+        Shown via ``Gui.Control.showDialog``. For a brand-new material *obj* is
+        ``None`` and *sim* is the container it will live under: the object is only
+        created in ``accept``, so a cancelled (or abandoned) creation leaves no
+        trace -- no dangling object, and no name/label counter bump. Editing an
+        existing material passes that object as *obj*. Bodies are not edited here;
+        they are attached by dragging them onto the material in the tree.
         """
 
-        def __init__(self, obj, created=False):
+        def __init__(self, obj=None, sim=None, created=False):
             try:
                 from PySide import QtWidgets
             except ImportError:
                 from PySide import QtGui as QtWidgets
 
             self.obj = obj
-            self.created = created
-            self._color = material_color(obj)
+            self.sim = sim
+            self.created = created  # retained for callers; unused in the new flow
+            self._color = (
+                material_color(obj) if obj is not None else _DEFAULT_MATERIAL_COLOR
+            )
 
             form = QtWidgets.QWidget()
             form.setWindowTitle("Wavesim Material")
             layout = QtWidgets.QFormLayout(form)
 
-            self._name = QtWidgets.QLineEdit(obj.Label)
+            self._name = QtWidgets.QLineEdit(obj.Label if obj is not None else "")
 
             self._color_btn = QtWidgets.QPushButton()
             self._color_btn.clicked.connect(self._pick_color)
@@ -444,15 +448,31 @@ if _GUI_AVAILABLE:
             self._mu.setEnabled(not checked)
 
         def accept(self):
-            doc = self.obj.Document
-            doc.openTransaction("Wavesim: Edit Material")
-            self.obj.Pec = self._pec.isChecked()
-            self.obj.Eps = self._eps.value()
-            self.obj.Mu = self._mu.value()
-            self.obj.Color = self._color
-            name = self._name.text().strip()
-            self.obj.Label = name or "Material ({})".format(_describe(self.obj))
-            apply_material_color(self.obj)
+            # The object is created here (not at command time), so a cancelled
+            # creation never leaves a dangling material behind.
+            new = self.obj is None
+            doc = self.sim.Document if new else self.obj.Document
+            doc.openTransaction(
+                "Wavesim: New Material" if new else "Wavesim: Edit Material"
+            )
+            try:
+                if new:
+                    mat = doc.addObject("App::FeaturePython", "Material")
+                    MaterialObject(mat)
+                    if mat.ViewObject is not None:
+                        MaterialViewProvider(mat.ViewObject)
+                    materials_group(self.sim).addObject(mat)
+                    self.obj = mat
+                self.obj.Pec = self._pec.isChecked()
+                self.obj.Eps = self._eps.value()
+                self.obj.Mu = self._mu.value()
+                self.obj.Color = self._color
+                name = self._name.text().strip()
+                self.obj.Label = name or "Material ({})".format(_describe(self.obj))
+                apply_material_color(self.obj)
+            except Exception:
+                doc.abortTransaction()
+                raise
             doc.commitTransaction()
             doc.recompute()
             # Resize the domain to include this material's bodies.
@@ -462,15 +482,8 @@ if _GUI_AVAILABLE:
             return True
 
         def reject(self):
-            if self.created:
-                # Abandon the just-created object so Cancel undoes the command.
-                doc = self.obj.Document
-                doc.openTransaction("Wavesim: Cancel Material")
-                doc.removeObject(self.obj.Name)
-                doc.commitTransaction()
-                doc.recompute()
-                from wavesim_gui import domain as domain_mod
-                domain_mod.notify_materials_changed(doc)
+            # Nothing is created until accept, so Cancel just closes the panel --
+            # no object to remove, no name/label counter left behind.
             Gui.Control.closeDialog()
             return True
 
@@ -484,10 +497,15 @@ if _GUI_AVAILABLE:
             # yields a plain int already.
             return int(getattr(buttons, "value", buttons))
 
-    def _open_material_panel(obj, created=False):
-        """Open (or replace) the material task panel bound to *obj*."""
+    def _open_material_panel(obj=None, sim=None, created=False):
+        """Open (or replace) the material task panel.
+
+        Pass *obj* to edit an existing material, or *sim* (with ``obj=None``) to
+        create a new one -- the object is only materialised when the panel is
+        accepted.
+        """
         Gui.Control.closeDialog()
-        Gui.Control.showDialog(TaskMaterialPanel(obj, created=created))
+        Gui.Control.showDialog(TaskMaterialPanel(obj, sim=sim, created=created))
 
     class CommandAssignMaterial:
         """Create an empty Material and open its editor panel.
@@ -514,21 +532,9 @@ if _GUI_AVAILABLE:
                 )
                 return
 
-            doc.openTransaction("Wavesim: New Material")
-            try:
-                mat = doc.addObject("App::FeaturePython", "Material")
-                MaterialObject(mat)
-                mat.Label = "Material ({})".format(_describe(mat))
-                if mat.ViewObject is not None:
-                    MaterialViewProvider(mat.ViewObject)
-                materials_group(sim).addObject(mat)
-            except Exception:
-                doc.abortTransaction()
-                raise
-            doc.commitTransaction()
-            doc.recompute()
-
-            _open_material_panel(mat, created=True)
+            # The material object is created only when the panel is accepted, so
+            # cancelling leaves no trace (no dangling object, no name counter).
+            _open_material_panel(sim=sim)
 
         def IsActive(self):
             return active_simulation(FreeCAD.ActiveDocument) is not None

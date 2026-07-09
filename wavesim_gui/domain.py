@@ -140,7 +140,7 @@ class DomainObject:
                 "Build a graded non-uniform rectilinear grid (snapper) instead "
                 "of a uniform Dx/Dy/Dz grid",
             )
-            obj.UseNonuniformGrid = False
+            obj.UseNonuniformGrid = True
         if not hasattr(obj, "MaxGradingRatio"):
             obj.addProperty(
                 "App::PropertyFloat", "MaxGradingRatio", "Grid",
@@ -149,6 +149,15 @@ class DomainObject:
                 "coarse interior (solver guidance ~1.5-2x)",
             )
             obj.MaxGradingRatio = 1.5
+        if not hasattr(obj, "MinCellSize"):
+            obj.addProperty(
+                "App::PropertyLength", "MinCellSize", "Grid",
+                "Smallest cell the non-uniform snapper may create; feature "
+                "lines closer than this are merged and graded fill is clamped "
+                "to it, so automatic snapping cannot produce an extremely fine "
+                "mesh (0 mm = no limit)",
+            )
+            obj.MinCellSize = "0 mm"
 
         # Per-axis node-coordinate arrays (world mm, including the PML pad cells)
         # spanning the padded grid -- the geometric source of truth every
@@ -167,7 +176,7 @@ class DomainObject:
                 "App::PropertyLength", "Spacing", "Domain",
                 "Air gap added around the material bounds on every side",
             )
-            obj.Spacing = "5 mm"
+            obj.Spacing = "0 mm"
         if not hasattr(obj, "Background"):
             obj.addProperty(
                 "App::PropertyLink", "Background", "Domain",
@@ -322,6 +331,19 @@ def cell_sizes_m(obj):
         float(obj.Dy.Value) / _MM_PER_M,
         float(obj.Dz.Value) / _MM_PER_M,
     )
+
+
+def min_cell_size_m(obj):
+    """Return the Domain's minimum snapper cell size in metres (0 = no limit).
+
+    Only meaningful with ``UseNonuniformGrid`` on; the snapper clamps its finest
+    cells to this so automatic feature-snapping cannot produce an extremely fine
+    mesh. Falls back to 0 (no limit) for older documents lacking the property.
+    """
+    q = getattr(obj, "MinCellSize", None)
+    if q is None:
+        return 0.0
+    return float(q.Value) / _MM_PER_M
 
 
 def node_coords_mm(obj):
@@ -871,6 +893,16 @@ if _GUI_AVAILABLE:
             self._ratio.setSingleStep(0.1)
             self._ratio.setValue(float(getattr(obj, "MaxGradingRatio", 1.5)))
 
+            # Smallest cell the snapper may create (0 = no limit): stops automatic
+            # feature snapping from producing an extremely fine mesh.
+            self._min_cell = QtWidgets.QDoubleSpinBox()
+            self._min_cell.setRange(0.0, 1.0e6)
+            self._min_cell.setDecimals(6)
+            self._min_cell.setSuffix(" mm")
+            self._min_cell.setSingleStep(0.1)
+            self._min_cell.setValue(float(getattr(obj, "MinCellSize", 0.0).Value)
+                                    if hasattr(obj, "MinCellSize") else 0.0)
+
             self._counts = QtWidgets.QLabel(self._counts_text())
 
             self._spacing = QtWidgets.QDoubleSpinBox()
@@ -913,10 +945,19 @@ if _GUI_AVAILABLE:
             layout.addRow("", self._default_btn)
             layout.addRow(self._nonuniform)
             layout.addRow("Max grading ratio:", self._ratio)
+            layout.addRow("Min cell size:", self._min_cell)
             layout.addRow("Cell counts:", self._counts)
             layout.addRow("Air spacing:", self._spacing)
             layout.addRow("Background material:", self._background)
             layout.addRow("PML thickness:", self._dpml)
+
+            # Per-face boundary conditions. A "same on all faces" checkbox drives
+            # every face from the first (X min) combo and greys the rest out.
+            self._bc_order = [prop for _f, prop, _d in _FACE_PROPS]
+            self._same_bc = QtWidgets.QCheckBox("Same condition on all faces")
+            all_same = len({str(getattr(obj, p)) for p in self._bc_order}) == 1
+            self._same_bc.setChecked(all_same)
+            layout.addRow(self._same_bc)
 
             self._combos = {}
             labels = {
@@ -940,16 +981,43 @@ if _GUI_AVAILABLE:
             info.setWordWrap(True)
             layout.addRow(info)
 
+            # Original values, so Cancel can restore the singleton after the
+            # live edits below.
+            self._orig = self._snapshot()
+            # Re-entrancy guard: mirroring one widget onto others must trigger a
+            # single recompute, not one per mirrored widget. ``_initializing``
+            # suppresses the live recompute while the panel is first wired up.
+            self._suspend = False
+            self._initializing = True
+
             self._cubic.toggled.connect(self._on_cubic)
             self._dx.valueChanged.connect(self._mirror_cubic)
-            # Recompute the derived cell counts live as the cell sizes change,
-            # before OK is pressed, so the user sees the grid resolution update.
-            self._dx.valueChanged.connect(self._update_counts)
-            self._dy.valueChanged.connect(self._update_counts)
-            self._dz.valueChanged.connect(self._update_counts)
+            # Live-apply: push edits onto the Domain and recompute so the derived
+            # cell counts *and* the 3D mesh preview refresh immediately, before OK.
+            for w in (self._dx, self._dy, self._dz, self._ratio, self._min_cell,
+                      self._spacing):
+                w.valueChanged.connect(self._live_apply)
+            self._cpw.valueChanged.connect(self._live_apply)
+            self._dpml.valueChanged.connect(self._live_apply)
+            # Toggling the grid mode / cubic-cells changes the mesh too, so apply
+            # after the enable/disable handlers have run.
             self._nonuniform.toggled.connect(self._on_nonuniform)
+            self._nonuniform.toggled.connect(self._live_apply)
+            self._cubic.toggled.connect(self._live_apply)
+            self._background.currentIndexChanged.connect(self._live_apply)
+            first_prop = self._bc_order[0]
+            for prop, combo in self._combos.items():
+                if prop == first_prop:
+                    continue
+                combo.currentTextChanged.connect(self._live_apply)
+            # The first face's combo drives the rest (when "same" is on) and then
+            # applies, so a single recompute reflects all six faces at once.
+            self._combos[first_prop].currentTextChanged.connect(self._on_first_bc)
+            self._same_bc.toggled.connect(self._on_same_bc)
             self._on_cubic(self._cubic.isChecked())
             self._on_nonuniform(self._nonuniform.isChecked())
+            self._on_same_bc(self._same_bc.isChecked())
+            self._initializing = False
 
             self.form = form
 
@@ -993,8 +1061,10 @@ if _GUI_AVAILABLE:
         def _on_nonuniform(self, checked):
             # With the snapper on, Dx/Dy/Dz become the coarse interior target set
             # from the max frequency: disable manual editing (but keep the
-            # "Default from max frequency" button), and expose the grading ratio.
+            # "Default from max frequency" button), and expose the grading ratio
+            # and the minimum cell size (both snapper-only).
             self._ratio.setEnabled(checked)
+            self._min_cell.setEnabled(checked)
             self._cubic.setEnabled(not checked)
             self._dx.setEnabled(not checked)
             if checked:
@@ -1003,10 +1073,97 @@ if _GUI_AVAILABLE:
             else:
                 self._on_cubic(self._cubic.isChecked())
 
+        def _on_same_bc(self, checked):
+            """Grey out all but the first BC combo and drive them from it."""
+            first = self._combos[self._bc_order[0]]
+            self._suspend = True
+            for prop in self._bc_order[1:]:
+                combo = self._combos[prop]
+                combo.setEnabled(not checked)
+                if checked:
+                    combo.setCurrentText(first.currentText())
+            self._suspend = False
+            self._live_apply()
+
+        def _on_first_bc(self, text):
+            """Mirror the first face's BC onto the rest (when 'same' is on), apply."""
+            if self._same_bc.isChecked():
+                self._suspend = True
+                for prop in self._bc_order[1:]:
+                    self._combos[prop].setCurrentText(text)
+                self._suspend = False
+            self._live_apply()
+
         def _mirror_cubic(self, *_):
             if self._cubic.isChecked():
+                self._suspend = True
                 self._dy.setValue(self._dx.value())
                 self._dz.setValue(self._dx.value())
+                self._suspend = False
+
+        # ---- live edit: apply widgets to the object + restore on cancel ------ #
+
+        def _snapshot(self):
+            """Capture the Domain's editable state for a Cancel restore."""
+            obj = self.obj
+            return {
+                "Dx": obj.Dx.Value, "Dy": obj.Dy.Value, "Dz": obj.Dz.Value,
+                "CellsPerWavelength": int(getattr(obj, "CellsPerWavelength", 20)),
+                "UseNonuniformGrid": bool(getattr(obj, "UseNonuniformGrid", True)),
+                "MaxGradingRatio": float(getattr(obj, "MaxGradingRatio", 1.5)),
+                "MinCellSize": (float(obj.MinCellSize.Value)
+                                if hasattr(obj, "MinCellSize") else 0.0),
+                "Spacing": obj.Spacing.Value,
+                "PMLThickness": int(getattr(obj, "PMLThickness", 8)),
+                "Background": getattr(obj, "Background", None),
+                "bc": {p: str(getattr(obj, p)) for p in self._bc_order},
+            }
+
+        def _write_to_obj(self):
+            """Push every widget value onto the Domain object (no transaction)."""
+            obj = self.obj
+            obj.Dx = "{} mm".format(self._dx.value())
+            obj.Dy = "{} mm".format(self._dy.value())
+            obj.Dz = "{} mm".format(self._dz.value())
+            obj.CellsPerWavelength = int(self._cpw.value())
+            obj.UseNonuniformGrid = bool(self._nonuniform.isChecked())
+            obj.MaxGradingRatio = float(self._ratio.value())
+            if hasattr(obj, "MinCellSize"):
+                obj.MinCellSize = "{} mm".format(self._min_cell.value())
+            obj.Spacing = "{} mm".format(self._spacing.value())
+            obj.PMLThickness = int(self._dpml.value())
+            bg_index = self._background.currentIndex()
+            obj.Background = (
+                None if bg_index == 0 else self._materials[bg_index - 1]
+            )
+            for prop, combo in self._combos.items():
+                setattr(obj, prop, combo.currentText())
+
+        def _restore(self):
+            """Restore the pre-edit state captured in :meth:`_snapshot`."""
+            obj = self.obj
+            o = self._orig
+            obj.Dx = "{} mm".format(o["Dx"])
+            obj.Dy = "{} mm".format(o["Dy"])
+            obj.Dz = "{} mm".format(o["Dz"])
+            obj.CellsPerWavelength = o["CellsPerWavelength"]
+            obj.UseNonuniformGrid = o["UseNonuniformGrid"]
+            obj.MaxGradingRatio = o["MaxGradingRatio"]
+            if hasattr(obj, "MinCellSize"):
+                obj.MinCellSize = "{} mm".format(o["MinCellSize"])
+            obj.Spacing = "{} mm".format(o["Spacing"])
+            obj.PMLThickness = o["PMLThickness"]
+            obj.Background = o["Background"]
+            for prop, val in o["bc"].items():
+                setattr(obj, prop, val)
+
+        def _live_apply(self, *_):
+            """Apply the current widgets and recompute so the mesh refreshes."""
+            if self._suspend or self._initializing:
+                return
+            self._write_to_obj()
+            self.obj.Document.recompute()
+            self._counts.setText(self._counts_text())
 
         def _apply_default_cell_size(self):
             """Fill dx/dy/dz from the simulation's max frequency.
@@ -1040,29 +1197,21 @@ if _GUI_AVAILABLE:
             self._update_counts()
 
         def accept(self):
+            # Values have been live-applied during editing; wrap a final write in
+            # one transaction so the whole edit is a single undo step.
             doc = self.obj.Document
             doc.openTransaction("Wavesim: Edit Domain")
-            self.obj.Dx = "{} mm".format(self._dx.value())
-            self.obj.Dy = "{} mm".format(self._dy.value())
-            self.obj.Dz = "{} mm".format(self._dz.value())
-            self.obj.CellsPerWavelength = int(self._cpw.value())
-            self.obj.UseNonuniformGrid = bool(self._nonuniform.isChecked())
-            self.obj.MaxGradingRatio = float(self._ratio.value())
-            self.obj.Spacing = "{} mm".format(self._spacing.value())
-            self.obj.PMLThickness = int(self._dpml.value())
-            bg_index = self._background.currentIndex()
-            self.obj.Background = (
-                None if bg_index == 0 else self._materials[bg_index - 1]
-            )
-            for prop, combo in self._combos.items():
-                setattr(self.obj, prop, combo.currentText())
+            self._write_to_obj()
             doc.commitTransaction()
             doc.recompute()
             Gui.Control.closeDialog()
             return True
 
         def reject(self):
-            # The domain is a permanent singleton, so Cancel just discards edits.
+            # The domain is a permanent singleton and was live-edited during the
+            # session, so Cancel restores the values captured when the panel opened.
+            self._restore()
+            self.obj.Document.recompute()
             Gui.Control.closeDialog()
             return True
 

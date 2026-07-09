@@ -114,15 +114,17 @@ def collect_axis_snaps(materials):
 # Per-axis graded meshing
 # --------------------------------------------------------------------------- #
 
-def _forced_lines(snaps, lo, hi, coarse):
+def _forced_lines(snaps, lo, hi, coarse, min_cell=0.0):
     """Sorted, deduped forced grid lines spanning ``[lo, hi]`` (mm).
 
     Snap coordinates outside the inner region are dropped; the rest are clamped
     into ``[lo, hi]`` and merged when closer than a small tolerance (so two nearly
-    coincident feature planes don't create a zero-width cell). The result always
-    starts at *lo* and ends at *hi* and is strictly increasing.
+    coincident feature planes don't create a zero-width cell). When *min_cell* is
+    positive, lines closer together than it are also merged, so two nearby
+    features cannot force a sub-minimum cell. The result always starts at *lo* and
+    ends at *hi* and is strictly increasing.
     """
-    tol = max(coarse * 1.0e-3, 1.0e-6)
+    tol = max(coarse * 1.0e-3, 1.0e-6, float(min_cell))
     merged = [lo]
     for v in sorted(snaps):
         if v < lo - tol or v > hi + tol:
@@ -181,7 +183,7 @@ def _graded_widths(w, hL, hR, H, r):
     return [x * scale for x in widths]
 
 
-def build_axis_nodes(snaps, lo, hi, coarse, ratio, pad_lo, pad_hi):
+def build_axis_nodes(snaps, lo, hi, coarse, ratio, pad_lo, pad_hi, min_cell=0.0):
     """Graded node coordinates (mm) for one axis, PML pad cells included.
 
     Parameters
@@ -196,22 +198,32 @@ def build_axis_nodes(snaps, lo, hi, coarse, ratio, pad_lo, pad_hi):
         Max size ratio between adjacent cells the graded fill may use.
     pad_lo, pad_hi : int
         Uniform PML cells (width *coarse*) appended below *lo* / above *hi*.
+    min_cell : float
+        Smallest cell the fill may use (mm); 0 disables the limit. Nearby forced
+        lines are merged and the fine feature cells are clamped to it, so
+        snapping cannot produce an extremely fine mesh.
 
     Returns a strictly-increasing list of node coordinates. The inner region is
     tiled so every gap between forced lines is resolved with cells no larger than
     *coarse*, fine next to small features and grading out to *coarse* in voids.
     """
     coarse = max(float(coarse), 1.0e-9)
+    min_cell = min(max(float(min_cell), 0.0), coarse)
     if hi - lo < coarse:
         hi = lo + coarse  # degenerate/thin axis: at least one inner cell
 
-    forced = _forced_lines(snaps, lo, hi, coarse)
+    forced = _forced_lines(snaps, lo, hi, coarse, min_cell)
     gaps = [b - a for a, b in zip(forced[:-1], forced[1:])]
 
     # Intrinsic desired size per interval (small gaps want small cells) and, from
     # that, the desired cell size at each forced line: the finer of its neighbours
-    # so a line bounding a small feature carries fine cells into the void.
+    # so a line bounding a small feature carries fine cells into the void. The
+    # min-cell floor keeps a small gap from spawning sub-minimum cells (a gap that
+    # is itself below the floor stays a single cell).
     intrinsic = [min(coarse, g) for g in gaps]
+    if min_cell > 0.0:
+        intrinsic = [s if g < min_cell else max(s, min_cell)
+                     for s, g in zip(intrinsic, gaps)]
     n = len(forced)
     end_size = [0.0] * n
     for i in range(n):
@@ -263,6 +275,7 @@ def build_domain_nodes(sim, domain):
     pad_lo, pad_hi = params["pad_lo"], params["pad_hi"]
     coarse_mm = tuple(c * _MM_PER_M for c in domain_mod.cell_sizes_m(domain))
     ratio = max(float(getattr(domain, "MaxGradingRatio", 1.5)), 1.0 + 1.0e-6)
+    min_cell_mm = domain_mod.min_cell_size_m(domain) * _MM_PER_M
 
     los = (bbox.XMin - sp_mm, bbox.YMin - sp_mm, bbox.ZMin - sp_mm)
     his = (bbox.XMax + sp_mm, bbox.YMax + sp_mm, bbox.ZMax + sp_mm)
@@ -274,7 +287,7 @@ def build_domain_nodes(sim, domain):
         nodes = tuple(
             build_axis_nodes(
                 snaps[a], los[a], his[a], coarse_mm[a] * scale, ratio,
-                pad_lo[a], pad_hi[a],
+                pad_lo[a], pad_hi[a], min_cell_mm,
             )
             for a in range(3)
         )

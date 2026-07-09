@@ -278,10 +278,9 @@ if _GUI_AVAILABLE:
             self._max_freq.setDecimals(6)
             self._max_freq.setSuffix(" " + self._freq_unit)
             self._max_freq.setSingleStep(1.0)
+            self._orig_max_freq = float(getattr(obj, "MaxFrequency", 1.0e9))
             self._max_freq.setValue(
-                units.freq_from_si(
-                    float(getattr(obj, "MaxFrequency", 1.0e9)), self._freq_unit
-                )
+                units.freq_from_si(self._orig_max_freq, self._freq_unit)
             )
 
             self._steps = QtWidgets.QLabel()
@@ -338,6 +337,8 @@ if _GUI_AVAILABLE:
                 self._steps.setText("(set a max time and grid cell size)")
 
         def accept(self):
+            from wavesim_gui import domain as domain_mod
+
             doc = self.obj.Document
             doc.openTransaction("Wavesim: Edit Simulation")
             self.obj.TimeUnit = self._time.currentText()
@@ -345,9 +346,20 @@ if _GUI_AVAILABLE:
             self.obj.MaxTime = units.time_to_si(
                 self._max_time.value(), self._time_unit
             )
-            self.obj.MaxFrequency = units.freq_to_si(
-                self._max_freq.value(), self._freq_unit
-            )
+            new_max_freq = units.freq_to_si(self._max_freq.value(), self._freq_unit)
+            self.obj.MaxFrequency = new_max_freq
+            # The max frequency drives the default cell size, so when it changes
+            # re-derive the Domain's cell sizes from it and recompute -- the mesh
+            # display and derived counts update immediately without opening the
+            # Domain panel. Left alone when the frequency is unchanged, so custom
+            # cell sizes survive an unrelated edit (e.g. changing a display unit).
+            domain = self._domain
+            freq_changed = abs(new_max_freq - self._orig_max_freq) > 1.0e-6
+            if domain is not None and freq_changed:
+                size_m = domain_mod.default_cell_size_m(self.obj, domain=domain)
+                if size_m is not None:
+                    size_mm = "{} mm".format(size_m * 1000.0)
+                    domain.Dx = domain.Dy = domain.Dz = size_mm
             doc.commitTransaction()
             doc.recompute()
             Gui.Control.closeDialog()

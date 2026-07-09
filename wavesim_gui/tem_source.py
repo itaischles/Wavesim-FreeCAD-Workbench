@@ -92,6 +92,11 @@ _ARROW_PIXELS = 90.0
 _MM_PER_M = 1000.0
 _AXIS_IDX = {"x": 0, "y": 1, "z": 2}
 
+# The two transverse axes of a face, in the solver's mode-slice order (matching
+# ``wavesim.mode_solver._NORMAL_CFG``): the ``bounds`` rect is (a, b) in this
+# order, so ``_bounds_rect_mm`` / ``tem_source_spec`` stay consistent with it.
+_TRANSVERSE = {"x": ("y", "z"), "y": ("x", "z"), "z": ("x", "y")}
+
 
 # --------------------------------------------------------------------------- #
 # Document-object model
@@ -147,6 +152,17 @@ class TEMSourceObject:
             )
             obj.Conductor = 0
 
+        # Optional in-plane bounds: an edge/face whose bounding box confines the
+        # mode solve to a sub-rectangle of the launch face (empty = whole face).
+        if not hasattr(obj, "BoundsSel"):
+            obj.addProperty(
+                "App::PropertyLinkSub", "BoundsSel", "Port",
+                "Optional edge/face whose in-plane bounding box confines the TEM "
+                "mode solve to a sub-rectangle of the launch face (empty = whole "
+                "face). Set via the task panel.",
+            )
+            obj.setEditorMode("BoundsSel", 2)  # hidden; set via the task panel
+
         # Excitation enum + one property per waveform parameter (shared scheme).
         exc.ensure_object_props(obj)
 
@@ -168,6 +184,15 @@ class TEMSourceObject:
                 "Mode'). 0 = the dominant (first) mode.",
             )
             obj.Conductor = 0
+        # Back-fill the optional in-plane bounds selection (whole face when unset).
+        if not hasattr(obj, "BoundsSel"):
+            obj.addProperty(
+                "App::PropertyLinkSub", "BoundsSel", "Port",
+                "Optional edge/face whose in-plane bounding box confines the TEM "
+                "mode solve to a sub-rectangle of the launch face (empty = whole "
+                "face). Set via the task panel.",
+            )
+            obj.setEditorMode("BoundsSel", 2)  # hidden; set via the task panel
         # Re-run property setup so ports saved before the extra waveforms gain
         # the new options + parameter properties and editor modes are re-asserted.
         exc.ensure_object_props(obj)
@@ -183,7 +208,9 @@ class TEMSourceObject:
             half = 5.0
             mn = FreeCAD.Vector(-half, -half, -half)
             mx = FreeCAD.Vector(half, half, half)
-        obj.Corners = [FreeCAD.Vector(*p) for p in _face_corners(mn, mx, str(obj.Face))]
+        rect = _bounds_rect_mm(dom, str(obj.Face), getattr(obj, "BoundsSel", None))
+        obj.Corners = [FreeCAD.Vector(*p)
+                       for p in _face_corners(mn, mx, str(obj.Face), rect)]
 
     def dumps(self):
         return {"Type": getattr(self, "Type", _TEM_TYPE)}
@@ -197,18 +224,100 @@ class TEMSourceObject:
     __setstate__ = loads
 
 
-def _face_corners(mn, mx, face):
-    """Four (x, y, z) corners of the *face* plane spanning the box *mn*..*mx*."""
+def _face_corners(mn, mx, face, rect=None):
+    """Four (x, y, z) corners of the *face* plane spanning the box *mn*..*mx*.
+
+    When *rect* ``(a0, a1, b0, b1)`` (world mm, transverse slice order) is given
+    the plane is shrunk to that in-plane sub-rectangle, so a bounded TEM port
+    draws only the region its mode is solved on.
+    """
     axis = face[0]
     hi = face.endswith("1")
     if axis == "x":
         x = mx.x if hi else mn.x
-        return [(x, mn.y, mn.z), (x, mx.y, mn.z), (x, mx.y, mx.z), (x, mn.y, mx.z)]
+        y0, y1, z0, z1 = (rect if rect is not None else (mn.y, mx.y, mn.z, mx.z))
+        return [(x, y0, z0), (x, y1, z0), (x, y1, z1), (x, y0, z1)]
     if axis == "y":
         y = mx.y if hi else mn.y
-        return [(mn.x, y, mn.z), (mx.x, y, mn.z), (mx.x, y, mx.z), (mn.x, y, mx.z)]
+        x0, x1, z0, z1 = (rect if rect is not None else (mn.x, mx.x, mn.z, mx.z))
+        return [(x0, y, z0), (x1, y, z0), (x1, y, z1), (x0, y, z1)]
     z = mx.z if hi else mn.z
-    return [(mn.x, mn.y, z), (mx.x, mn.y, z), (mx.x, mx.y, z), (mn.x, mx.y, z)]
+    x0, x1, y0, y1 = (rect if rect is not None else (mn.x, mx.x, mn.y, mx.y))
+    return [(x0, y0, z), (x1, y0, z), (x1, y1, z), (x0, y1, z)]
+
+
+def _bounds_sel_bbox(bounds_sel):
+    """World-mm :class:`FreeCAD.BoundBox` of a ``BoundsSel`` LinkSub, or ``None``.
+
+    *bounds_sel* is an ``App::PropertyLinkSub`` value ``(object, (subnames,))``.
+    The picked sub-elements' bounding boxes are unioned; when no sub-element is
+    named the whole linked shape is used. ``None`` when it can't be resolved.
+    """
+    if not bounds_sel:
+        return None
+    link, subs = bounds_sel[0], bounds_sel[1]
+    shape = getattr(link, "Shape", None)
+    if shape is None:
+        return None
+    subs = [s for s in (subs or []) if s]
+    elems = []
+    if subs:
+        for sub in subs:
+            try:
+                elems.append(shape.getElement(sub))
+            except Exception:
+                continue
+    else:
+        elems = [shape]
+    boxes = []
+    for elem in elems:
+        try:
+            boxes.append(elem.BoundBox)
+        except Exception:
+            continue
+    if not boxes:
+        return None
+    return FreeCAD.BoundBox(
+        min(b.XMin for b in boxes), min(b.YMin for b in boxes),
+        min(b.ZMin for b in boxes), max(b.XMax for b in boxes),
+        max(b.YMax for b in boxes), max(b.ZMax for b in boxes),
+    )
+
+
+def _bounds_rect_mm(dom, face, bounds_sel):
+    """In-plane rect ``(a0, a1, b0, b1)`` (world mm) of *bounds_sel* on *face*.
+
+    Projects the selection's bounding box onto the face's two transverse axes
+    (solver slice order, see :data:`_TRANSVERSE`) and clamps it to the domain
+    face. Returns ``None`` when no usable selection is set (⇒ whole face).
+    """
+    bb = _bounds_sel_bbox(bounds_sel)
+    if bb is None:
+        return None
+    ax_a, ax_b = _TRANSVERSE[face[0]]
+    lo = {"x": bb.XMin, "y": bb.YMin, "z": bb.ZMin}
+    hi = {"x": bb.XMax, "y": bb.YMax, "z": bb.ZMax}
+    a0, a1, b0, b1 = lo[ax_a], hi[ax_a], lo[ax_b], hi[ax_b]
+    if dom is not None and (dom.DomainMax - dom.DomainMin).Length > 1.0e-9:
+        dmn, dmx = dom.DomainMin, dom.DomainMax
+        dlo = {"x": dmn.x, "y": dmn.y, "z": dmn.z}
+        dhi = {"x": dmx.x, "y": dmx.y, "z": dmx.z}
+        a0, a1 = max(a0, dlo[ax_a]), min(a1, dhi[ax_a])
+        b0, b1 = max(b0, dlo[ax_b]), min(b1, dhi[ax_b])
+    if a1 <= a0 or b1 <= b0:
+        return None
+    return (a0, a1, b0, b1)
+
+
+def _bounds_desc(obj):
+    """Short human label for a port's ``BoundsSel`` (or a 'whole face' note)."""
+    sel = getattr(obj, "BoundsSel", None)
+    if not sel:
+        return "Whole face (no bounds)"
+    link, subs = sel[0], sel[1]
+    subs = [s for s in (subs or []) if s]
+    name = getattr(link, "Label", None) or getattr(link, "Name", "?")
+    return "{} ({})".format(name, ", ".join(subs)) if subs else str(name)
 
 
 def _flow_direction(face):
@@ -271,7 +380,7 @@ def tem_source_spec(obj, origin_m):
     # +1 from a low face (x0/y0/z0), -1 from a high face (x1/y1/z1). The solver's
     # mode profiles assume +normal propagation, so the runner flips H when this is
     # negative (mirrors _flow_direction, which aims the viewport arrow).
-    return {
+    spec = {
         "name": str(obj.Label or obj.Name),
         "normal": axis,
         "position": position,
@@ -280,6 +389,28 @@ def tem_source_spec(obj, origin_m):
         "excitation": exc.spec_from_object(obj),
         "fields": str(getattr(obj, "Fields", "EH")),
     }
+    _add_bounds_spec(spec, dom, face, axis, getattr(obj, "BoundsSel", None), origin_m)
+    return spec
+
+
+def _add_bounds_spec(spec, dom, face, axis, bounds_sel, origin_m):
+    """Attach a solver-frame ``"bounds"`` rect to *spec* when one is selected.
+
+    Shared by the TEM source and the SPICE TEM port. The world-mm in-plane rect
+    from :func:`_bounds_rect_mm` is converted to solver metres on the two
+    transverse axes (the domain origin subtracted, like the plane position);
+    absent ⇒ the runner solves on the whole face.
+    """
+    rect = _bounds_rect_mm(dom, face, bounds_sel)
+    if rect is None:
+        return
+    ax_a, ax_b = _TRANSVERSE[axis]
+    ia, ib = _AXIS_IDX[ax_a], _AXIS_IDX[ax_b]
+    a0, a1, b0, b1 = rect
+    spec["bounds"] = [
+        a0 / _MM_PER_M - origin_m[ia], a1 / _MM_PER_M - origin_m[ia],
+        b0 / _MM_PER_M - origin_m[ib], b1 / _MM_PER_M - origin_m[ib],
+    ]
 
 
 def _describe(obj):
@@ -536,6 +667,7 @@ if _GUI_AVAILABLE:
             self.obj = obj
             self.created = created
             self._orig_face = str(getattr(obj, "Face", "z0"))
+            self._orig_bounds = getattr(obj, "BoundsSel", None)
 
             form = QtWidgets.QWidget()
             form.setWindowTitle("Wavesim TEM Source")
@@ -567,6 +699,22 @@ if _GUI_AVAILABLE:
             layout.addRow("Inject fields:", self._fields)
             layout.addRow("Energize conductor:", self._conductor)
 
+            # Optional in-plane bounds: pick an edge/face whose bounding box
+            # confines the mode solve to a sub-rectangle of the launch face.
+            self._bounds_label = QtWidgets.QLabel(_bounds_desc(obj))
+            self._bounds_label.setWordWrap(True)
+            pick = QtWidgets.QPushButton("Select bounding edge/face")
+            clear = QtWidgets.QPushButton("Clear")
+            brow = QtWidgets.QWidget()
+            blay = QtWidgets.QHBoxLayout(brow)
+            blay.setContentsMargins(0, 0, 0, 0)
+            blay.addWidget(pick)
+            blay.addWidget(clear)
+            layout.addRow("Solve bounds:", self._bounds_label)
+            layout.addRow("", brow)
+            pick.clicked.connect(self._pick_bounds)
+            clear.clicked.connect(self._clear_bounds)
+
             # Excitation combo + per-waveform parameter rows + preview button
             # (shared with the point-source panel).
             self.build_excitation_ui(layout, QtWidgets)
@@ -584,6 +732,9 @@ if _GUI_AVAILABLE:
                 "Compute Mode lists one 'conductor N' mode per signal conductor in "
                 "the results tree — set 'Energize conductor' to that N to drive "
                 "that conductor (0 launches the dominant mode). "
+                "Optionally select an edge/face to confine the mode solve to its "
+                "in-plane bounding box (e.g. a single connector's cross-section on "
+                "a shared plane); Clear restores the whole face. "
                 "Frequency/time units are set on the Simulation object."
             )
             info.setWordWrap(True)
@@ -602,6 +753,31 @@ if _GUI_AVAILABLE:
             self.obj.Face = self._selected_face()
             self.obj.Document.recompute()
 
+        def _pick_bounds(self, *_):
+            """Set BoundsSel from the first edge/face in the current selection."""
+            try:
+                from PySide import QtWidgets
+            except ImportError:
+                from PySide import QtGui as QtWidgets
+            for s in Gui.Selection.getSelectionEx():
+                picks = [n for n in (getattr(s, "SubElementNames", []) or [])
+                         if n.startswith("Edge") or n.startswith("Face")]
+                if picks:
+                    self.obj.BoundsSel = (s.Object, [picks[0]])
+                    self._bounds_label.setText(_bounds_desc(self.obj))
+                    self.obj.Document.recompute()
+                    return
+            QtWidgets.QMessageBox.information(
+                self.form, "Wavesim TEM Source",
+                "Select an edge or face in the 3D view first, then click "
+                "'Select bounding edge/face'.",
+            )
+
+        def _clear_bounds(self, *_):
+            self.obj.BoundsSel = None
+            self._bounds_label.setText(_bounds_desc(self.obj))
+            self.obj.Document.recompute()
+
         def _commit(self, title):
             """Write the widget values onto the object and force PML on the face.
 
@@ -610,12 +786,15 @@ if _GUI_AVAILABLE:
             Compute Mode so both see exactly the same persisted state.
             """
             doc = self.obj.Document
-            # Restore the original face first so the transaction captures the full
-            # change (the live edit already moved the object outside it).
+            # Restore the original face/bounds first so the transaction captures
+            # the full change (the live edits already moved them outside it).
+            new_bounds = getattr(self.obj, "BoundsSel", None)
             self.obj.Face = self._orig_face
+            self.obj.BoundsSel = self._orig_bounds
             doc.openTransaction(title)
             face = self._selected_face()
             self.obj.Face = face
+            self.obj.BoundsSel = new_bounds
             self.obj.Fields = _FIELDS_TOKEN[self._fields.currentText()]
             self.obj.Conductor = int(self._conductor.value())
             self.write_excitation(self.obj)
@@ -627,6 +806,7 @@ if _GUI_AVAILABLE:
             doc.recompute()
             domain_mod.notify_domain_inputs_changed(doc)
             self._orig_face = face
+            self._orig_bounds = new_bounds
 
         def _on_compute(self, *_):
             self._commit("Wavesim: Edit TEM Source")
@@ -646,6 +826,7 @@ if _GUI_AVAILABLE:
                 doc.recompute()
             else:
                 self.obj.Face = self._orig_face
+                self.obj.BoundsSel = self._orig_bounds
                 doc.recompute()
             Gui.Control.closeDialog()
             return True

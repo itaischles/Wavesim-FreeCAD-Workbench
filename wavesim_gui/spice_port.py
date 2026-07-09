@@ -289,6 +289,17 @@ class SpiceTEMPortObject:
             )
             obj.Conductor = 0
 
+        # Optional in-plane bounds (edge/face) confining the mode solve to a
+        # sub-rectangle of the launch face; shared behaviour with the TEM source.
+        if not hasattr(obj, "BoundsSel"):
+            obj.addProperty(
+                "App::PropertyLinkSub", "BoundsSel", "Port",
+                "Optional edge/face whose in-plane bounding box confines the TEM "
+                "mode solve to a sub-rectangle of the launch face (empty = whole "
+                "face). Set via the task panel.",
+            )
+            obj.setEditorMode("BoundsSel", 2)  # hidden; set via the task panel
+
         ensure_spice_props(obj)
 
         if not hasattr(obj, "Corners"):
@@ -298,6 +309,14 @@ class SpiceTEMPortObject:
     def onDocumentRestored(self, obj):
         obj.Proxy = self
         self.Type = getattr(self, "Type", _TEM_TYPE)
+        if not hasattr(obj, "BoundsSel"):
+            obj.addProperty(
+                "App::PropertyLinkSub", "BoundsSel", "Port",
+                "Optional edge/face whose in-plane bounding box confines the TEM "
+                "mode solve to a sub-rectangle of the launch face (empty = whole "
+                "face). Set via the task panel.",
+            )
+            obj.setEditorMode("BoundsSel", 2)  # hidden; set via the task panel
         ensure_spice_props(obj)
 
     def execute(self, obj):
@@ -310,8 +329,10 @@ class SpiceTEMPortObject:
             half = 5.0
             mn = FreeCAD.Vector(-half, -half, -half)
             mx = FreeCAD.Vector(half, half, half)
+        rect = tem_mod._bounds_rect_mm(dom, str(obj.Face),
+                                       getattr(obj, "BoundsSel", None))
         obj.Corners = [FreeCAD.Vector(*p)
-                       for p in tem_mod._face_corners(mn, mx, str(obj.Face))]
+                       for p in tem_mod._face_corners(mn, mx, str(obj.Face), rect)]
 
     def dumps(self):
         return {"Type": getattr(self, "Type", _TEM_TYPE)}
@@ -414,6 +435,8 @@ def spice_tem_port_spec(obj, origin_m):
         "conductor_id": int(getattr(obj, "Conductor", 0)),
         "directional": str(getattr(obj, "Fields", "EH")) == "EH",
     }
+    tem_mod._add_bounds_spec(spec, dom, face, axis,
+                             getattr(obj, "BoundsSel", None), origin_m)
     spec.update(_spice_common_spec(obj))
     return spec
 
@@ -745,6 +768,7 @@ if _GUI_AVAILABLE:
             self.obj = obj
             self.created = created
             self._orig_face = str(getattr(obj, "Face", "z0"))
+            self._orig_bounds = getattr(obj, "BoundsSel", None)
 
             form = QtWidgets.QWidget()
             form.setWindowTitle("Wavesim SPICE TEM Port")
@@ -772,6 +796,21 @@ if _GUI_AVAILABLE:
             layout.addRow("Inject fields:", self._fields)
             layout.addRow("Energize conductor:", self._conductor)
 
+            # Optional in-plane bounds (mirrors the TEM source panel).
+            self._bounds_label = QtWidgets.QLabel(tem_mod._bounds_desc(obj))
+            self._bounds_label.setWordWrap(True)
+            pick = QtWidgets.QPushButton("Select bounding edge/face")
+            clear = QtWidgets.QPushButton("Clear")
+            brow = QtWidgets.QWidget()
+            blay = QtWidgets.QHBoxLayout(brow)
+            blay.setContentsMargins(0, 0, 0, 0)
+            blay.addWidget(pick)
+            blay.addWidget(clear)
+            layout.addRow("Solve bounds:", self._bounds_label)
+            layout.addRow("", brow)
+            pick.clicked.connect(self._pick_bounds)
+            clear.clicked.connect(self._clear_bounds)
+
             self._build_spice_ui(layout, QtWidgets)
 
             self._compute = QtWidgets.QPushButton("Compute Mode")
@@ -782,7 +821,9 @@ if _GUI_AVAILABLE:
                 "A SPICE TEM port drives the TEM mode of the PEC cross-section "
                 "on the chosen face (set to PML automatically) with the linked "
                 "circuit. 'Compute Mode' solves and plots the mode(s) now; put "
-                "the matched source resistance in the netlist. " + self._NOTE
+                "the matched source resistance in the netlist. Optionally select "
+                "an edge/face to confine the mode solve to its in-plane bounding "
+                "box (Clear restores the whole face). " + self._NOTE
             )
             info.setWordWrap(True)
             layout.addRow(info)
@@ -796,12 +837,37 @@ if _GUI_AVAILABLE:
             self.obj.Face = self._selected_face()
             self.obj.Document.recompute()
 
+        def _pick_bounds(self, *_):
+            """Set BoundsSel from the first edge/face in the current selection."""
+            QtWidgets = _qt_widgets()
+            for s in Gui.Selection.getSelectionEx():
+                picks = [n for n in (getattr(s, "SubElementNames", []) or [])
+                         if n.startswith("Edge") or n.startswith("Face")]
+                if picks:
+                    self.obj.BoundsSel = (s.Object, [picks[0]])
+                    self._bounds_label.setText(tem_mod._bounds_desc(self.obj))
+                    self.obj.Document.recompute()
+                    return
+            QtWidgets.QMessageBox.information(
+                self.form, "Wavesim SPICE TEM Port",
+                "Select an edge or face in the 3D view first, then click "
+                "'Select bounding edge/face'.",
+            )
+
+        def _clear_bounds(self, *_):
+            self.obj.BoundsSel = None
+            self._bounds_label.setText(tem_mod._bounds_desc(self.obj))
+            self.obj.Document.recompute()
+
         def _commit(self, title):
             doc = self.obj.Document
+            new_bounds = getattr(self.obj, "BoundsSel", None)
             self.obj.Face = self._orig_face
+            self.obj.BoundsSel = self._orig_bounds
             doc.openTransaction(title)
             face = self._selected_face()
             self.obj.Face = face
+            self.obj.BoundsSel = new_bounds
             self.obj.Fields = _FIELDS_TOKEN[self._fields.currentText()]
             self.obj.Conductor = int(self._conductor.value())
             self._write_spice(self.obj)
@@ -815,6 +881,7 @@ if _GUI_AVAILABLE:
             doc.recompute()
             domain_mod.notify_domain_inputs_changed(doc)
             self._orig_face = face
+            self._orig_bounds = new_bounds
 
         def _on_compute(self, *_):
             self._commit("Wavesim: Edit SPICE TEM Port")
@@ -834,6 +901,7 @@ if _GUI_AVAILABLE:
                 doc.recompute()
             else:
                 self.obj.Face = self._orig_face
+                self.obj.BoundsSel = self._orig_bounds
                 doc.recompute()
             Gui.Control.closeDialog()
             return True

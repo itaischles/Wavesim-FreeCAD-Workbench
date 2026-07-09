@@ -51,6 +51,9 @@ job.json schema (Session 2)
                        "conductor_id": 0,       # which solved mode to launch:
                                                 # a conductor label (see summary
                                                 # "modes"), 0/absent = dominant
+                       "bounds": [a0,a1,b0,b1], # optional in-plane subset (solver
+                                                # metres, transverse slice order);
+                                                # absent = the whole face
                        "excitation": {"type":.., ...}, "fields":"EH"|"E"}, ...],
                        # legacy entries may carry flat "fmax"/"amplitude" keys
                        # and omit "direction" (defaults to +normal / low face)
@@ -61,6 +64,7 @@ job.json schema (Session 2)
          "p0":[x,y,z], "p1":[x,y,z], "sign":1.0, "uic":false},
         {"kind":"tem",  "name":.., "netlist":"<path>", "nodes":["port1p","0"],
          "normal":"z", "position":.., "direction":1.0|-1.0, "conductor_id":0,
+         "bounds":[a0,a1,b0,b1],  # optional; as in tem_sources (whole face if absent)
          "directional":true, "sign":1.0, "uic":false}, ...],
       "mode_only": false,                     # solve TEM modes only; no FDTD run
       "monitors": {
@@ -92,7 +96,11 @@ the PEC cross-section, launches it as a directional ``PlaneSource`` (built via
 field profiles into ``results.npz`` (keys ``mode_<si>_<mi>_phi`` / ``_pec`` /
 ``_E_<comp>``) with its per-unit-length parameters under ``summary["modes"]``.
 With ``mode_only`` true the runner solves and saves the modes and skips the FDTD
-time-stepping entirely (used by the workbench's "Compute Mode" button).
+time-stepping entirely (used by the workbench's "Compute Mode" button). An
+optional ``bounds`` ``[a0,a1,b0,b1]`` (solver metres, transverse slice order)
+confines the mode solve to a sub-rectangle of the face — e.g. one connector's
+cross-section on a plane that cuts several — and is forwarded straight to
+``solve_tem_modes(bounds=...)``; absent it solves on the whole face.
 
 SPICE co-simulation ports
 -------------------------
@@ -376,8 +384,14 @@ def _solve_all_modes(ws, np, grid, job):
                 prefix, normal, name, grid.Nx, grid.Ny, grid.Nz
             )
         )
+        # Optional in-plane bounds (solver-frame metres, transverse slice order):
+        # confine the mode solve to a sub-rectangle of the face. Absent => whole
+        # face, the historical behaviour.
+        bounds = t.get("bounds")
         modes = ws.solve_tem_modes(
-            grid, normal=normal, position=position, compute_params=True
+            grid, normal=normal, position=position,
+            bounds=tuple(bounds) if bounds else None,
+            compute_params=True,
         )
         _emit_status(
             "{}found {} TEM mode(s); building field profiles...".format(

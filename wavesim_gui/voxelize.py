@@ -345,7 +345,8 @@ def voxelize_materials(materials, cell_size_m, spacing_m=0.0,
                        pad_lo=(8, 8, 8), pad_hi=(8, 8, 8),
                        extra_points_mm=(), extra_axis_offsets=(),
                        port_faces=(), bg_eps=1.0, bg_mu=1.0, bg_pec=False,
-                       max_total_cells=4_000_000, progress=None):
+                       nodes_m=None,
+                       max_total_cells=10_000_000, progress=None):
     """Voxelise *materials* onto a regular grid bounding all their bodies.
 
     Parameters
@@ -376,6 +377,15 @@ def voxelize_materials(materials, cell_size_m, spacing_m=0.0,
         cross-section is extruded through the spacing + PML cells on that face
         (see :func:`_extrude_port_faces`) so the guided mode exits the absorber
         without re-reflecting. Empty for a run with no TEM ports.
+    nodes_m : tuple of array, optional
+        Explicit per-axis node coordinates ``(x, y, z)`` in **world metres**
+        (strictly increasing, PML pad cells included) from the Domain's graded
+        grid. When given, the grid extent/cell centres come from these directly
+        and *cell_size_m*/*spacing_m*/*pad_lo*/*pad_hi*/*extra_** are ignored (the
+        node arrays already bake them in). When ``None`` (the uniform default),
+        a regular grid is derived from *cell_size_m* + the bounds, exactly as
+        before. Cell centres are always ``0.5*(nodes[:-1]+nodes[1:])``, so the
+        two paths coincide bit-for-bit on a uniform grid.
     bg_eps, bg_mu, bg_pec : float / float / bool
         The background medium filling every "empty" voxel -- the eps/mu/PEC of
         the Domain's chosen background Material (vacuum: ``1.0, 1.0, False``).
@@ -402,14 +412,35 @@ def voxelize_materials(materials, cell_size_m, spacing_m=0.0,
     if not entries:
         raise ValueError("No solid bodies are assigned to any material.")
 
-    bbox = _expand_bbox_points(_combined_bbox(entries), extra_points_mm)
-    bbox = _expand_bbox_axis(bbox, extra_axis_offsets)
-    dx_mm, dy_mm, dz_mm = (c * _MM_PER_M for c in cell_size_m)
-    cell_mm = (dx_mm, dy_mm, dz_mm)
+    # Per-axis node coordinates (world mm) spanning the padded grid. Either
+    # supplied explicitly (the Domain's graded grid) or derived as a uniform grid
+    # bounding the geometry + extras. Both then share one centre-based sweep.
+    if nodes_m is not None:
+        nodes_mm = tuple(
+            np.ascontiguousarray(a, dtype=np.float64) * _MM_PER_M for a in nodes_m
+        )
+    else:
+        bbox = _expand_bbox_points(_combined_bbox(entries), extra_points_mm)
+        bbox = _expand_bbox_axis(bbox, extra_axis_offsets)
+        dx_mm, dy_mm, dz_mm = (c * _MM_PER_M for c in cell_size_m)
+        (Nx, Ny, Nz), (ox, oy, oz) = _grid_extent(
+            bbox, (dx_mm, dy_mm, dz_mm), spacing_m * _MM_PER_M, pad_lo, pad_hi
+        )
+        nodes_mm = (
+            ox + np.arange(Nx + 1) * dx_mm,
+            oy + np.arange(Ny + 1) * dy_mm,
+            oz + np.arange(Nz + 1) * dz_mm,
+        )
 
-    (Nx, Ny, Nz), (ox, oy, oz) = _grid_extent(
-        bbox, cell_mm, spacing_m * _MM_PER_M, pad_lo, pad_hi
-    )
+    nx_mm, ny_mm, nz_mm = nodes_mm
+    Nx, Ny, Nz = nx_mm.size - 1, ny_mm.size - 1, nz_mm.size - 1
+    ox, oy, oz = float(nx_mm[0]), float(ny_mm[0]), float(nz_mm[0])
+    # Representative scalar spacings: the constant cell size on a uniform grid,
+    # the minimum width on a graded one (matching the solver's scalar grid.dx).
+    dx_mm = float(np.diff(nx_mm).min())
+    dy_mm = float(np.diff(ny_mm).min())
+    dz_mm = float(np.diff(nz_mm).min())
+
     total = Nx * Ny * Nz
     if total > max_total_cells:
         raise ValueError(
@@ -432,10 +463,11 @@ def voxelize_materials(materials, cell_size_m, spacing_m=0.0,
     # cell resolution (never below the geometric tolerance).
     deflection = max(min(dx_mm, dy_mm) * 0.25, tol)
 
-    # Cell-centre world coordinates (mm) along each axis, precomputed (numpy).
-    xs = ox + (np.arange(Nx) + 0.5) * dx_mm
-    ys = oy + (np.arange(Ny) + 0.5) * dy_mm
-    zs = oz + (np.arange(Nz) + 0.5) * dz_mm
+    # Cell-centre world coordinates (mm) along each axis, from the node arrays.
+    # On a uniform grid this is exactly ``ox + (arange(N) + 0.5) * d``.
+    xs = 0.5 * (nx_mm[:-1] + nx_mm[1:])
+    ys = 0.5 * (ny_mm[:-1] + ny_mm[1:])
+    zs = 0.5 * (nz_mm[:-1] + nz_mm[1:])
 
     def cell_range(lo, hi, axis_coords):
         """Indices of cell centres falling within [lo, hi] (a shape's bbox)."""
@@ -493,14 +525,27 @@ def voxelize_materials(materials, cell_size_m, spacing_m=0.0,
     # done before the counts below so they reflect the extruded geometry).
     _extrude_port_faces(arrays, port_faces, bg_eps=bg_eps, bg_mu=bg_mu,
                         bg_pec=bg_pec)
+    grid_dict = {
+        "Nx": Nx, "Ny": Ny, "Nz": Nz,
+        "dx": dx_mm / _MM_PER_M,
+        "dy": dy_mm / _MM_PER_M,
+        "dz": dz_mm / _MM_PER_M,
+    }
+    # Solver-frame node coordinates (metres, origin at 0): the runner calls
+    # create_grid_rectilinear with these. Only emitted for a genuinely
+    # non-uniform grid -- a uniform run stays on create_grid, which sets exact
+    # constant spacing arrays (create_grid_rectilinear derives them via
+    # ``diff(coords)``, which rounds ~1 ULP off a uniform tick and would perturb
+    # dt / the field evolution). The origin is baked into the voxel arrays, so
+    # subtract it. The runner still writes plot coordinate arrays for both paths
+    # from ``grid.x``/``grid.xc``, which exist on a uniform grid too.
+    if nodes_m is not None:
+        grid_dict["x"] = [(float(v) - ox) / _MM_PER_M for v in nx_mm]
+        grid_dict["y"] = [(float(v) - oy) / _MM_PER_M for v in ny_mm]
+        grid_dict["z"] = [(float(v) - oz) / _MM_PER_M for v in nz_mm]
     return {
         "arrays": arrays,
-        "grid": {
-            "Nx": Nx, "Ny": Ny, "Nz": Nz,
-            "dx": dx_mm / _MM_PER_M,
-            "dy": dy_mm / _MM_PER_M,
-            "dz": dz_mm / _MM_PER_M,
-        },
+        "grid": grid_dict,
         "origin_m": (ox / _MM_PER_M, oy / _MM_PER_M, oz / _MM_PER_M),
         "counts": {
             "dielectric_cells": int(np.count_nonzero(eps_arr != float(bg_eps))),
@@ -579,6 +624,15 @@ def build_job_from_document(doc, steps=None, fmax=30.0e9, progress=None):
     bg_eps = float(getattr(bg_mat, "Eps", 1.0)) if bg_mat is not None else 1.0
     bg_mu = float(getattr(bg_mat, "Mu", 1.0)) if bg_mat is not None else 1.0
     bg_pec = bool(getattr(bg_mat, "Pec", False)) if bg_mat is not None else False
+    # Non-uniform grid: when the Domain's snapper is enabled, hand its explicit
+    # node arrays to the voxeliser (which then ignores cell size / spacing / PML
+    # padding -- the snapper already baked them in). Off (the default) leaves
+    # nodes_m None so the voxeliser derives the usual uniform grid.
+    nodes_m = None
+    if getattr(dom, "UseNonuniformGrid", False):
+        candidate = domain_mod.node_coords_m(dom)
+        if all(len(a) >= 2 for a in candidate):
+            nodes_m = candidate
     # Grow the grid to include every source position and snapshot slice, so an
     # input outside the material bounds (or in the PML) still lands inside it.
     vox = voxelize_materials(
@@ -587,6 +641,7 @@ def build_job_from_document(doc, steps=None, fmax=30.0e9, progress=None):
         extra_axis_offsets=snapshot_axis_offsets(sim),
         port_faces=port_faces,
         bg_eps=bg_eps, bg_mu=bg_mu, bg_pec=bg_pec,
+        nodes_m=nodes_m,
         progress=progress,
     )
     grid = vox["grid"]

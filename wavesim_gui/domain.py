@@ -127,6 +127,41 @@ class DomainObject:
                 obj.addProperty("App::PropertyInteger", name, "Grid", doc)
                 obj.setEditorMode(name, 1)  # read-only (derived)
 
+        if not hasattr(obj, "CellsPerWavelength"):
+            obj.addProperty(
+                "App::PropertyInteger", "CellsPerWavelength", "Grid",
+                "Cells resolving one wavelength at the simulation's max "
+                "frequency; used by the 'Default from max frequency' cell size",
+            )
+            obj.CellsPerWavelength = 20
+        if not hasattr(obj, "UseNonuniformGrid"):
+            obj.addProperty(
+                "App::PropertyBool", "UseNonuniformGrid", "Grid",
+                "Build a graded non-uniform rectilinear grid (snapper) instead "
+                "of a uniform Dx/Dy/Dz grid",
+            )
+            obj.UseNonuniformGrid = False
+        if not hasattr(obj, "MaxGradingRatio"):
+            obj.addProperty(
+                "App::PropertyFloat", "MaxGradingRatio", "Grid",
+                "Largest size ratio between adjacent cells the non-uniform "
+                "snapper may use when grading from a fine feature out to the "
+                "coarse interior (solver guidance ~1.5-2x)",
+            )
+            obj.MaxGradingRatio = 1.5
+
+        # Per-axis node-coordinate arrays (world mm, including the PML pad cells)
+        # spanning the padded grid -- the geometric source of truth every
+        # downstream consumer derives from. ``execute`` populates them: uniform
+        # ticks when UseNonuniformGrid is off, the snapper's lines when on.
+        for name in ("NodesX", "NodesY", "NodesZ"):
+            if not hasattr(obj, name):
+                obj.addProperty(
+                    "App::PropertyFloatList", name, "Grid",
+                    "Grid node coordinates along {} (world mm; maintained "
+                    "internally)".format(name[-1].lower()),
+                )
+                obj.setEditorMode(name, 2)  # hidden
         if not hasattr(obj, "Spacing"):
             obj.addProperty(
                 "App::PropertyLength", "Spacing", "Domain",
@@ -183,10 +218,11 @@ class DomainObject:
 
         zero = FreeCAD.Vector(0, 0, 0)
         if bbox is None:
-            # No geometry yet: empty boxes, zero counts.
+            # No geometry yet: empty boxes, zero counts, no node arrays.
             obj.DomainMin = obj.DomainMax = zero
             obj.PmlMin = obj.PmlMax = zero
             obj.Nx = obj.Ny = obj.Nz = 0
+            obj.NodesX = obj.NodesY = obj.NodesZ = []
             return
 
         params = domain_grid_params(obj)
@@ -208,9 +244,38 @@ class DomainObject:
         else:
             obj.PmlMin = obj.PmlMax = zero  # no PML -> draw no outer box
 
-        dims = vox.derive_grid_dims(sim, cell_sizes_m(obj))
-        if dims is not None:
-            obj.Nx, obj.Ny, obj.Nz = dims["Nx"], dims["Ny"], dims["Nz"]
+        # Per-axis node-coordinate arrays (world mm) spanning the padded grid.
+        # With UseNonuniformGrid on, the snapper places lines on the geometry's
+        # features and grades the spacing; otherwise these are uniform ticks
+        # whose extent matches the voxeliser's own ``_grid_extent`` for the same
+        # geometry, so the preview and the run agree.
+        nodes = None
+        if getattr(obj, "UseNonuniformGrid", False):
+            from wavesim_gui import gridbuild
+            try:
+                nodes = gridbuild.build_domain_nodes(sim, obj)
+            except Exception as exc:  # never let meshing break the recompute
+                FreeCAD.Console.PrintWarning(
+                    "Wavesim: non-uniform grid build failed ({}); "
+                    "falling back to a uniform grid.\n".format(exc)
+                )
+                nodes = None
+
+        if nodes is not None:
+            obj.NodesX = list(nodes[0])
+            obj.NodesY = list(nodes[1])
+            obj.NodesZ = list(nodes[2])
+            obj.Nx = len(nodes[0]) - 1
+            obj.Ny = len(nodes[1]) - 1
+            obj.Nz = len(nodes[2]) - 1
+        else:
+            (nx, ny, nz), (ox, oy, oz) = vox._grid_extent(
+                bbox, (dx, dy, dz), sp_mm, pad_lo, pad_hi
+            )
+            obj.NodesX = [ox + i * dx for i in range(nx + 1)]
+            obj.NodesY = [oy + i * dy for i in range(ny + 1)]
+            obj.NodesZ = [oz + i * dz for i in range(nz + 1)]
+            obj.Nx, obj.Ny, obj.Nz = nx, ny, nz
 
     def dumps(self):
         return {"Type": getattr(self, "Type", _DOMAIN_TYPE)}
@@ -259,6 +324,87 @@ def cell_sizes_m(obj):
     )
 
 
+def node_coords_mm(obj):
+    """Return the Domain's ``(NodesX, NodesY, NodesZ)`` arrays (world mm lists).
+
+    These are the per-axis grid node coordinates spanning the padded grid (PML
+    included), the geometric source of truth ``execute`` maintains. Empty lists
+    when the domain has no sized geometry yet.
+    """
+    return (
+        list(getattr(obj, "NodesX", []) or []),
+        list(getattr(obj, "NodesY", []) or []),
+        list(getattr(obj, "NodesZ", []) or []),
+    )
+
+
+def node_coords_m(obj):
+    """Return the Domain's node-coordinate arrays in metres (world frame)."""
+    return tuple(
+        [c / _MM_PER_M for c in axis] for axis in node_coords_mm(obj)
+    )
+
+
+def min_spacings_m(obj):
+    """Return the minimum cell width (metres) on each axis from the node arrays.
+
+    Falls back to the scalar ``Dx``/``Dy``/``Dz`` for an axis whose node array
+    is not populated yet. On a uniform grid the minimum equals the cell size, so
+    this reproduces the scalar spacing; on a graded grid it is the finest cell,
+    which sets the CFL step for the whole domain (mirroring the solver's
+    ``_cfl_dt`` over ``min(diff(nodes))``).
+    """
+    nodes = node_coords_mm(obj)
+    out = []
+    for axis, fallback in zip(nodes, cell_sizes_m(obj)):
+        if len(axis) >= 2:
+            widths = [axis[i + 1] - axis[i] for i in range(len(axis) - 1)]
+            out.append(min(widths) / _MM_PER_M)
+        else:
+            out.append(fallback)
+    return tuple(out)
+
+
+def default_cell_size_m(sim, domain=None, cells_per_wavelength=None):
+    """Suggested uniform cell size (metres) for *sim*'s max frequency.
+
+    ``dx = c0 / (fmax * N_lambda * sqrt(eps_r,max * mu_r,max))`` where
+    ``N_lambda`` is the Domain's ``CellsPerWavelength`` (overridable via
+    *cells_per_wavelength*, so a task panel can preview an uncommitted value) and
+    ``eps_r,max`` / ``mu_r,max`` are the largest relative constants among the
+    simulation's materials (PEC bodies are skipped; each falls back to 1.0). This
+    resolves the shortest wavelength present -- the one in the highest-index
+    medium at the top frequency -- with ``N_lambda`` cells.
+
+    Returns ``None`` when the max frequency is not positive (no sensible size).
+    """
+    from wavesim_gui.commands import max_frequency_hz
+    from wavesim_gui import materials as materials_mod
+
+    fmax = max_frequency_hz(sim)
+    if fmax <= 0.0:
+        return None
+
+    if cells_per_wavelength is not None:
+        n_lambda = int(cells_per_wavelength)
+    else:
+        if domain is None:
+            domain = find_domain(sim)
+        n_lambda = int(getattr(domain, "CellsPerWavelength", 20)) if domain else 20
+    if n_lambda <= 0:
+        n_lambda = 20
+
+    eps_max = 1.0
+    mu_max = 1.0
+    for mat in materials_mod.find_materials(sim):
+        if getattr(mat, "Pec", False):
+            continue  # PEC has no meaningful eps/mu wavelength
+        eps_max = max(eps_max, float(getattr(mat, "Eps", 1.0)))
+        mu_max = max(mu_max, float(getattr(mat, "Mu", 1.0)))
+
+    return _C0 / (fmax * n_lambda * math.sqrt(eps_max * mu_max))
+
+
 # CFL parameters mirroring the solver's ``wavesim.grid.make_grid``: dt is the
 # conservative 3D Courant limit, set purely by the cell sizes (independent of the
 # cell counts, and of whether the domain is 2D). Duplicated here because the
@@ -270,13 +416,16 @@ _CFL = 0.99
 def cfl_dt(domain):
     """Return the solver's CFL time step (seconds) for *domain*'s cell sizes.
 
-    Mirrors ``wavesim.grid.make_grid``::
+    Mirrors ``wavesim.grid._cfl_dt``::
 
         dt = CFL / (c * sqrt(1/dx^2 + 1/dy^2 + 1/dz^2)),  CFL = 0.99
 
-    so the step count shown in the GUI matches what the runner actually uses.
+    where each spacing is the *minimum* cell width on its axis (the solver
+    reduces the CFL over the finest cell), so the step count shown in the GUI
+    matches what the runner actually uses -- on a uniform grid the minimum is
+    just the cell size, so this is unchanged there.
     """
-    dx, dy, dz = cell_sizes_m(domain)
+    dx, dy, dz = min_spacings_m(domain)
     return _CFL / (_C0 * math.sqrt(1.0 / dx ** 2 + 1.0 / dy ** 2 + 1.0 / dz ** 2))
 
 
@@ -533,13 +682,15 @@ if _GUI_AVAILABLE:
             self._fill(self._pml_coords, self._pml_lines,
                        obj.PmlMin, obj.PmlMax)
 
-        def _grid_segments(self, mn, mx, dx, dy, dz):
+        def _grid_segments(self, mn, mx, nodes_x, nodes_y, nodes_z):
             """Line segments for the three orthogonal cell grids on the min faces.
 
             Returns ``(points, indices)`` for an ``SoIndexedLineSet``: an XY grid
-            at ``z = mn.z`` (lines every dx and dy), a YZ grid at ``x = mn.x``
-            (dy/dz) and an XZ grid at ``y = mn.y`` (dx/dz). Line counts per axis
-            are clamped to :data:`_MAX_GRID_LINES`.
+            at ``z = mn.z``, a YZ grid at ``x = mn.x`` and an XZ grid at
+            ``y = mn.y``. Grid lines are placed at the explicit per-axis node
+            coordinates (``nodes_*``, world mm) clamped to the inner domain box,
+            so a non-uniform grid shows its real (graded) spacing. Line counts per
+            axis are clamped to :data:`_MAX_GRID_LINES` by decimating.
             """
             pts = []
             idx = []
@@ -550,18 +701,28 @@ if _GUI_AVAILABLE:
                 pts.append(p1)
                 idx.extend([a, a + 1, -1])
 
-            def ticks(lo, hi, step):
-                if step <= 0.0:
-                    return [lo, hi]
-                n = min(int(math.floor((hi - lo) / step + 1e-9)), _MAX_GRID_LINES)
-                vals = [lo + i * step for i in range(n + 1)]
-                if vals[-1] < hi - 1e-9:
-                    vals.append(hi)  # always close on the domain face
+            def ticks(lo, hi, nodes):
+                # Node coordinates inside [lo, hi] (the inner box), always closing
+                # on both faces, then decimated so no axis exceeds the line cap.
+                tol = 1e-9
+                vals = [v for v in nodes if lo - tol <= v <= hi + tol]
+                if not vals:
+                    vals = [lo, hi]
+                if vals[0] > lo + tol:
+                    vals.insert(0, lo)
+                if vals[-1] < hi - tol:
+                    vals.append(hi)
+                if len(vals) > _MAX_GRID_LINES:
+                    step = int(math.ceil(len(vals) / float(_MAX_GRID_LINES)))
+                    decimated = vals[::step]
+                    if decimated[-1] != vals[-1]:
+                        decimated.append(vals[-1])
+                    vals = decimated
                 return vals
 
-            xs = ticks(mn.x, mx.x, dx)
-            ys = ticks(mn.y, mx.y, dy)
-            zs = ticks(mn.z, mx.z, dz)
+            xs = ticks(mn.x, mx.x, nodes_x)
+            ys = ticks(mn.y, mx.y, nodes_y)
+            zs = ticks(mn.z, mx.z, nodes_z)
 
             # XY grid at z = mn.z
             for x in xs:
@@ -592,9 +753,21 @@ if _GUI_AVAILABLE:
                 if coords.point.getNum():
                     coords.point.deleteValues(0)
                 return
-            pts, idx = self._grid_segments(
-                mn, mx, float(obj.Dx.Value), float(obj.Dy.Value), float(obj.Dz.Value)
-            )
+            nodes_x = list(getattr(obj, "NodesX", []) or [])
+            nodes_y = list(getattr(obj, "NodesY", []) or [])
+            nodes_z = list(getattr(obj, "NodesZ", []) or [])
+            # Fall back to uniform ticks if the node arrays are not populated yet
+            # (e.g. an older document restored before the first recompute).
+            if not nodes_x:
+                nodes_x = [mn.x + i * float(obj.Dx.Value)
+                           for i in range(int((mx.x - mn.x) / max(float(obj.Dx.Value), 1e-9)) + 1)]
+            if not nodes_y:
+                nodes_y = [mn.y + i * float(obj.Dy.Value)
+                           for i in range(int((mx.y - mn.y) / max(float(obj.Dy.Value), 1e-9)) + 1)]
+            if not nodes_z:
+                nodes_z = [mn.z + i * float(obj.Dz.Value)
+                           for i in range(int((mx.z - mn.z) / max(float(obj.Dz.Value), 1e-9)) + 1)]
+            pts, idx = self._grid_segments(mn, mx, nodes_x, nodes_y, nodes_z)
             coords.point.setValues(0, len(pts), pts)
             if coords.point.getNum() > len(pts):
                 coords.point.deleteValues(len(pts))
@@ -605,7 +778,8 @@ if _GUI_AVAILABLE:
         def updateData(self, obj, prop):
             if prop in ("DomainMin", "DomainMax", "PmlMin", "PmlMax"):
                 self._rebuild()
-            if prop in ("DomainMin", "DomainMax", "Dx", "Dy", "Dz"):
+            if prop in ("DomainMin", "DomainMax", "Dx", "Dy", "Dz",
+                        "NodesX", "NodesY", "NodesZ"):
                 self._rebuild_grid()
 
         def getDisplayModes(self, vobj):
@@ -672,6 +846,31 @@ if _GUI_AVAILABLE:
             self._dy = cell_spin(float(obj.Dy.Value))
             self._dz = cell_spin(float(obj.Dz.Value))
 
+            # Cells-per-wavelength + a one-click button that fills the cell sizes
+            # from the simulation's max frequency (c / (fmax * N_lambda * n)).
+            self._cpw = QtWidgets.QSpinBox()
+            self._cpw.setRange(1, 1000)
+            self._cpw.setSuffix(" cells/wavelength")
+            self._cpw.setValue(int(getattr(obj, "CellsPerWavelength", 20)))
+
+            self._default_btn = QtWidgets.QPushButton(
+                "Default from max frequency"
+            )
+            self._default_btn.clicked.connect(self._apply_default_cell_size)
+
+            # Non-uniform (snapper) grid: a mode toggle plus the grading bound.
+            # When on, the cell-size boxes become the coarse interior target
+            # (best set from the max frequency) and the snapper refines features.
+            self._nonuniform = QtWidgets.QCheckBox(
+                "Non-uniform grid (snap to features)"
+            )
+            self._nonuniform.setChecked(bool(getattr(obj, "UseNonuniformGrid", False)))
+            self._ratio = QtWidgets.QDoubleSpinBox()
+            self._ratio.setRange(1.0, 5.0)
+            self._ratio.setDecimals(2)
+            self._ratio.setSingleStep(0.1)
+            self._ratio.setValue(float(getattr(obj, "MaxGradingRatio", 1.5)))
+
             self._counts = QtWidgets.QLabel(self._counts_text())
 
             self._spacing = QtWidgets.QDoubleSpinBox()
@@ -710,6 +909,10 @@ if _GUI_AVAILABLE:
             layout.addRow("Cell size dx:", self._dx)
             layout.addRow("Cell size dy:", self._dy)
             layout.addRow("Cell size dz:", self._dz)
+            layout.addRow("Resolution:", self._cpw)
+            layout.addRow("", self._default_btn)
+            layout.addRow(self._nonuniform)
+            layout.addRow("Max grading ratio:", self._ratio)
             layout.addRow("Cell counts:", self._counts)
             layout.addRow("Air spacing:", self._spacing)
             layout.addRow("Background material:", self._background)
@@ -744,7 +947,9 @@ if _GUI_AVAILABLE:
             self._dx.valueChanged.connect(self._update_counts)
             self._dy.valueChanged.connect(self._update_counts)
             self._dz.valueChanged.connect(self._update_counts)
+            self._nonuniform.toggled.connect(self._on_nonuniform)
             self._on_cubic(self._cubic.isChecked())
+            self._on_nonuniform(self._nonuniform.isChecked())
 
             self.form = form
 
@@ -779,14 +984,60 @@ if _GUI_AVAILABLE:
             self._counts.setText(self._counts_text(dims))
 
         def _on_cubic(self, checked):
+            if self._nonuniform.isChecked():
+                return  # cell-size boxes are driven by the snapper, not editable
             self._dy.setEnabled(not checked)
             self._dz.setEnabled(not checked)
             self._mirror_cubic()
+
+        def _on_nonuniform(self, checked):
+            # With the snapper on, Dx/Dy/Dz become the coarse interior target set
+            # from the max frequency: disable manual editing (but keep the
+            # "Default from max frequency" button), and expose the grading ratio.
+            self._ratio.setEnabled(checked)
+            self._cubic.setEnabled(not checked)
+            self._dx.setEnabled(not checked)
+            if checked:
+                self._dy.setEnabled(False)
+                self._dz.setEnabled(False)
+            else:
+                self._on_cubic(self._cubic.isChecked())
 
         def _mirror_cubic(self, *_):
             if self._cubic.isChecked():
                 self._dy.setValue(self._dx.value())
                 self._dz.setValue(self._dx.value())
+
+        def _apply_default_cell_size(self):
+            """Fill dx/dy/dz from the simulation's max frequency.
+
+            Uses the live cells-per-wavelength spin box (not yet committed) and
+            the simulation's materials to compute a uniform cubic cell size, then
+            forces cubic cells so all three axes get the resolved size.
+            """
+            try:
+                from PySide import QtWidgets
+            except ImportError:
+                from PySide import QtGui as QtWidgets
+            from wavesim_gui.commands import active_simulation
+
+            sim = active_simulation(self.obj.Document)
+            size_m = default_cell_size_m(
+                sim, cells_per_wavelength=self._cpw.value()
+            )
+            if size_m is None:
+                QtWidgets.QMessageBox.warning(
+                    Gui.getMainWindow(), "Wavesim Domain",
+                    "Set a positive max frequency on the Simulation first "
+                    "(double-click the Simulation object).",
+                )
+                return
+            size_mm = size_m * _MM_PER_M
+            # Cubic cells: set dx and mirror to dy/dz through the cubic path.
+            self._cubic.setChecked(True)
+            self._dx.setValue(size_mm)
+            self._mirror_cubic()
+            self._update_counts()
 
         def accept(self):
             doc = self.obj.Document
@@ -794,6 +1045,9 @@ if _GUI_AVAILABLE:
             self.obj.Dx = "{} mm".format(self._dx.value())
             self.obj.Dy = "{} mm".format(self._dy.value())
             self.obj.Dz = "{} mm".format(self._dz.value())
+            self.obj.CellsPerWavelength = int(self._cpw.value())
+            self.obj.UseNonuniformGrid = bool(self._nonuniform.isChecked())
+            self.obj.MaxGradingRatio = float(self._ratio.value())
             self.obj.Spacing = "{} mm".format(self._spacing.value())
             self.obj.PMLThickness = int(self._dpml.value())
             bg_index = self._background.currentIndex()

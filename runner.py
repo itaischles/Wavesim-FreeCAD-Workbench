@@ -30,7 +30,16 @@ job.json schema (Session 2)
                                               # _resolve_backend). The GPU path
                                               # allocates the grid as float32.
       "steps": 1000,
-      "grid":   {"Nx":.., "Ny":.., "Nz":.., "dx":.., "dy":.., "dz":..},
+      "grid":   {"Nx":.., "Ny":.., "Nz":.., "dx":.., "dy":.., "dz":..,
+                 "x":[..], "y":[..], "z":[..]},  # optional node-coordinate
+                 # arrays (metres, solver frame, strictly increasing, N+1 nodes
+                 # per axis). When present the runner builds a non-uniform
+                 # rectilinear grid via create_grid_rectilinear (dx/dy/dz then
+                 # carry the *minimum* spacing per axis); absent -> uniform
+                 # create_grid. The workbench sends them only for a genuinely
+                 # graded grid: create_grid_rectilinear derives spacings via
+                 # diff(coords), which rounds ~1 ULP off a uniform tick, so a
+                 # uniform run stays on create_grid to keep dt/results exact.
       "boundary": {"d_pml": 10, "faces": ["x0",...], "pec_faces": ["z0",...]} | null,
       "source": {"component":"Ez", "x":.., "y":.., "z":..,
                  "excitation": {"type":"gaussian"|"sine"|"rectangular"|
@@ -66,7 +75,12 @@ job.json schema (Session 2)
 
 results.npz holds the recorded monitor series (e.g. ``energy_times`` /
 ``energy_values``); summary.json holds scalar run metadata (dt, steps, wall
-time, grid dims, voxel counts, final energy).
+time, grid dims, voxel counts, final energy). Each snapshot also stores its two
+in-plane node/edge coordinate arrays (``snapshot_<idx>_edges0`` / ``_edges1``,
+metres, solver frame) and each TEM mode its two transverse cell-centre
+coordinate arrays (``mode_<si>_<mi>_ca`` / ``_cb``), so the workbench draws them
+on the real grid (uniform or non-uniform) instead of assuming a constant cell
+size.
 
 TEM ports (Session 9)
 ---------------------
@@ -265,6 +279,21 @@ def _f(value):
     return None if value is None else float(value)
 
 
+# In-plane axes (in array-index order) of the slice perpendicular to a normal,
+# mirroring ``wavesim.monitors.record_snapshot``'s plane extraction.
+_INPLANE_AXES = {"z": ("x", "y"), "y": ("x", "z"), "x": ("y", "z")}
+
+
+def _axis_nodes(grid, axis):
+    """The node (edge) coordinate array of *grid* along *axis* ('x'/'y'/'z')."""
+    return {"x": grid.x, "y": grid.y, "z": grid.z}[axis]
+
+
+def _axis_centers(grid, axis):
+    """The cell-centre coordinate array of *grid* along *axis*."""
+    return {"x": grid.xc, "y": grid.yc, "z": grid.zc}[axis]
+
+
 def _choose_mode(modes, wanted, name):
     """Pick the mode whose energized conductor is *wanted* (0 = dominant).
 
@@ -363,6 +392,17 @@ def _solve_all_modes(ws, np, grid, job):
             for comp, arr in mode.E.items():
                 mode_arrays["{}_E_{}".format(key, comp)] = np.asarray(
                     arr, dtype=np.float64
+                )
+            # Transverse cell-centre coordinates (metres, solver frame) so the
+            # results plot can draw the mode on the real (possibly non-uniform)
+            # axes rather than assuming a constant da/db spacing.
+            t_axes = list(getattr(mode, "transverse_axes", []))
+            if len(t_axes) == 2:
+                mode_arrays[key + "_ca"] = np.asarray(
+                    _axis_centers(grid, t_axes[0]), dtype=np.float64
+                )
+                mode_arrays[key + "_cb"] = np.asarray(
+                    _axis_centers(grid, t_axes[1]), dtype=np.float64
                 )
             mode_meta.append({
                 "source_index": si, "mode_index": mi, "name": name,
@@ -537,9 +577,22 @@ def run_job(workdir):
     dx = float(g["dx"])
     dy = float(g.get("dy", dx))
     dz = float(g.get("dz", dx))
-    grid = ws.create_grid(
-        int(g["Nx"]), int(g["Ny"]), int(g["Nz"]), dx, dy, dz, dtype=field_dtype
-    )
+    # Non-uniform (rectilinear) grid when the job carries per-axis node
+    # coordinate arrays (solver frame, metres); else the uniform grid. On a
+    # uniform node array the two paths are bit-for-bit identical by design (the
+    # solver derives constant spacing/dual arrays from the coordinates).
+    gx, gy, gz = g.get("x"), g.get("y"), g.get("z")
+    if gx is not None and gy is not None and gz is not None:
+        grid = ws.create_grid_rectilinear(
+            np.asarray(gx, dtype=np.float64),
+            np.asarray(gy, dtype=np.float64),
+            np.asarray(gz, dtype=np.float64),
+            dtype=field_dtype,
+        )
+    else:
+        grid = ws.create_grid(
+            int(g["Nx"]), int(g["Ny"]), int(g["Nz"]), dx, dy, dz, dtype=field_dtype
+        )
     grid = ws.set_vacuum(grid)
 
     # Optional voxelised materials (Session 3+). Absent in the Session 2 slice.
@@ -713,12 +766,21 @@ def run_job(workdir):
         result_arrays["probe_{}_values".format(idx)] = np.asarray(mon.values)
         probe_meta.append({"name": name, "component": mon.component})
 
-    # Snapshots: a stack of frames (n_frames, Nx, Ny) plus their times each.
+    # Snapshots: a stack of frames (n_frames, N_axis1, N_axis2) plus their times.
+    # Also save the two in-plane node (edge) coordinate arrays (metres, solver
+    # frame) so the results plot honours non-uniform spacing via pcolormesh.
     snapshot_meta = []
     for idx, (name, mon) in enumerate(snapshots):
         if mon.snapshots:
             result_arrays["snapshot_{}_data".format(idx)] = np.asarray(mon.snapshots)
             result_arrays["snapshot_{}_times".format(idx)] = np.asarray(mon.snap_times)
+            ax0, ax1 = _INPLANE_AXES.get(getattr(mon, "normal", "z"), ("x", "y"))
+            result_arrays["snapshot_{}_edges0".format(idx)] = np.asarray(
+                _axis_nodes(grid, ax0), dtype=np.float64
+            )
+            result_arrays["snapshot_{}_edges1".format(idx)] = np.asarray(
+                _axis_nodes(grid, ax1), dtype=np.float64
+            )
         snapshot_meta.append({
             "name": name, "component": mon.component,
             "frames": len(mon.snapshots),

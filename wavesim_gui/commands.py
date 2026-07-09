@@ -101,13 +101,29 @@ class SimulationContainer:
             obj.MaxTime = 2.0e-9
             obj.setEditorMode("MaxTime", 1)  # read-only; edit through the panel
 
+        # Maximum frequency of interest, stored in SI hertz. Drives the default
+        # grid cell size (c / (fmax * cells-per-wavelength * sqrt(eps*mu))).
+        # Edited through the panel in the display frequency unit.
+        if not hasattr(obj, "MaxFrequency"):
+            obj.addProperty(
+                "App::PropertyFloat", "MaxFrequency", "Run",
+                "Maximum frequency of interest, in hertz (edit via the "
+                "Simulation panel in the display frequency unit). Drives the "
+                "default cell size.",
+            )
+            obj.MaxFrequency = 1.0e9  # 1 GHz
+            obj.setEditorMode("MaxFrequency", 1)  # read-only; edit through panel
+
     def onDocumentRestored(self, obj):
         # Re-assert the back-reference after a reload.
         obj.Proxy = self
         self.Type = getattr(self, "Type", _SIM_TYPE)
-        # Editor modes are runtime-only; keep MaxTime edited through the panel.
+        # Editor modes are runtime-only; keep MaxTime/MaxFrequency edited through
+        # the panel.
         if hasattr(obj, "MaxTime"):
             obj.setEditorMode("MaxTime", 1)
+        if hasattr(obj, "MaxFrequency"):
+            obj.setEditorMode("MaxFrequency", 1)
 
     def execute(self, obj):
         # Pure container; nothing to recompute.
@@ -140,6 +156,17 @@ def active_simulation(doc):
         if getattr(obj, _TYPE_PROP, None) == _SIM_TYPE:
             return obj
     return None
+
+
+def max_frequency_hz(sim):
+    """Return the Simulation container's maximum frequency in hertz.
+
+    Falls back to the 1 GHz default when *sim* is missing the property (e.g. a
+    document created before this property existed).
+    """
+    if sim is None:
+        return 1.0e9
+    return float(getattr(sim, "MaxFrequency", 1.0e9))
 
 
 # --------------------------------------------------------------------------- #
@@ -242,11 +269,27 @@ if _GUI_AVAILABLE:
                 )
             )
 
+            # Maximum frequency of interest, shown in the selected frequency
+            # unit. Tracked like the max time so changing the dropdown
+            # re-expresses the same physical frequency.
+            self._freq_unit = self._freq.currentText()
+            self._max_freq = QtWidgets.QDoubleSpinBox()
+            self._max_freq.setRange(0.0, 1.0e12)
+            self._max_freq.setDecimals(6)
+            self._max_freq.setSuffix(" " + self._freq_unit)
+            self._max_freq.setSingleStep(1.0)
+            self._max_freq.setValue(
+                units.freq_from_si(
+                    float(getattr(obj, "MaxFrequency", 1.0e9)), self._freq_unit
+                )
+            )
+
             self._steps = QtWidgets.QLabel()
 
             layout.addRow("Time unit:", self._time)
             layout.addRow("Frequency unit:", self._freq)
             layout.addRow("Max simulation time:", self._max_time)
+            layout.addRow("Max frequency:", self._max_freq)
             layout.addRow("Time steps:", self._steps)
 
             info = QtWidgets.QLabel(
@@ -259,6 +302,7 @@ if _GUI_AVAILABLE:
             layout.addRow(info)
 
             self._time.currentTextChanged.connect(self._on_time_unit_changed)
+            self._freq.currentTextChanged.connect(self._on_freq_unit_changed)
             self._max_time.valueChanged.connect(self._update_steps)
             self._update_steps()
 
@@ -273,6 +317,15 @@ if _GUI_AVAILABLE:
             self._max_time.setValue(units.time_from_si(si, new_unit))
             self._max_time.blockSignals(blocked)
             self._update_steps()
+
+        def _on_freq_unit_changed(self, new_unit):
+            """Re-express the max-frequency value when the freq dropdown changes."""
+            si = units.freq_to_si(self._max_freq.value(), self._freq_unit)
+            self._freq_unit = new_unit
+            self._max_freq.setSuffix(" " + new_unit)
+            blocked = self._max_freq.blockSignals(True)
+            self._max_freq.setValue(units.freq_from_si(si, new_unit))
+            self._max_freq.blockSignals(blocked)
 
         def _update_steps(self, *_):
             from wavesim_gui import domain as domain_mod
@@ -291,6 +344,9 @@ if _GUI_AVAILABLE:
             self.obj.FrequencyUnit = self._freq.currentText()
             self.obj.MaxTime = units.time_to_si(
                 self._max_time.value(), self._time_unit
+            )
+            self.obj.MaxFrequency = units.freq_to_si(
+                self._max_freq.value(), self._freq_unit
             )
             doc.commitTransaction()
             doc.recompute()

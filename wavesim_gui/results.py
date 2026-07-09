@@ -237,7 +237,8 @@ def build_results(doc, sim, workdir, summary):
         )
         return None
     try:
-        keys = set(np.load(npz_path).files)
+        npz = np.load(npz_path)
+        keys = set(npz.files)
     except Exception as exc:
         FreeCAD.Console.PrintError(
             "Wavesim: could not read results.npz ({})\n".format(exc)
@@ -316,6 +317,14 @@ def build_results(doc, sim, workdir, summary):
             extent = _snapshot_extent(sim, name)
             if extent is not None:
                 _store_snapshot_extent(leaf, *extent)
+            # In-plane node/edge coordinates (metres, solver frame) from the
+            # runner: stored on the leaf as mm relative to the slice corner so
+            # the plot uses pcolormesh on the real (possibly non-uniform) grid.
+            e0k = "snapshot_{}_edges0".format(idx)
+            e1k = "snapshot_{}_edges1".format(idx)
+            if e0k in keys and e1k in keys:
+                _store_edges(leaf, "XEdges", npz[e0k])
+                _store_edges(leaf, "YEdges", npz[e1k])
 
         # TEM modes (one leaf per solved port mode). Each opens a figure of the
         # mode shape plus the port's per-unit-length parameters.
@@ -331,6 +340,15 @@ def build_results(doc, sim, workdir, summary):
             )
             leaf = _new_leaf(name, _KIND_MODE, key, "")
             _store_mode_meta(leaf, meta)
+            # Transverse cell-centre coordinates (metres, solver frame) from the
+            # runner: stored as absolute mm so the plot draws the mode on the
+            # real (possibly non-uniform) transverse axes.
+            cak, cbk = key + "_ca", key + "_cb"
+            if cak in keys and cbk in keys:
+                _store_edges(leaf, "CoordsA", npz[cak], relative=False,
+                             group="Mode")
+                _store_edges(leaf, "CoordsB", npz[cbk], relative=False,
+                             group="Mode")
     except Exception:
         doc.abortTransaction()
         raise
@@ -365,6 +383,26 @@ def _store_snapshot_extent(leaf, width, height, axis_x, axis_y, plane, offset):
         )
         leaf.setEditorMode("Offset", 1)
     leaf.Offset = "{} mm".format(offset)
+
+
+def _store_edges(leaf, prop, coords_m, relative=True, group="Snapshot"):
+    """Stash a coordinate array (solver-frame metres) on a leaf as an mm list.
+
+    *relative* subtracts the first coordinate (used for snapshot edges, which are
+    drawn from the slice corner at 0); mode transverse coordinates keep their
+    absolute position. Stored as a read-only ``App::PropertyFloatList`` so it
+    survives save/reload with the run output.
+    """
+    vals = [float(v) for v in coords_m]
+    if not vals:
+        return
+    origin = vals[0] if relative else 0.0
+    mm = [(v - origin) * _MM_PER_M for v in vals]
+    if not hasattr(leaf, prop):
+        leaf.addProperty("App::PropertyFloatList", prop, group,
+                         "Axis coordinates (mm)")
+        leaf.setEditorMode(prop, 1)
+    setattr(leaf, prop, mm)
 
 
 def _store_mode_meta(leaf, meta):
@@ -708,15 +746,21 @@ if _GUI_AVAILABLE:
         comp = str(getattr(obj, "Component", "")) or "field"
         is_magnitude = comp.startswith("|") or comp.startswith("∣")
 
+        # In-plane node/edge coordinates (mm) from the runner: when present the
+        # frame is drawn with pcolormesh on the real (possibly non-uniform) grid.
+        xedges = list(getattr(obj, "XEdges", []) or [])
+        yedges = list(getattr(obj, "YEdges", []) or [])
+        use_mesh = len(xedges) >= 2 and len(yedges) >= 2
+
         # Physical extent / axis labels (fall back to cell indices).
         size = getattr(obj, "InPlaneSize", None)
-        if size is not None and size.x > 0 and size.y > 0:
-            extent = [0.0, float(size.x), 0.0, float(size.y)]
+        have_size = size is not None and size.x > 0 and size.y > 0
+        if use_mesh or have_size:
             xlabel = "{} (mm)".format(getattr(obj, "AxisX", "x"))
             ylabel = "{} (mm)".format(getattr(obj, "AxisY", "y"))
         else:
-            extent = None
             xlabel, ylabel = "cell i", "cell j"
+        extent = [0.0, float(size.x), 0.0, float(size.y)] if have_size else None
 
         # Symmetric colour scale for signed fields (RdBu_r); 0..max for
         # magnitudes (inferno). Log scaling mirrors wavesim's animate_snapshots:
@@ -747,14 +791,30 @@ if _GUI_AVAILABLE:
 
         ax = figure.add_subplot(111)
         # frames[f] has shape (axis1, axis2); show axis1 horizontal, axis2
-        # vertical with a lower-left origin.
-        # Equal aspect so a square physical extent (e.g. 0..50 mm on both axes)
-        # renders square rather than being stretched to fill the axes.
-        image = ax.imshow(
-            np.asarray(frames[0]).T, origin="lower", extent=extent,
-            cmap=cmap, norm=_make_norm(False), aspect="equal",
-        )
-        figure.colorbar(image, ax=ax, label=comp)
+        # vertical with a lower-left origin. Equal aspect so a square physical
+        # extent renders square rather than stretched to fill the axes.
+        if use_mesh:
+            # pcolormesh honours non-uniform edge spacing; C is (Ny, Nx) so pass
+            # the transposed frame against (xedges, yedges).
+            artist = ax.pcolormesh(
+                np.asarray(xedges), np.asarray(yedges),
+                np.asarray(frames[0]).T, cmap=cmap, norm=_make_norm(False),
+            )
+            ax.set_aspect("equal")
+        else:
+            artist = ax.imshow(
+                np.asarray(frames[0]).T, origin="lower", extent=extent,
+                cmap=cmap, norm=_make_norm(False), aspect="equal",
+            )
+
+        def _set_frame_data(idx):
+            data2d = np.asarray(frames[idx]).T
+            if use_mesh:
+                artist.set_array(data2d.ravel())
+            else:
+                artist.set_data(data2d)
+
+        figure.colorbar(artist, ax=ax, label=comp)
         ax.set_xlabel(xlabel)
         ax.set_ylabel(ylabel)
 
@@ -788,14 +848,14 @@ if _GUI_AVAILABLE:
         layout.addLayout(controls)
 
         def on_log(checked):
-            image.set_norm(_make_norm(bool(checked)))
+            artist.set_norm(_make_norm(bool(checked)))
             dialog._canvas.draw_idle()
 
         log_check.toggled.connect(on_log)
 
         def show_frame(idx):
             idx = max(0, min(int(idx), len(frames) - 1))
-            image.set_data(np.asarray(frames[idx]).T)
+            _set_frame_data(idx)
             _set_title(idx)
             dialog._canvas.draw_idle()
 
@@ -883,9 +943,17 @@ if _GUI_AVAILABLE:
         axis_b = str(getattr(obj, "AxisB", "b"))
 
         Na, Nb = phi.shape
-        # Cell-centre coordinates in mm (the workbench's display unit).
-        xa = (np.arange(Na) + 0.5) * da * 1.0e3
-        yb = (np.arange(Nb) + 0.5) * db * 1.0e3
+        # Cell-centre coordinates in mm (the workbench's display unit). Prefer the
+        # real transverse coordinate arrays from the runner (which honour a
+        # non-uniform grid); fall back to a constant da/db spacing for older runs.
+        coords_a = list(getattr(obj, "CoordsA", []) or [])
+        coords_b = list(getattr(obj, "CoordsB", []) or [])
+        if len(coords_a) == Na and len(coords_b) == Nb:
+            xa = np.asarray(coords_a)  # already mm (stored absolute)
+            yb = np.asarray(coords_b)
+        else:
+            xa = (np.arange(Na) + 0.5) * da * 1.0e3
+            yb = (np.arange(Nb) + 0.5) * db * 1.0e3
 
         made = _make_window("Wavesim Results - {}".format(obj.Label))
         if made is None:

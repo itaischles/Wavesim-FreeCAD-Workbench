@@ -887,49 +887,21 @@ if _GUI_AVAILABLE:
     # TEM mode plotter
     # ------------------------------------------------------------------ #
 
-    def open_first_mode(grp, port_name=None):
-        """Open the plot of a TEM-mode leaf under results group *grp*.
+    _NAN = float("nan")
 
-        Convenience for the "Compute Mode" flow so the solved mode pops up
-        immediately. When *port_name* is given (the port whose panel triggered
-        the solve), the first mode leaf belonging to that port is opened so a
-        multi-port document shows the mode the user asked for rather than
-        whichever port happens to be solved first; otherwise the first mode leaf
-        of any port is opened. A no-op when there is no matching mode leaf.
+    def _mode_data_from_leaf(obj):
+        """Everything :func:`_draw_mode` needs, read from a saved mode leaf.
+
+        Arrays come from the run's ``results.npz``; the geometry and
+        per-unit-length parameters from the read-only properties
+        :func:`_store_mode_meta` stashed on the leaf. ``None`` when the arrays
+        are gone (the run output was moved or deleted).
         """
-        if grp is None:
-            return
-        modes = [
-            child for child in getattr(grp, "Group", []) or []
-            if str(getattr(child, "ResultKind", "")) == _KIND_MODE
-        ]
-        if port_name:
-            for child in modes:
-                if str(getattr(child, "PortName", "")) == str(port_name):
-                    open_result(child)
-                    return
-        if modes:
-            open_result(modes[0])
-
-    def _plot_mode(obj):
-        """Figure of a solved TEM mode: φ contours + E quiver + PEC outline.
-
-        Mirrors :func:`wavesim.viz.plot_tem_mode` but reads the raw 2D arrays
-        from ``results.npz`` (FreeCAD's Python cannot import the solver), drawing
-        with its own matplotlib. The port's per-unit-length parameters are shown
-        in an annotation box.
-        """
-        import math
-
-        import numpy as np
-
         workdir = str(obj.ResultsDir)
         key = str(obj.DataKey)
         phi = _load_array(workdir, key + "_phi")
         if phi is None:
-            _missing(obj)
-            return
-        pec = _load_array(workdir, key + "_pec")
+            return None
 
         ecomps = [c for c in str(getattr(obj, "Ecomps", "")).split(",") if c]
         Ea = Eb = None
@@ -937,61 +909,145 @@ if _GUI_AVAILABLE:
             Ea = _load_array(workdir, "{}_E_{}".format(key, ecomps[0]))
             Eb = _load_array(workdir, "{}_E_{}".format(key, ecomps[1]))
 
-        da = float(getattr(obj, "Da", 0.0)) or 1.0
-        db = float(getattr(obj, "Db", 0.0)) or 1.0
-        axis_a = str(getattr(obj, "AxisA", "a"))
-        axis_b = str(getattr(obj, "AxisB", "b"))
+        def _num(prop):
+            return float(getattr(obj, prop, _NAN))
 
+        return {
+            "label": str(obj.Label),
+            "port_name": str(getattr(obj, "PortName", "")),
+            "phi": phi,
+            "pec": _load_array(workdir, key + "_pec"),
+            "Ea": Ea, "Eb": Eb,
+            # Stored absolute, already in mm.
+            "coords_a": list(getattr(obj, "CoordsA", []) or []),
+            "coords_b": list(getattr(obj, "CoordsB", []) or []),
+            "da": _num("Da"), "db": _num("Db"),
+            "axis_a": str(getattr(obj, "AxisA", "a")),
+            "axis_b": str(getattr(obj, "AxisB", "b")),
+            "conductor_id": int(getattr(obj, "ConductorId", 0)),
+            "normal": str(getattr(obj, "Normal", "")),
+            "position": _num("ModePosition"),
+            "impedance": _num("Impedance"), "eps_eff": _num("EpsEff"),
+            "capacitance": _num("Capacitance"), "inductance": _num("Inductance"),
+            "v_phase": _num("VPhase"),
+            "fmax": float(getattr(obj, "Fmax", 0.0)),
+            "fields": str(getattr(obj, "Fields", "")),
+        }
+
+    def _mode_data_from_summary(workdir, meta):
+        """The same fields, read straight from a solve's npz + ``summary["modes"]``.
+
+        Used by :func:`show_mode_preview`, which has no document leaf to read
+        from. Every array is pulled into memory here so the caller can delete the
+        temp workdir as soon as the figure exists.
+        """
+        key = "mode_{}_{}".format(
+            meta.get("source_index", 0), meta.get("mode_index", 0)
+        )
+        phi = _load_array(workdir, key + "_phi")
+        if phi is None:
+            return None
+
+        ecomps = list(meta.get("Ecomps", []))
+        Ea = Eb = None
+        if len(ecomps) >= 2:
+            Ea = _load_array(workdir, "{}_E_{}".format(key, ecomps[0]))
+            Eb = _load_array(workdir, "{}_E_{}".format(key, ecomps[1]))
+
+        def _coords(suffix):
+            """Transverse cell centres as mm (the runner writes solver metres)."""
+            arr = _load_array(workdir, key + suffix)
+            return [] if arr is None else [float(v) * _MM_PER_M for v in arr]
+
+        def _num(value):
+            return _NAN if value is None else float(value)
+
+        axes = meta.get("transverse_axes", ["a", "b"])
+        name = meta.get("name", "TEM")
+        return {
+            "label": "{} — energized conductor {}".format(
+                name, meta.get("conductor_id", "?")
+            ),
+            "port_name": name,
+            "phi": phi,
+            "pec": _load_array(workdir, key + "_pec"),
+            "Ea": Ea, "Eb": Eb,
+            "coords_a": _coords("_ca"), "coords_b": _coords("_cb"),
+            "da": float(meta.get("da", 0.0)), "db": float(meta.get("db", 0.0)),
+            "axis_a": str(axes[0]), "axis_b": str(axes[1]),
+            "conductor_id": int(meta.get("conductor_id", 0)),
+            "normal": str(meta.get("normal", "")),
+            "position": float(meta.get("position", 0.0)),
+            "impedance": _num(meta.get("impedance")),
+            "eps_eff": _num(meta.get("eps_eff")),
+            "capacitance": _num(meta.get("capacitance")),
+            "inductance": _num(meta.get("inductance")),
+            "v_phase": _num(meta.get("v_phase")),
+            "fmax": float(meta.get("fmax", 0.0)),
+            "fields": str(meta.get("fields", "")),
+        }
+
+    def _draw_mode(figure, data):
+        """Draw a solved TEM mode into *figure*: φ contours + E quiver + PEC outline.
+
+        Mirrors :func:`wavesim.viz.plot_tem_mode` but works from the raw 2D arrays
+        (FreeCAD's Python cannot import the solver), drawing with its own
+        matplotlib. The port's per-unit-length parameters go in an annotation box.
+        *figure* is cleared first, so the mode selector can redraw in place.
+        """
+        import math
+
+        import numpy as np
+
+        figure.clear()
+        ax = figure.add_subplot(111)
+
+        phi = data["phi"]
         Na, Nb = phi.shape
         # Cell-centre coordinates in mm (the workbench's display unit). Prefer the
         # real transverse coordinate arrays from the runner (which honour a
         # non-uniform grid); fall back to a constant da/db spacing for older runs.
-        coords_a = list(getattr(obj, "CoordsA", []) or [])
-        coords_b = list(getattr(obj, "CoordsB", []) or [])
+        coords_a, coords_b = data["coords_a"], data["coords_b"]
         if len(coords_a) == Na and len(coords_b) == Nb:
-            xa = np.asarray(coords_a)  # already mm (stored absolute)
+            xa = np.asarray(coords_a)
             yb = np.asarray(coords_b)
         else:
-            xa = (np.arange(Na) + 0.5) * da * 1.0e3
-            yb = (np.arange(Nb) + 0.5) * db * 1.0e3
-
-        made = _make_window("Wavesim Results - {}".format(obj.Label))
-        if made is None:
-            return
-        dialog, figure, _layout = made
-        ax = figure.add_subplot(111)
+            xa = (np.arange(Na) + 0.5) * (data["da"] or 1.0) * 1.0e3
+            yb = (np.arange(Nb) + 0.5) * (data["db"] or 1.0) * 1.0e3
 
         cf = ax.contourf(xa, yb, phi.T, levels=20, cmap="RdBu_r")
         figure.colorbar(cf, ax=ax, pad=0.02, label="potential φ (V)")
 
+        Ea, Eb = data["Ea"], data["Eb"]
         if Ea is not None and Eb is not None:
             step = max(1, min(Na, Nb) // 25)
             AX, BY = np.meshgrid(xa[::step], yb[::step])
             ax.quiver(AX, BY, Ea.T[::step, ::step], Eb.T[::step, ::step],
                       color="k", alpha=0.7, pivot="mid")
 
+        pec = data["pec"]
         if pec is not None and np.any(pec):
             ax.contour(xa, yb, np.asarray(pec).T.astype(float),
                        levels=[0.5], colors="dimgray", linewidths=1.5)
 
         ax.set_aspect("equal")
-        ax.set_xlabel("{} (mm)".format(axis_a))
-        ax.set_ylabel("{} (mm)".format(axis_b))
-        ax.set_title(str(obj.Label))
+        ax.set_xlabel("{} (mm)".format(data["axis_a"]))
+        ax.set_ylabel("{} (mm)".format(data["axis_b"]))
+        # ``subtitle`` (the preview's "mode i of N") goes on a second title line.
+        title = data["label"]
+        if data.get("subtitle"):
+            title = "{}\n{}".format(title, data["subtitle"])
+        ax.set_title(title)
 
         # Annotation box: every port parameter that was computed (NaN == skipped).
         c0 = 299792458.0
-        z0 = float(getattr(obj, "Impedance", float("nan")))
-        eps_eff = float(getattr(obj, "EpsEff", float("nan")))
-        cap = float(getattr(obj, "Capacitance", float("nan")))
-        ind = float(getattr(obj, "Inductance", float("nan")))
-        vph = float(getattr(obj, "VPhase", float("nan")))
-        fmax = float(getattr(obj, "Fmax", 0.0))
-        pos = float(getattr(obj, "ModePosition", 0.0))
+        z0, eps_eff = data["impedance"], data["eps_eff"]
+        cap, ind, vph = data["capacitance"], data["inductance"], data["v_phase"]
+        fmax = data["fmax"]
 
-        lines = ["conductor {}".format(int(getattr(obj, "ConductorId", 0))),
+        lines = ["energized conductor {}".format(data["conductor_id"]),
                  "{}-propagation @ {:.4g} mm".format(
-                     str(getattr(obj, "Normal", "")), pos * 1.0e3)]
+                     data["normal"], data["position"] * 1.0e3)]
         if math.isfinite(z0):
             lines.append("Z₀ = {:.2f} Ω".format(z0))
         if math.isfinite(eps_eff):
@@ -1004,14 +1060,97 @@ if _GUI_AVAILABLE:
             lines.append("v = {:.4g} m/s ({:.1f}% c)".format(vph, 100.0 * vph / c0))
         if fmax > 0:
             lines.append("f_max = {:.4g} GHz".format(fmax / 1.0e9))
-        fields = str(getattr(obj, "Fields", ""))
-        if fields:
-            lines.append("inject: {}".format(fields))
+        if data["fields"]:
+            lines.append("inject: {}".format(data["fields"]))
 
         ax.text(0.02, 0.98, "\n".join(lines), transform=ax.transAxes,
                 va="top", ha="left", fontsize=8,
                 bbox=dict(boxstyle="round", facecolor="white", alpha=0.75))
 
+    def _plot_mode(obj):
+        """Open the figure of a mode leaf saved by a run (double-click in the tree)."""
+        data = _mode_data_from_leaf(obj)
+        if data is None:
+            _missing(obj)
+            return
+        made = _make_window("Wavesim Results - {}".format(obj.Label))
+        if made is None:
+            return
+        dialog, figure, _layout = made
+        _draw_mode(figure, data)
         dialog._canvas.draw()
         dialog.show()
         _register_window(dialog)
+
+    def show_mode_preview(workdir, summary):
+        """Plot the modes of a "Compute Mode" solve, without touching the document.
+
+        The preview's ``results.npz`` lives in a temp directory the caller deletes
+        as soon as this returns (the modes are re-solved and saved by the next
+        real run), so every array is read into the figure's data up front and no
+        Results leaf is created.
+
+        A port whose plane cuts several signal conductors solves one mode per
+        conductor. They all share the one window: a ``<`` / ``>`` pair plus a
+        dropdown scroll through them, and each mode names its energized conductor
+        in the dropdown, the figure title and the parameter box. Returns ``False``
+        when there was no plottable mode.
+        """
+        datas = []
+        for meta in summary.get("modes", []):
+            data = _mode_data_from_summary(workdir, meta)
+            if data is not None:
+                datas.append(data)
+        if not datas:
+            return False
+
+        made = _make_window("Wavesim Mode - {}".format(datas[0]["port_name"]))
+        if made is None:
+            return False
+        dialog, figure, layout = made
+
+        total = len(datas)
+        if total > 1:
+            for idx, data in enumerate(datas):
+                data["subtitle"] = "mode {} of {}".format(idx + 1, total)
+
+            _QtCore, QtWidgets = _qt()
+            row = QtWidgets.QHBoxLayout()
+            prev = QtWidgets.QPushButton("◀")
+            nxt = QtWidgets.QPushButton("▶")
+            for button in (prev, nxt):
+                button.setMaximumWidth(36)
+            combo = QtWidgets.QComboBox()
+            for idx, data in enumerate(datas):
+                combo.addItem("Mode {} of {} — energized conductor {}".format(
+                    idx + 1, total, data["conductor_id"]))
+            row.addWidget(QtWidgets.QLabel("Solved modes:"))
+            row.addWidget(combo, 1)
+            row.addWidget(prev)
+            row.addWidget(nxt)
+            layout.addLayout(row)
+
+            def show_mode(idx):
+                idx = max(0, min(int(idx), total - 1))
+                # The ends of the list are hard stops rather than wrapping, so
+                # the buttons say how many modes are left to look at.
+                prev.setEnabled(idx > 0)
+                nxt.setEnabled(idx < total - 1)
+                _draw_mode(figure, datas[idx])
+                dialog._canvas.draw_idle()
+
+            def step(delta):
+                combo.setCurrentIndex(
+                    max(0, min(combo.currentIndex() + delta, total - 1))
+                )
+
+            combo.currentIndexChanged.connect(show_mode)
+            prev.clicked.connect(lambda *_: step(-1))
+            nxt.clicked.connect(lambda *_: step(+1))
+            prev.setEnabled(False)
+
+        _draw_mode(figure, datas[0])
+        dialog._canvas.draw()
+        dialog.show()
+        _register_window(dialog)
+        return True

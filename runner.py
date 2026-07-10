@@ -101,11 +101,19 @@ the PEC cross-section, launches it as a directional ``PlaneSource`` (built via
 field profiles into ``results.npz`` (keys ``mode_<si>_<mi>_phi`` / ``_pec`` /
 ``_E_<comp>``) with its per-unit-length parameters under ``summary["modes"]``.
 With ``mode_only`` true the runner solves and saves the modes and skips the FDTD
-time-stepping entirely (used by the workbench's "Compute Mode" button). An
+time-stepping entirely. The workbench's "Compute Mode" button uses this, sending a
+job that carries **only the one port** it wants previewed (it plots the modes and
+throws the workdir away); a real run solves every port's mode and keeps them in
+its own ``results.npz``/``summary.json``. An
 optional ``bounds`` ``[a0,a1,b0,b1]`` (solver metres, transverse slice order)
 confines the mode solve to a sub-rectangle of the face — e.g. one connector's
 cross-section on a plane that cuts several — and is forwarded straight to
-``solve_tem_modes(bounds=...)``; absent it solves on the whole face.
+``solve_tem_modes(bounds=...)``; absent it solves on the whole face. The solver
+embeds a bounded mode back into the full transverse plane (a ``PlaneSource``
+launch needs that shape), so the runner crops the *saved* ``mode_*`` profiles and
+their ``_ca``/``_cb`` coords back to the solved sub-rect (:func:`_bounds_window`)
+— the results plot then shows the bounded region, not a face of zeros around it.
+The launched mode itself keeps its full shape.
 
 At the FDTD cell size the voxeliser can shred a continuous PEC on the plane into
 disconnected cells, so ``ndimage.label`` miscounts conductors. When that happens
@@ -126,8 +134,8 @@ SPICE co-simulation ports
 Each ``spice_ports`` entry couples one FDTD lumped port to a user ngspice netlist
 in lockstep (:class:`wavesim.sources.SpicePort`). A ``kind:"line"`` port is a
 straight ``p0 -> p1`` line; a ``kind:"tem"`` port drives a solved TEM mode of the
-named plane (solved alongside the ``tem_sources`` modes, so it shows in the
-results tree and honours ``mode_only``). The ngspice shared library is taken from
+named plane (solved alongside the ``tem_sources`` modes, so it is saved/plotted
+like one and honours ``mode_only``). The ngspice shared library is taken from
 ``ngspice_dll`` (falling back to a per-port ``library_path`` / PySpice's own
 search). Each port records its port V(t)/I(t) into ``results.npz`` (keys
 ``spice_<idx>_times`` / ``_voltages`` / ``_currents``) with names under
@@ -319,6 +327,30 @@ def _axis_nodes(grid, axis):
 def _axis_centers(grid, axis):
     """The cell-centre coordinate array of *grid* along *axis*."""
     return {"x": grid.xc, "y": grid.yc, "z": grid.zc}[axis]
+
+
+def _bounds_window(grid, mode, bounds):
+    """Index window ``(ia0, ia1, ib0, ib1)`` of a ``bounds`` rect on *mode*'s plane.
+
+    Mirrors ``mode_solver.solve_tem_modes``'s own sub-rect indexing, so the saved
+    profiles can be cropped back to exactly the cells it solved. ``None`` when the
+    rect degenerates to nothing (⇒ save the whole plane, as before).
+    """
+    a0, a1, b0, b1 = bounds
+    ta = mode.transverse_axes
+    ia0, ia1 = grid.axis_index(ta[0], a0), grid.axis_index(ta[0], a1)
+    ib0, ib1 = grid.axis_index(ta[1], b0), grid.axis_index(ta[1], b1)
+    if ia1 <= ia0 or ib1 <= ib0:
+        return None
+    return ia0, ia1, ib0, ib1
+
+
+def _crop_plane(arr, win):
+    """Crop a full-plane 2D profile to a :func:`_bounds_window` (no-op if ``None``)."""
+    if win is None:
+        return arr
+    ia0, ia1, ib0, ib1 = win
+    return arr[ia0:ia1, ib0:ib1]
 
 
 def _choose_mode(modes, wanted, name):
@@ -520,6 +552,10 @@ def _solve_all_modes(ws, np, grid, job, material_data=None):
         # solved mode is interpolated back onto the coarse grid to launch.
         mm = t.get("mode_mesh")
         use_mesh = mm is not None and material_data is not None
+        # Optional in-plane bounds (solver-frame metres, transverse slice order).
+        # Mutually exclusive with a mode mesh, whose fine grid already spans
+        # exactly the (bounded) box.
+        bounds = None if use_mesh else t.get("bounds")
 
         prefix = "Port {}/{}: ".format(si + 1, n_ports) if n_ports > 1 else ""
         _emit_status(
@@ -538,11 +574,9 @@ def _solve_all_modes(ws, np, grid, job, material_data=None):
                 solve_grid, normal=normal, position=position, compute_params=True,
             )
         else:
-            # Optional in-plane bounds (solver-frame metres, transverse slice
-            # order): confine the mode solve to a sub-rectangle of the face.
-            # Absent => whole face, the historical behaviour.
+            # Confine the mode solve to a sub-rectangle of the face when the port
+            # carries ``bounds``. Absent => whole face, the historical behaviour.
             solve_grid = grid
-            bounds = t.get("bounds")
             modes = ws.solve_tem_modes(
                 grid, normal=normal, position=position,
                 bounds=tuple(bounds) if bounds else None,
@@ -554,13 +588,25 @@ def _solve_all_modes(ws, np, grid, job, material_data=None):
             )
         )
 
+        # ``solve_tem_modes`` embeds a bounded solve back into the *full* plane
+        # (a PlaneSource launch needs the full transverse shape), padding it with
+        # zeros. Crop the **saved** profiles back to the cells actually solved, so
+        # the results plot draws the bounded region the user selected instead of a
+        # face of zeros around it. The in-memory ``mode`` handed to ``to_source``
+        # / ``SpicePort`` below keeps its full shape and is untouched.
+        win = _bounds_window(grid, modes[0], bounds) if (bounds and modes) else None
+
         for mi, mode in enumerate(modes):
             key = "mode_{}_{}".format(si, mi)
-            mode_arrays[key + "_phi"] = np.asarray(mode.phi, dtype=np.float64)
-            mode_arrays[key + "_pec"] = np.asarray(mode.pec, dtype=np.uint8)
+            mode_arrays[key + "_phi"] = np.asarray(
+                _crop_plane(mode.phi, win), dtype=np.float64
+            )
+            mode_arrays[key + "_pec"] = np.asarray(
+                _crop_plane(mode.pec, win), dtype=np.uint8
+            )
             for comp, arr in mode.E.items():
                 mode_arrays["{}_E_{}".format(key, comp)] = np.asarray(
-                    arr, dtype=np.float64
+                    _crop_plane(arr, win), dtype=np.float64
                 )
             # Transverse cell-centre coordinates (metres, solver frame) so the
             # results plot can draw the mode on the real (possibly non-uniform)
@@ -568,13 +614,14 @@ def _solve_all_modes(ws, np, grid, job, material_data=None):
             t_axes = list(getattr(mode, "transverse_axes", []))
             if len(t_axes) == 2:
                 # From the grid the mode was solved on (the fine mesh when used),
-                # so the results plot shows the true mode resolution.
-                mode_arrays[key + "_ca"] = np.asarray(
-                    _axis_centers(solve_grid, t_axes[0]), dtype=np.float64
-                )
-                mode_arrays[key + "_cb"] = np.asarray(
-                    _axis_centers(solve_grid, t_axes[1]), dtype=np.float64
-                )
+                # so the results plot shows the true mode resolution; sliced to
+                # the same window as the profiles above.
+                ca = _axis_centers(solve_grid, t_axes[0])
+                cb = _axis_centers(solve_grid, t_axes[1])
+                if win is not None:
+                    ca, cb = ca[win[0]:win[1]], cb[win[2]:win[3]]
+                mode_arrays[key + "_ca"] = np.asarray(ca, dtype=np.float64)
+                mode_arrays[key + "_cb"] = np.asarray(cb, dtype=np.float64)
             mode_meta.append({
                 "source_index": si, "mode_index": mi, "name": name,
                 "conductor_id": int(mode.conductor_id),

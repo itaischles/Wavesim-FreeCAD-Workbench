@@ -8,11 +8,13 @@ a ``materials.npz`` of voxelised materials. The runner writes ``results.npz`` an
 together and persist for later inspection.
 
 The working directory is **stable per document**: ``<results path>/<document
-name>/run`` for a simulation and ``.../mode`` for a TEM mode solve. Re-running a
-document therefore overwrites its previous results instead of piling up
-timestamped folders — callers must warn the user first (see
-:func:`wavesim_gui.run.confirm_overwrite`). Run and mode outputs are kept apart
-so a quick mode solve does not destroy a long simulation's ``results.npz``.
+name>/run`` for a simulation. Re-running a document therefore overwrites its
+previous results instead of piling up timestamped folders — callers must warn the
+user first (see :func:`wavesim_gui.run.confirm_overwrite`). A TEM "Compute Mode"
+preview is throwaway (its modes are re-solved by the next real run and saved
+alongside the run's results), so it uses a :func:`temp_workdir` that
+:func:`discard_workdir` deletes once the mode has been plotted — nothing of a
+preview reaches the results path.
 
 This module is FreeCAD-side and deliberately Qt-free and solver-free: it only
 writes JSON, so it stays importable in console mode and never touches the
@@ -22,6 +24,8 @@ incompatible solver Python.
 import json
 import os
 import re
+import shutil
+import tempfile
 
 import wavesim_settings
 
@@ -82,6 +86,22 @@ def prepare_workdir(doc, prefix="run"):
         if os.path.isfile(path):
             os.remove(path)
     return workdir
+
+
+def temp_workdir():
+    """Create a throwaway working directory for a preview job.
+
+    Used by the TEM "Compute Mode" solve, whose output is only ever plotted: the
+    modes it finds are re-solved (and saved) by the next real run, so writing
+    them into the document's results path would be misleading clutter. The caller
+    must pass the directory to :func:`discard_workdir` when done.
+    """
+    return tempfile.mkdtemp(prefix="wavesim_mode_")
+
+
+def discard_workdir(workdir):
+    """Delete a :func:`temp_workdir` and everything in it (never raises)."""
+    shutil.rmtree(workdir, ignore_errors=True)
 
 
 def write_job(workdir, job):

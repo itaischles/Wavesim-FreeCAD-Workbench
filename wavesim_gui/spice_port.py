@@ -284,7 +284,7 @@ class SpiceTEMPortObject:
             obj.addProperty(
                 "App::PropertyInteger", "Conductor", "Port",
                 "Which solved TEM mode to drive: the conductor label of the "
-                "energized conductor (shown in the results tree after 'Compute "
+                "energized conductor (shown in the mode plot after 'Compute "
                 "Mode'). 0 = the dominant (first) mode.",
             )
             obj.Conductor = 0
@@ -820,7 +820,8 @@ if _GUI_AVAILABLE:
             info = QtWidgets.QLabel(
                 "A SPICE TEM port drives the TEM mode of the PEC cross-section "
                 "on the chosen face (set to PML automatically) with the linked "
-                "circuit. 'Compute Mode' solves and plots the mode(s) now; put "
+                "circuit. 'Compute Mode' solves and plots this port's mode(s) now "
+                "for viewing only (a Run re-solves and saves them); put "
                 "the matched source resistance in the netlist. Optionally select "
                 "an edge/face to confine the mode solve to its in-plane bounding "
                 "box (Clear restores the whole face). " + self._NOTE

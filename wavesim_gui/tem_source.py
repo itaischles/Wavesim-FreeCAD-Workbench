@@ -16,10 +16,11 @@ Workflow
   port setup.
 * The mode itself is solved out-of-process by the conda-side ``runner.py`` (it
   needs scipy/numba, unavailable in FreeCAD's Python). The panel's **Compute
-  Mode** button runs a *mode-only* job (no FDTD time-stepping); otherwise the
-  main Run solves the mode just before stepping the simulation. Either way the
-  solved mode lands in the Results tree as a clickable node showing the mode
-  shape and the port's per-unit-length parameters (Z0, eps_eff, C, L, v).
+  Mode** button runs a *mode-only* job (no FDTD time-stepping) for **that port
+  alone** and plots the result; nothing is saved, because the main Run re-solves
+  every port's mode just before stepping the simulation and stores those with its
+  own results, as clickable Results-tree nodes. Either view shows the mode shape
+  and the port's per-unit-length parameters (Z0, eps_eff, C, L, v).
 
 Rendering
 ---------
@@ -147,7 +148,7 @@ class TEMSourceObject:
             obj.addProperty(
                 "App::PropertyInteger", "Conductor", "Port",
                 "Which solved TEM mode to launch: the conductor label of the "
-                "energized conductor (shown in the results tree after 'Compute "
+                "energized conductor (shown in the mode plot after 'Compute "
                 "Mode'). 0 = the dominant (first) mode.",
             )
             obj.Conductor = 0
@@ -180,7 +181,7 @@ class TEMSourceObject:
             obj.addProperty(
                 "App::PropertyInteger", "Conductor", "Port",
                 "Which solved TEM mode to launch: the conductor label of the "
-                "energized conductor (shown in the results tree after 'Compute "
+                "energized conductor (shown in the mode plot after 'Compute "
                 "Mode'). 0 = the dominant (first) mode.",
             )
             obj.Conductor = 0
@@ -653,9 +654,10 @@ if _GUI_AVAILABLE:
     class TaskTEMSourcePanel(source_mod.ExcitationParamsMixin):
         """Task panel to edit a TEM port: face, fields and excitation.
 
-        "Compute Mode" solves and visualises the port mode now (out of process,
-        no FDTD); OK commits the source and leaves the mode for the main Run.
-        Cancel removes a freshly-created source so it leaves no trace.
+        "Compute Mode" solves and visualises *this* port's mode now (out of
+        process, no FDTD, nothing saved); OK commits the source and leaves the
+        mode for the main Run. Cancel removes a freshly-created source so it
+        leaves no trace.
         """
 
         def __init__(self, obj, created=False):
@@ -689,7 +691,7 @@ if _GUI_AVAILABLE:
 
             # Which solved mode to launch, by energized-conductor label. 0 means
             # the dominant (first) mode; other values match the "conductor N"
-            # nodes the results tree lists after Compute Mode.
+            # modes Compute Mode plots.
             self._conductor = QtWidgets.QSpinBox()
             self._conductor.setRange(0, 999)
             self._conductor.setSpecialValueText("Dominant (first mode)")
@@ -727,11 +729,12 @@ if _GUI_AVAILABLE:
                 "chosen face (which is set to PML automatically). The face must "
                 "cut at least two conductors. Pick a temporal waveform and its "
                 "parameters (preview with the plot button). 'Compute Mode' solves "
-                "and plots the mode(s) now; otherwise it is solved when you Run. "
+                "and plots this port's mode(s) now, for viewing only; they are "
+                "re-solved and saved when you Run. "
                 "With several conductors on the face (e.g. two coax cross-sections), "
-                "Compute Mode lists one 'conductor N' mode per signal conductor in "
-                "the results tree — set 'Energize conductor' to that N to drive "
-                "that conductor (0 launches the dominant mode). "
+                "Compute Mode plots one mode per signal conductor (pick between "
+                "them in the plot window) — set 'Energize conductor' to that "
+                "conductor's N to drive it (0 launches the dominant mode). "
                 "Optionally select an edge/face to confine the mode solve to its "
                 "in-plane bounding box (e.g. a single connector's cross-section on "
                 "a shared plane); Clear restores the whole face. "
@@ -844,14 +847,41 @@ if _GUI_AVAILABLE:
         Gui.Control.closeDialog()
         Gui.Control.showDialog(TaskTEMSourcePanel(obj, created=created))
 
-    def run_mode_solve(doc, focus_obj=None):
-        """Solve the document's TEM port mode(s) out of process (no FDTD run).
+    def _isolate_port(spec, arrays, port_obj):
+        """Cut a job *spec* down to the single mode-solved port *port_obj*.
 
-        Builds the usual voxelised job, flags it ``mode_only``, runs the
-        conda-side runner, then (re)builds the Results tree and opens the solved
-        mode of *focus_obj* -- the TEM/SPICE port whose panel triggered the solve.
-        All defined ports are solved together, so without this the first port's
-        mode would pop up regardless of which panel the user clicked from.
+        "Compute Mode" previews one port, so the other ports' (expensive) mode
+        solves have nothing to do here. Ports are matched on the ``name`` their
+        ``*_spec`` writes -- the object's label, the same key the runner echoes
+        into ``summary["modes"]``. Mode-mesh arrays belonging to the dropped ports
+        are pruned from *arrays* so the preview's ``materials.npz`` carries only
+        what its one mode solve reads. Returns ``False`` when *port_obj* has no
+        entry in the job at all.
+        """
+        name = str(getattr(port_obj, "Label", "") or getattr(port_obj, "Name", ""))
+        tem = [t for t in spec.get("tem_sources") or [] if t.get("name") == name]
+        spice = [p for p in spec.get("spice_ports") or []
+                 if p.get("kind") == "tem" and p.get("name") == name]
+        if not tem and not spice:
+            return False
+        spec["tem_sources"] = tem
+        spec["spice_ports"] = spice
+        keep = {e["mode_mesh"]["key"] for e in tem + spice if e.get("mode_mesh")}
+        for key in [k for k in arrays if k.startswith("modemesh_")]:
+            if key.rsplit("_", 1)[0] not in keep:  # 'modemesh_<i>_pec' -> 'modemesh_<i>'
+                del arrays[key]
+        return True
+
+    def run_mode_solve(doc, port_obj):
+        """Solve and plot the TEM mode of *port_obj* out of process (no FDTD run).
+
+        Builds the usual voxelised job, cuts it down to this one port (see
+        :func:`_isolate_port`), flags it ``mode_only`` and runs the conda-side
+        runner in a throwaway directory. The solved mode is plotted straight from
+        there and the directory is deleted afterwards: the preview exists to be
+        looked at, and a full Run re-solves every port's mode and saves those
+        alongside its own results. *port_obj* is the TEM source or SPICE TEM port
+        whose panel pressed "Compute Mode".
         """
         try:
             from PySide import QtWidgets
@@ -862,15 +892,7 @@ if _GUI_AVAILABLE:
         from wavesim_gui import voxelize as vox_mod
         from wavesim_gui import results as results_mod
 
-        sim = active_simulation(doc)
         main = Gui.getMainWindow()
-        # The mode workdir is reused solve after solve for this document; let the
-        # user rescue the previous modes before voxelisation (the slow part).
-        workdir = job_mod.workdir_for(doc, prefix="mode")
-        if not run_mod.confirm_overwrite(
-            workdir, parent=main, title="Wavesim Mode Solve"
-        ):
-            return
         # Voxelisation runs on the GUI thread and can be slow; show a cancelable
         # progress dialog while it sweeps the geometry.
         vox_dialog, vox_cb = run_mod.voxelization_progress(
@@ -894,48 +916,50 @@ if _GUI_AVAILABLE:
                 "before computing a mode.",
             )
             return
-        # A SPICE TEM port also defines a plane to solve, so accept either.
-        has_spice_tem = any(
-            p.get("kind") == "tem" for p in spec.get("spice_ports") or []
-        )
-        if not spec.get("tem_sources") and not has_spice_tem:
+        if not _isolate_port(spec, arrays, port_obj):
             QtWidgets.QMessageBox.warning(
-                main, "Wavesim Mode Solve", "No TEM port to solve.",
+                main, "Wavesim Mode Solve",
+                "This port has no plane to solve. Check it sits under the "
+                "simulation's Sources group.",
             )
             return
 
         spec["mode_only"] = True
         spec["steps"] = 1
-        workdir = job_mod.prepare_workdir(doc, prefix="mode")
-        job_mod.write_job(workdir, spec)
-        vox_mod.write_materials(workdir, arrays)
+        # A preview is never saved: it runs in a temp dir, is plotted from there,
+        # and the dir goes away. Only a full Run writes modes to the results path.
+        workdir = job_mod.temp_workdir()
+        try:
+            job_mod.write_job(workdir, spec)
+            vox_mod.write_materials(workdir, arrays)
 
-        FreeCAD.Console.PrintMessage(
-            "Wavesim: solving TEM mode(s) in {}\n".format(workdir)
-        )
-        summary = run_mod.run_job(
-            workdir, 1, parent=main,
-            message="Preparing TEM mode solve...", busy=True,
-        )
-        if summary is None:
-            return
-        if not summary.get("modes"):
-            QtWidgets.QMessageBox.information(
-                main, "Wavesim Mode Solve",
-                "No TEM mode was found. A TEM port plane needs at least two "
-                "PEC conductors (e.g. a signal conductor and a ground/shield).",
+            FreeCAD.Console.PrintMessage(
+                "Wavesim: solving the TEM mode of '{}' in {}\n".format(
+                    port_obj.Label, workdir
+                )
             )
-            return
-
-        grp = results_mod.build_results(doc, sim, workdir, summary)
-        # All ports are solved together; open the mode of the port whose panel
-        # triggered the solve (matched by name, the same key the runner records
-        # in summary["modes"]) so a multi-port document shows the requested mode.
-        focus_name = None
-        if focus_obj is not None:
-            focus_name = str(getattr(focus_obj, "Label", "")
-                             or getattr(focus_obj, "Name", ""))
-        results_mod.open_first_mode(grp, focus_name)
+            summary = run_mod.run_job(
+                workdir, 1, parent=main,
+                message="Preparing TEM mode solve...", busy=True,
+            )
+            if summary is None:
+                return
+            if not summary.get("modes"):
+                QtWidgets.QMessageBox.information(
+                    main, "Wavesim Mode Solve",
+                    "No TEM mode was found. A TEM port plane needs at least two "
+                    "PEC conductors (e.g. a signal conductor and a ground/shield).",
+                )
+                return
+            # Reads every array it needs before returning, so the temp dir below
+            # can go while the plot window stays open.
+            if not results_mod.show_mode_preview(workdir, summary):
+                FreeCAD.Console.PrintWarning(
+                    "Wavesim: the solved mode of '{}' could not be plotted.\n"
+                    .format(port_obj.Label)
+                )
+        finally:
+            job_mod.discard_workdir(workdir)
 
     class CommandAddTEMSource:
         """Create a TEM port Source on a domain face and open its editor."""

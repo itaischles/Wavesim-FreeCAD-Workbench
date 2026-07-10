@@ -15,9 +15,17 @@ The mesh is built per axis, independently:
   extent on its axis. Grid lines are forced exactly at these coordinates so cells
   conform to the geometry.
 * **Graded fill.** Between consecutive forced lines the interval is tiled with
-  cells no larger than the coarse target (``default_cell_size_m`` -> the Domain's
-  ``Dx/Dy/Dz``); a small gap gets fine cells and the size grows toward the
-  interior by at most ``MaxGradingRatio`` per step (solver guidance ~1.5-2x).
+  cells no larger than the coarse target (the Domain's ``Dx/Dy/Dz``, now the
+  *background* resolution); a small gap gets fine cells and the size grows toward
+  the interior by at most ``MaxGradingRatio`` per step (solver guidance ~1.5-2x).
+* **Material refinement.** Each dielectric body tightens the coarse target over
+  the axis interval it spans to its own per-medium resolution
+  ``c0 / (fmax * N_lambda * sqrt(eps_r * mu_r))`` (see
+  :func:`collect_material_caps`): a higher relative permittivity / permeability
+  means a shorter wavelength, so that band of the grid is meshed finer while the
+  low-index void stays coarse. Being axis-separable, the refinement fills the
+  body's projected slab on each axis; the body itself (the slabs' intersection)
+  is fine on all three.
 * **PML pads.** ``pad_lo``/``pad_hi`` uniform cells (coarse size) are appended
   outside the inner region for the absorber, matching ``domain_grid_params``.
 
@@ -110,6 +118,57 @@ def collect_axis_snaps(materials):
     return axes
 
 
+def collect_material_caps(sim, domain, materials):
+    """Per-axis material cell-size caps ``(lo_mm, hi_mm, target_mm)``.
+
+    Each dielectric body imposes, over the interval it spans on an axis, a maximum
+    cell size equal to its own per-medium resolution
+    ``c0 / (fmax * N_lambda * sqrt(eps_r * mu_r))`` (see
+    :func:`wavesim_gui.domain.wavelength_cell_size_m`). A higher-index body has a
+    shorter wavelength and so a smaller target, refining that band of the grid;
+    the void keeps the coarse target. The body's *bounding box* on each axis is
+    used, so the refinement fills the axis-projected slab of the body -- the best
+    a rectilinear (axis-separable) grid can do, and the 3D intersection of the
+    three slabs (the body itself) ends up fine on all axes.
+
+    PEC bodies are skipped (no meaningful wavelength). Returns three empty lists
+    when the max frequency is unset, so the snapper falls back to the plain coarse
+    target.
+    """
+    from wavesim_gui import domain as domain_mod
+    from wavesim_gui import voxelize as vox
+
+    caps = ([], [], [])
+    for shape, eps, mu, pec in vox._gather(materials):
+        if pec:
+            continue
+        target_m = domain_mod.wavelength_cell_size_m(sim, eps, mu, domain)
+        if target_m is None:
+            return ([], [], [])  # no max frequency -> no material sizing
+        target_mm = target_m * _MM_PER_M
+        bb = shape.BoundBox
+        caps[0].append((bb.XMin, bb.XMax, target_mm))
+        caps[1].append((bb.YMin, bb.YMax, target_mm))
+        caps[2].append((bb.ZMin, bb.ZMax, target_mm))
+    return caps
+
+
+def _gap_coarse(a, b, coarse, caps):
+    """Coarse cell target (mm) for the interval ``[a, b]`` given material *caps*.
+
+    The axis *coarse* (void target), tightened to the smallest material target of
+    any cap interval covering the gap's midpoint. Because material bounding-box
+    faces are forced grid lines, each gap lies wholly inside or outside every cap
+    interval, so the midpoint test classifies the whole gap.
+    """
+    mid = 0.5 * (a + b)
+    target = coarse
+    for lo, hi, t in caps:
+        if lo <= mid <= hi and t < target:
+            target = t
+    return target
+
+
 # --------------------------------------------------------------------------- #
 # Per-axis graded meshing
 # --------------------------------------------------------------------------- #
@@ -183,7 +242,8 @@ def _graded_widths(w, hL, hR, H, r):
     return [x * scale for x in widths]
 
 
-def build_axis_nodes(snaps, lo, hi, coarse, ratio, pad_lo, pad_hi, min_cell=0.0):
+def build_axis_nodes(snaps, lo, hi, coarse, ratio, pad_lo, pad_hi, min_cell=0.0,
+                     caps=()):
     """Graded node coordinates (mm) for one axis, PML pad cells included.
 
     Parameters
@@ -193,7 +253,8 @@ def build_axis_nodes(snaps, lo, hi, coarse, ratio, pad_lo, pad_hi, min_cell=0.0)
     lo, hi : float
         Bounds of the inner (air-padded) region on this axis, world mm.
     coarse : float
-        Target interior cell size (mm) -- the max-frequency resolution.
+        Target interior (void) cell size (mm) -- the background-medium
+        resolution.
     ratio : float
         Max size ratio between adjacent cells the graded fill may use.
     pad_lo, pad_hi : int
@@ -202,10 +263,15 @@ def build_axis_nodes(snaps, lo, hi, coarse, ratio, pad_lo, pad_hi, min_cell=0.0)
         Smallest cell the fill may use (mm); 0 disables the limit. Nearby forced
         lines are merged and the fine feature cells are clamped to it, so
         snapping cannot produce an extremely fine mesh.
+    caps : iterable of (lo_mm, hi_mm, target_mm)
+        Material cell-size caps (:func:`collect_material_caps`): over each
+        interval the coarse target is tightened to *target_mm* so a high-index
+        body's band gets finer cells. Empty ⇒ uniform coarse target everywhere.
 
     Returns a strictly-increasing list of node coordinates. The inner region is
     tiled so every gap between forced lines is resolved with cells no larger than
-    *coarse*, fine next to small features and grading out to *coarse* in voids.
+    the (material-tightened) coarse target, fine next to small features and
+    grading out toward the void.
     """
     coarse = max(float(coarse), 1.0e-9)
     min_cell = min(max(float(min_cell), 0.0), coarse)
@@ -215,12 +281,18 @@ def build_axis_nodes(snaps, lo, hi, coarse, ratio, pad_lo, pad_hi, min_cell=0.0)
     forced = _forced_lines(snaps, lo, hi, coarse, min_cell)
     gaps = [b - a for a, b in zip(forced[:-1], forced[1:])]
 
+    # Per-gap coarse target: the void size, tightened where a material body covers
+    # the gap (its shorter wavelength wants smaller cells), then floored by the
+    # min-cell limit so material refinement can't undercut it either.
+    gap_coarse = [max(_gap_coarse(a, b, coarse, caps), min_cell)
+                  for a, b in zip(forced[:-1], forced[1:])]
+
     # Intrinsic desired size per interval (small gaps want small cells) and, from
     # that, the desired cell size at each forced line: the finer of its neighbours
     # so a line bounding a small feature carries fine cells into the void. The
     # min-cell floor keeps a small gap from spawning sub-minimum cells (a gap that
     # is itself below the floor stays a single cell).
-    intrinsic = [min(coarse, g) for g in gaps]
+    intrinsic = [min(gc, g) for gc, g in zip(gap_coarse, gaps)]
     if min_cell > 0.0:
         intrinsic = [s if g < min_cell else max(s, min_cell)
                      for s, g in zip(intrinsic, gaps)]
@@ -234,7 +306,8 @@ def build_axis_nodes(snaps, lo, hi, coarse, ratio, pad_lo, pad_hi, min_cell=0.0)
     nodes = [forced[0]]
     for k, g in enumerate(gaps):
         pos = nodes[-1]
-        for cw in _graded_widths(g, end_size[k], end_size[k + 1], coarse, ratio):
+        for cw in _graded_widths(g, end_size[k], end_size[k + 1],
+                                 gap_coarse[k], ratio):
             pos += cw
             nodes.append(pos)
         nodes[-1] = forced[k + 1]  # land exactly on the forced line
@@ -254,9 +327,12 @@ def build_domain_nodes(sim, domain):
 
     Uses the material geometry bounds (grown for sources/monitors, via
     ``combined_bbox_mm``) as the inner region, the Domain's ``Dx/Dy/Dz`` as the
-    coarse interior target, its ``MaxGradingRatio`` as the grading bound and the
-    per-face PML padding from ``domain_grid_params``. Returns ``None`` when there
-    is no geometry to bound (the caller falls back to a uniform grid).
+    coarse (background) interior target, its ``MaxGradingRatio`` as the grading
+    bound and the per-face PML padding from ``domain_grid_params``. Each material
+    body additionally refines its own band down to its per-medium resolution (see
+    :func:`collect_material_caps`), so higher-index regions are meshed finer than
+    the void. Returns ``None`` when there is no geometry to bound (the caller
+    falls back to a uniform grid).
 
     If the grid exceeds :data:`_MAX_TOTAL_CELLS`, the coarse target is scaled up
     and the whole mesh rebuilt until it fits (bounded number of attempts).
@@ -280,14 +356,22 @@ def build_domain_nodes(sim, domain):
     los = (bbox.XMin - sp_mm, bbox.YMin - sp_mm, bbox.ZMin - sp_mm)
     his = (bbox.XMax + sp_mm, bbox.YMax + sp_mm, bbox.ZMax + sp_mm)
     snaps = collect_axis_snaps(materials)
+    # Per-axis material cell-size caps: higher-index bodies refine their band
+    # below the coarse (background) target. Scaled alongside ``coarse`` in the
+    # cell-count guard below, so a grid that must be coarsened to fit coarsens
+    # material regions and void together.
+    caps = collect_material_caps(sim, domain, materials)
 
     nodes = None
     scale = 1.0
     for _attempt in range(12):
+        scaled_caps = tuple(
+            [(lo, hi, t * scale) for lo, hi, t in caps[a]] for a in range(3)
+        )
         nodes = tuple(
             build_axis_nodes(
                 snaps[a], los[a], his[a], coarse_mm[a] * scale, ratio,
-                pad_lo[a], pad_hi[a], min_cell_mm,
+                pad_lo[a], pad_hi[a], min_cell_mm, scaled_caps[a],
             )
             for a in range(3)
         )

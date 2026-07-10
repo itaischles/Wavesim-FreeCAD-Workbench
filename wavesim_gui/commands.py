@@ -356,7 +356,7 @@ if _GUI_AVAILABLE:
             domain = self._domain
             freq_changed = abs(new_max_freq - self._orig_max_freq) > 1.0e-6
             if domain is not None and freq_changed:
-                size_m = domain_mod.default_cell_size_m(self.obj, domain=domain)
+                size_m = domain_mod.suggested_cell_size_m(self.obj, domain=domain)
                 if size_m is not None:
                     size_mm = "{} mm".format(size_m * 1000.0)
                     domain.Dx = domain.Dy = domain.Dz = size_mm

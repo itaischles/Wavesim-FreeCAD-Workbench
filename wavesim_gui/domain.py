@@ -387,21 +387,19 @@ def min_spacings_m(obj):
     return tuple(out)
 
 
-def default_cell_size_m(sim, domain=None, cells_per_wavelength=None):
-    """Suggested uniform cell size (metres) for *sim*'s max frequency.
+def wavelength_cell_size_m(sim, eps_r=1.0, mu_r=1.0, domain=None,
+                           cells_per_wavelength=None):
+    """Cell size (metres) resolving ``N_lambda`` cells per wavelength in a medium.
 
-    ``dx = c0 / (fmax * N_lambda * sqrt(eps_r,max * mu_r,max))`` where
-    ``N_lambda`` is the Domain's ``CellsPerWavelength`` (overridable via
-    *cells_per_wavelength*, so a task panel can preview an uncommitted value) and
-    ``eps_r,max`` / ``mu_r,max`` are the largest relative constants among the
-    simulation's materials (PEC bodies are skipped; each falls back to 1.0). This
-    resolves the shortest wavelength present -- the one in the highest-index
-    medium at the top frequency -- with ``N_lambda`` cells.
+    ``dx = c0 / (fmax * N_lambda * sqrt(eps_r * mu_r))`` -- the shortest
+    wavelength at the max frequency in a medium of relative constants *eps_r* /
+    *mu_r*, resolved with ``N_lambda`` cells. ``N_lambda`` is the Domain's
+    ``CellsPerWavelength`` (overridable via *cells_per_wavelength*, so a task
+    panel can preview an uncommitted value).
 
     Returns ``None`` when the max frequency is not positive (no sensible size).
     """
     from wavesim_gui.commands import max_frequency_hz
-    from wavesim_gui import materials as materials_mod
 
     fmax = max_frequency_hz(sim)
     if fmax <= 0.0:
@@ -416,6 +414,32 @@ def default_cell_size_m(sim, domain=None, cells_per_wavelength=None):
     if n_lambda <= 0:
         n_lambda = 20
 
+    n = math.sqrt(max(float(eps_r) * float(mu_r), 1.0e-12))
+    return _C0 / (fmax * n_lambda * n)
+
+
+def background_eps_mu(domain):
+    """Return the Domain background medium's ``(eps_r, mu_r)`` (vacuum default)."""
+    bg = background_material(domain)
+    eps = float(getattr(bg, "Eps", 1.0)) if bg is not None else 1.0
+    mu = float(getattr(bg, "Mu", 1.0)) if bg is not None else 1.0
+    return eps, mu
+
+
+def default_cell_size_m(sim, domain=None, cells_per_wavelength=None):
+    """Suggested uniform cell size (metres) for *sim*'s max frequency.
+
+    ``dx = c0 / (fmax * N_lambda * sqrt(eps_r,max * mu_r,max))`` where
+    ``eps_r,max`` / ``mu_r,max`` are the largest relative constants among the
+    simulation's materials (PEC bodies are skipped; each falls back to 1.0). This
+    resolves the shortest wavelength present -- the one in the highest-index
+    medium at the top frequency -- so a single uniform cell size is fine enough
+    everywhere. See :func:`wavelength_cell_size_m` for the per-medium form.
+
+    Returns ``None`` when the max frequency is not positive (no sensible size).
+    """
+    from wavesim_gui import materials as materials_mod
+
     eps_max = 1.0
     mu_max = 1.0
     for mat in materials_mod.find_materials(sim):
@@ -424,7 +448,30 @@ def default_cell_size_m(sim, domain=None, cells_per_wavelength=None):
         eps_max = max(eps_max, float(getattr(mat, "Eps", 1.0)))
         mu_max = max(mu_max, float(getattr(mat, "Mu", 1.0)))
 
-    return _C0 / (fmax * n_lambda * math.sqrt(eps_max * mu_max))
+    return wavelength_cell_size_m(sim, eps_max, mu_max, domain, cells_per_wavelength)
+
+
+def suggested_cell_size_m(sim, domain=None, cells_per_wavelength=None):
+    """Cell size (metres) to fill the Domain's ``Dx/Dy/Dz`` from the max frequency.
+
+    * **Uniform grid** -- the global-finest :func:`default_cell_size_m`: one
+      constant size must resolve the highest-index medium in the model.
+    * **Non-uniform grid** -- the coarse *background* resolution
+      (:func:`wavelength_cell_size_m` for the background medium). ``Dx/Dy/Dz``
+      then acts as the void/interior target and the snapper refines each material
+      body down to its own per-medium requirement (see
+      :mod:`wavesim_gui.gridbuild`), so higher-index regions get finer cells
+      without meshing the whole domain that fine.
+
+    Returns ``None`` when the max frequency is not positive.
+    """
+    if domain is None:
+        domain = find_domain(sim)
+    if domain is not None and getattr(domain, "UseNonuniformGrid", False):
+        eps_bg, mu_bg = background_eps_mu(domain)
+        return wavelength_cell_size_m(sim, eps_bg, mu_bg, domain,
+                                      cells_per_wavelength)
+    return default_cell_size_m(sim, domain, cells_per_wavelength)
 
 
 # CFL parameters mirroring the solver's ``wavesim.grid.make_grid``: dt is the
@@ -1170,7 +1217,10 @@ if _GUI_AVAILABLE:
 
             Uses the live cells-per-wavelength spin box (not yet committed) and
             the simulation's materials to compute a uniform cubic cell size, then
-            forces cubic cells so all three axes get the resolved size.
+            forces cubic cells so all three axes get the resolved size. In
+            non-uniform mode the filled size is the coarse *background* resolution
+            (the snapper refines each material below it by its index); in uniform
+            mode it is the global-finest size a single spacing needs.
             """
             try:
                 from PySide import QtWidgets
@@ -1179,9 +1229,19 @@ if _GUI_AVAILABLE:
             from wavesim_gui.commands import active_simulation
 
             sim = active_simulation(self.obj.Document)
-            size_m = default_cell_size_m(
-                sim, cells_per_wavelength=self._cpw.value()
-            )
+            if self._nonuniform.isChecked():
+                # Coarse target = the (uncommitted) background medium's resolution.
+                bg_index = self._background.currentIndex()
+                bg = self._materials[bg_index - 1] if bg_index > 0 else None
+                eps_bg = float(getattr(bg, "Eps", 1.0)) if bg is not None else 1.0
+                mu_bg = float(getattr(bg, "Mu", 1.0)) if bg is not None else 1.0
+                size_m = wavelength_cell_size_m(
+                    sim, eps_bg, mu_bg, cells_per_wavelength=self._cpw.value()
+                )
+            else:
+                size_m = default_cell_size_m(
+                    sim, cells_per_wavelength=self._cpw.value()
+                )
             if size_m is None:
                 QtWidgets.QMessageBox.warning(
                     Gui.getMainWindow(), "Wavesim Domain",

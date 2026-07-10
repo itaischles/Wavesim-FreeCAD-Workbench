@@ -864,6 +864,13 @@ if _GUI_AVAILABLE:
 
         sim = active_simulation(doc)
         main = Gui.getMainWindow()
+        # The mode workdir is reused solve after solve for this document; let the
+        # user rescue the previous modes before voxelisation (the slow part).
+        workdir = job_mod.workdir_for(doc, prefix="mode")
+        if not run_mod.confirm_overwrite(
+            workdir, parent=main, title="Wavesim Mode Solve"
+        ):
+            return
         # Voxelisation runs on the GUI thread and can be slow; show a cancelable
         # progress dialog while it sweeps the geometry.
         vox_dialog, vox_cb = run_mod.voxelization_progress(
@@ -899,7 +906,7 @@ if _GUI_AVAILABLE:
 
         spec["mode_only"] = True
         spec["steps"] = 1
-        workdir = job_mod.new_workdir(prefix="mode")
+        workdir = job_mod.prepare_workdir(doc, prefix="mode")
         job_mod.write_job(workdir, spec)
         vox_mod.write_materials(workdir, arrays)
 

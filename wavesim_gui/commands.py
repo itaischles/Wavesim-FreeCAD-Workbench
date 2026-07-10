@@ -475,6 +475,16 @@ if _GUI_AVAILABLE:
             except ImportError:
                 from PySide import QtGui as QtWidgets
 
+            doc = FreeCAD.ActiveDocument
+            # This document's results folder is reused run after run, so give the
+            # user a chance to rescue the previous results before voxelisation
+            # (the slow part) starts.
+            workdir = job_mod.workdir_for(doc, prefix="run")
+            if not run_mod.confirm_overwrite(
+                workdir, parent=Gui.getMainWindow(), title="Wavesim Run"
+            ):
+                return
+
             # Build from real geometry when materials are assigned; otherwise
             # fall back to the Session-2 hardcoded vacuum box. Materials without
             # a grid is a user error -- refuse rather than guess a cell size.
@@ -485,7 +495,7 @@ if _GUI_AVAILABLE:
             )
             try:
                 spec, arrays = vox_mod.build_job_from_document(
-                    FreeCAD.ActiveDocument, progress=vox_cb
+                    doc, progress=vox_cb
                 )
             except vox_mod.VoxelizationCancelled:
                 vox_dialog.close()
@@ -504,7 +514,7 @@ if _GUI_AVAILABLE:
                     "Wavesim: no materials assigned; running the demo box.\n"
                 )
 
-            workdir = job_mod.new_workdir()
+            workdir = job_mod.prepare_workdir(doc, prefix="run")
             job_mod.write_job(workdir, spec)
             if arrays is not None:
                 vox_mod.write_materials(workdir, arrays)
@@ -517,11 +527,9 @@ if _GUI_AVAILABLE:
             )
             if summary is not None:
                 from wavesim_gui import results as results_mod
-                sim = active_simulation(FreeCAD.ActiveDocument)
+                sim = active_simulation(doc)
                 if sim is not None:
-                    results_mod.build_results(
-                        FreeCAD.ActiveDocument, sim, workdir, summary
-                    )
+                    results_mod.build_results(doc, sim, workdir, summary)
                 _show_run_summary(summary, workdir)
 
         def IsActive(self):

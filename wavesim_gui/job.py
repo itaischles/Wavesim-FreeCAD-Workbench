@@ -4,34 +4,83 @@
 A "job" is a self-contained working directory the conda-side ``runner.py``
 consumes: a ``job.json`` describing the simulation plus, from Session 3 onward,
 a ``materials.npz`` of voxelised materials. The runner writes ``results.npz`` and
-``summary.json`` back into the same directory, so keeping each run in its own
-timestamped folder under the configured results path means a run's inputs and
-outputs live together and persist for later inspection.
+``summary.json`` back into the same directory, so a run's inputs and outputs live
+together and persist for later inspection.
+
+The working directory is **stable per document**: ``<results path>/<document
+name>/run`` for a simulation and ``.../mode`` for a TEM mode solve. Re-running a
+document therefore overwrites its previous results instead of piling up
+timestamped folders — callers must warn the user first (see
+:func:`wavesim_gui.run.confirm_overwrite`). Run and mode outputs are kept apart
+so a quick mode solve does not destroy a long simulation's ``results.npz``.
 
 This module is FreeCAD-side and deliberately Qt-free and solver-free: it only
 writes JSON, so it stays importable in console mode and never touches the
 incompatible solver Python.
 """
 
-import datetime
 import json
 import os
+import re
 
 import wavesim_settings
 
 
-def new_workdir(prefix="run"):
-    """Create and return a fresh timestamped working directory.
+# Every file the runner or the workbench writes into a workdir. Cleared before a
+# new run so a stale artefact (e.g. a materials.npz from a previous geometry, or
+# the results of a run that this one is about to replace) can never be picked up
+# as if it belonged to the new job.
+JOB_ARTEFACTS = ("job.json", "materials.npz", "results.npz", "summary.json")
 
-    Lives under the configured results folder (created if missing). The
-    timestamp includes microseconds so two runs started in the same second do
-    not collide.
+_UNSAFE_CHARS = re.compile(r"[^A-Za-z0-9._-]+")
+
+
+def document_slug(doc):
+    """Return a filesystem-safe folder name identifying *doc*.
+
+    The saved ``.FCStd`` file's stem when there is one, else the document label
+    (an unsaved document shares the ``Unnamed`` folder — saving it moves its
+    results to a folder of their own).
+    """
+    name = ""
+    if doc is not None:
+        path = str(getattr(doc, "FileName", "") or "")
+        if path:
+            name = os.path.splitext(os.path.basename(path))[0]
+        else:
+            name = str(getattr(doc, "Label", "") or getattr(doc, "Name", "") or "")
+    name = _UNSAFE_CHARS.sub("_", name).strip("._")
+    return name or "Unnamed"
+
+
+def workdir_for(doc, prefix="run"):
+    """Return *doc*'s working directory for the *prefix* ('run'/'mode') stage.
+
+    Pure path arithmetic — nothing is created or deleted, so callers can probe
+    it with :func:`existing_artefacts` before asking the user to overwrite.
     """
     root = wavesim_settings.get_results_path()
-    os.makedirs(root, exist_ok=True)
-    stamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S_%f")
-    workdir = os.path.join(root, "{}_{}".format(prefix, stamp))
+    return os.path.join(root, document_slug(doc), prefix)
+
+
+def existing_artefacts(workdir):
+    """Return the :data:`JOB_ARTEFACTS` that already exist in *workdir*."""
+    return [name for name in JOB_ARTEFACTS
+            if os.path.isfile(os.path.join(workdir, name))]
+
+
+def prepare_workdir(doc, prefix="run"):
+    """Create *doc*'s working directory, clearing any previous job artefacts.
+
+    Only the files this workbench writes are removed; anything else the user
+    keeps in the folder is left alone. Returns the directory path.
+    """
+    workdir = workdir_for(doc, prefix)
     os.makedirs(workdir, exist_ok=True)
+    for name in JOB_ARTEFACTS:
+        path = os.path.join(workdir, name)
+        if os.path.isfile(path):
+            os.remove(path)
     return workdir
 
 

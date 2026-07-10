@@ -91,6 +91,40 @@ def _read_summary(workdir):
         return None
 
 
+def confirm_overwrite(workdir, parent=None, title="Wavesim"):
+    """Ask before a run replaces the results already sitting in *workdir*.
+
+    Results live in a stable per-document folder (see :mod:`wavesim_gui.job`), so
+    every run after the first destroys its predecessor's output. Returns ``True``
+    to proceed — including when the folder holds nothing to lose, in which case
+    no dialog is shown.
+    """
+    from wavesim_gui import job as job_mod
+
+    if not job_mod.existing_artefacts(workdir):
+        return True
+
+    try:
+        from PySide import QtWidgets
+    except ImportError:
+        from PySide import QtGui as QtWidgets
+
+    box = QtWidgets.QMessageBox(parent)
+    box.setWindowTitle(title)
+    box.setIcon(QtWidgets.QMessageBox.Warning)
+    box.setText("Previous results for this document will be overwritten.")
+    box.setInformativeText(
+        "The results in\n\n{}\n\nwill be replaced by this run. Move or rename "
+        "the folder first if you want to keep them.".format(workdir)
+    )
+    box.setStandardButtons(
+        QtWidgets.QMessageBox.Ok | QtWidgets.QMessageBox.Cancel
+    )
+    box.button(QtWidgets.QMessageBox.Ok).setText("Overwrite and Run")
+    box.setDefaultButton(QtWidgets.QMessageBox.Ok)
+    return box.exec_() == QtWidgets.QMessageBox.Ok
+
+
 def voxelization_progress(parent=None, title="Wavesim",
                           message="Voxelizing geometry..."):
     """Return ``(dialog, callback)`` for showing voxelisation progress.

@@ -105,6 +105,13 @@ def materials_bbox_mm(materials):
 
 _AXIS_IDX = {"x": 0, "y": 1, "z": 2}
 
+# Unit vector of each axis (for plane slicing) and the two transverse axes of a
+# normal in the solver's mode-slice order (matching ``mode_solver._NORMAL_CFG``
+# and ``tem_source._TRANSVERSE``): the connectivity-preserving mode mesh emits
+# its ``(a, b)`` arrays in this order.
+_AXIS_VEC = {"x": (1.0, 0.0, 0.0), "y": (0.0, 1.0, 0.0), "z": (0.0, 0.0, 1.0)}
+_TRANSVERSE_AXES = {"x": ("y", "z"), "y": ("x", "z"), "z": ("x", "y")}
+
 
 def _expand_bbox_points(bbox, points_mm):
     """Grow *bbox* (mm, possibly ``None``) to include each ``(x, y, z)`` point."""
@@ -341,6 +348,239 @@ def _extrude_port_faces(arrays, port_faces, bg_eps=1.0, bg_mu=1.0, bg_pec=False)
             arr[tuple(sel)] = arr[tuple(src)]
 
 
+# --------------------------------------------------------------------------- #
+# Connectivity-preserving TEM mode mesh (Session B)
+#
+# At the FDTD cell size the voxeliser can shred one continuous PEC on a port
+# plane into several disconnected cells, so the mode solver's
+# ``ndimage.label(pec)`` miscounts conductors. These helpers re-voxelise *only
+# that plane* on a finer transverse grid, auto-refining until the PEC connected-
+# component count stabilises, and ship the fine 2D arrays to the runner (which
+# solves the mode there and interpolates it back to launch on the coarse grid).
+# The FDTD grid itself is untouched.
+# --------------------------------------------------------------------------- #
+
+def _plane_inside(body_shape, normal, pos_mm, a_coords, b_coords, deflection):
+    """Boolean ``(Na, Nb)`` mask of transverse cell centres inside *body_shape*.
+
+    Generalises :func:`_layer_inside` to any axis-aligned *normal* ('x'/'y'/'z').
+    Slices the body with the plane at *pos_mm* along the normal, projects each
+    section wire onto the two transverse axes (slice order, see
+    :data:`_TRANSVERSE_AXES`), and even-odd point-in-polygon-tests the ``(a, b)``
+    cell-centre grid. Returns ``None`` when the plane misses the solid.
+    """
+    import numpy as np
+    from matplotlib.path import Path
+
+    try:
+        wires = body_shape.slice(FreeCAD.Vector(*_AXIS_VEC[normal]), float(pos_mm))
+    except Exception:
+        return None
+    if not wires:
+        return None
+    ax_a, ax_b = _TRANSVERSE_AXES[normal]
+    ga, gb = np.meshgrid(a_coords, b_coords, indexing="ij")
+    pts = np.column_stack([ga.ravel(), gb.ravel()])
+    inside = np.zeros(pts.shape[0], dtype=bool)
+    any_wire = False
+    for w in wires:
+        try:
+            verts = w.discretize(Deflection=deflection)
+        except Exception:
+            continue
+        if len(verts) < 3:
+            continue
+        poly = np.array([(getattr(v, ax_a), getattr(v, ax_b)) for v in verts])
+        inside ^= Path(poly).contains_points(pts)
+        any_wire = True
+    if not any_wire:
+        return None
+    return inside.reshape(len(a_coords), len(b_coords))
+
+
+def _label_2d(mask):
+    """Count 4-connected ``True`` components in a 2D boolean array.
+
+    A compact numpy union-find standing in for ``scipy.ndimage.label`` (scipy is
+    not in FreeCAD's bundled Python) with the same 4-connectivity the solver's
+    ``ndimage.label`` uses by default, so the count here matches what
+    :func:`wavesim.mode_solver.solve_tem_modes` would see on the same mask.
+    """
+    import numpy as np
+
+    m = np.ascontiguousarray(mask, dtype=bool)
+    if not m.any():
+        return 0
+    n = int(m.sum())
+    idx = -np.ones(m.shape, dtype=np.int64)
+    idx[m] = np.arange(n)
+    parent = np.arange(n, dtype=np.int64)
+
+    def find(x):
+        root = x
+        while parent[root] != root:
+            root = parent[root]
+        while parent[x] != root:
+            parent[x], x = root, parent[x]
+        return root
+
+    # Adjacency pairs where both cells are True (4-connectivity: right + down).
+    ra, rb = np.nonzero(m[:, :-1] & m[:, 1:])
+    da, db = np.nonzero(m[:-1, :] & m[1:, :])
+    u = np.concatenate([idx[ra, rb], idx[da, db]])
+    v = np.concatenate([idx[ra, rb + 1], idx[da + 1, db]])
+    for a, b in zip(u.tolist(), v.tolist()):
+        ra_, rb_ = find(a), find(b)
+        if ra_ != rb_:
+            parent[max(ra_, rb_)] = min(ra_, rb_)
+    return len({find(i) for i in range(n)})
+
+
+def voxelize_port_plane(materials, normal, pos_mm, a_nodes_mm, b_nodes_mm,
+                        bg_eps=1.0, bg_mu=1.0, bg_pec=False):
+    """Voxelise the material cross-section on one plane into 2D ``(a, b)`` arrays.
+
+    Returns ``(pec2d, eps2d, mu2d)`` shaped ``(Na, Nb)`` in transverse slice order
+    (see :data:`_TRANSVERSE_AXES`), sampled at the cell centres of the node
+    coordinate arrays *a_nodes_mm* / *b_nodes_mm* (world mm). Mirrors
+    :func:`voxelize_materials`'s per-body assignment (later bodies overwrite
+    earlier, a dielectric clears a PEC background) but for a single plane.
+    """
+    import numpy as np
+
+    a_c = 0.5 * (a_nodes_mm[:-1] + a_nodes_mm[1:])
+    b_c = 0.5 * (b_nodes_mm[:-1] + b_nodes_mm[1:])
+    eps2d = np.full((a_c.size, b_c.size), float(bg_eps), dtype=np.float64)
+    mu2d = np.full((a_c.size, b_c.size), float(bg_mu), dtype=np.float64)
+    pec2d = np.full((a_c.size, b_c.size), bool(bg_pec), dtype=bool)
+    da = float(np.diff(a_nodes_mm).min())
+    db = float(np.diff(b_nodes_mm).min())
+    deflection = max(min(da, db) * 0.25, min(da, db) * 1.0e-6)
+    for body_shape, eps, mu, pec in _gather(materials):
+        inside = _plane_inside(body_shape, normal, pos_mm, a_c, b_c, deflection)
+        if inside is None or not inside.any():
+            continue
+        if pec:
+            pec2d[inside] = True
+        else:
+            eps2d[inside] = eps
+            mu2d[inside] = mu
+            pec2d[inside] = False  # a dielectric body clears a PEC background
+    return pec2d, eps2d, mu2d
+
+
+def build_mode_mesh(materials, normal, pos_mm, span_mm, base_cell_mm,
+                    bg_eps=1.0, bg_mu=1.0, bg_pec=False,
+                    max_factor=128, max_cells=300_000,
+                    min_resolved=64, stable_steps=2):
+    """Auto-refine a transverse re-voxelisation until PEC connectivity stabilises.
+
+    Voxelises the port plane over the transverse rectangle *span_mm*
+    ``(a0, a1, b0, b1)`` (world mm, slice order) at successively finer cell sizes
+    -- *base_cell_mm* ``(ca, cb)`` divided by factor 1, 2, 4, 8, ... -- counting
+    the PEC connected components (:func:`_label_2d`) each pass. Coarse
+    voxelisation over-counts conductors when it fragments a continuous PEC (a thin
+    tube wall shatters into arcs); refining merges the fragments and the count
+    *drops* toward the true value, then holds.
+
+    Refinement continues **through flat steps** until the count is unchanged for
+    *stable_steps* consecutive halvings *and* the mesh is genuinely fine
+    (``min(Na, Nb) >= min_resolved``), or a cap (*max_cells* / *max_factor*) is
+    hit. Stopping only on the very first flat step is wrong: a wall thinner than a
+    cell stays *equally* fragmented for a halving or two before it connects, which
+    would otherwise be mistaken for convergence at the coarse (fragmented) count.
+    The ``min_resolved`` floor likewise forbids "converging" while still too coarse
+    to represent the wall. Returns ``(a_nodes_mm, b_nodes_mm, pec2d, eps2d, mu2d)``
+    at the finest mesh reached.
+
+    Returns ``None`` when a mode mesh is unnecessary: no PEC on the plane, or the
+    component count never dropped below the base-resolution count (connectivity is
+    already stable, so the runner's ordinary coarse-slice solve is unchanged).
+    """
+    import numpy as np
+
+    a0, a1, b0, b1 = span_mm
+    span_a, span_b = a1 - a0, b1 - b0
+    ca0, cb0 = base_cell_mm
+    if span_a <= 0.0 or span_b <= 0.0 or ca0 <= 0.0 or cb0 <= 0.0:
+        return None
+
+    best = None
+    best_count = None
+    coarse_count = None
+    stable = 0
+    factor = 1
+    while factor <= max_factor:
+        Na = max(1, int(math.ceil(span_a / (ca0 / factor))))
+        Nb = max(1, int(math.ceil(span_b / (cb0 / factor))))
+        if Na * Nb > max_cells:
+            break  # keep the finest mesh computed so far
+        a_nodes = a0 + np.arange(Na + 1) * (span_a / Na)
+        b_nodes = b0 + np.arange(Nb + 1) * (span_b / Nb)
+        pec2d, eps2d, mu2d = voxelize_port_plane(
+            materials, normal, pos_mm, a_nodes, b_nodes,
+            bg_eps=bg_eps, bg_mu=bg_mu, bg_pec=bg_pec,
+        )
+        count = _label_2d(pec2d)
+        if count == 0:
+            return None  # no PEC on the plane; nothing to preserve
+        if coarse_count is None:
+            coarse_count = count
+        stable = stable + 1 if count == best_count else 0
+        best, best_count = (a_nodes, b_nodes, pec2d, eps2d, mu2d), count
+        if stable >= stable_steps and min(Na, Nb) >= min_resolved:
+            break  # count held across finer meshes at adequate resolution
+        factor *= 2
+
+    if best is None or best_count is None or coarse_count is None:
+        return None
+    # Only worth a fine mode mesh when refinement actually merged fragments; an
+    # already-stable plane keeps today's coarse-slice behaviour (regression-safe).
+    if best_count >= coarse_count:
+        return None
+    return best
+
+
+def _plane_material_span_mm(materials, normal):
+    """Transverse ``(a0, a1, b0, b1)`` world-mm extent of all bodies, slice order.
+
+    The default mode-mesh span when no Session-A bounds rect is set: the plane
+    region actually occupied by geometry, so the fine re-voxelisation concentrates
+    its resolution on the conductors rather than the empty PML pads.
+    """
+    bbox = _combined_bbox(_gather(materials))
+    if bbox is None:
+        return None
+    ax_a, ax_b = _TRANSVERSE_AXES[normal]
+    lo = {"x": bbox.XMin, "y": bbox.YMin, "z": bbox.ZMin}
+    hi = {"x": bbox.XMax, "y": bbox.YMax, "z": bbox.ZMax}
+    return (lo[ax_a], hi[ax_a], lo[ax_b], hi[ax_b])
+
+
+def _port_slice_pos_mm(materials, normal, face_is_high, normal_cell_mm):
+    """World-mm coordinate along *normal* at which to sample the port section.
+
+    A TEM port plane sits on a domain face, which is out in the spacing/PML region
+    where the raw CAD does not reach -- slicing there misses the solid, or hits
+    its exact end face (a floating-point-fragile degenerate slice that catches one
+    end but not the other). Instead sample at the geometry's own boundary-most
+    cross-section nearest the face, nudged just inside off the end face, mirroring
+    how :func:`_extrude_port_faces` copies that cross-section out to the face for
+    the coarse solve. Uses the PEC bodies' extent (the conductors define the
+    guide), falling back to all bodies. ``None`` when there is no geometry.
+    """
+    bbox = _combined_bbox([e for e in _gather(materials) if e[3]]) \
+        or _combined_bbox(_gather(materials))
+    if bbox is None:
+        return None
+    lo = {"x": bbox.XMin, "y": bbox.YMin, "z": bbox.ZMin}[normal]
+    hi = {"x": bbox.XMax, "y": bbox.YMax, "z": bbox.ZMax}[normal]
+    if hi <= lo:
+        return lo  # degenerate (zero-length along the normal): slice on the plane
+    nudge = min(0.25 * normal_cell_mm, 0.49 * (hi - lo))
+    return (hi - nudge) if face_is_high else (lo + nudge)
+
+
 def voxelize_materials(materials, cell_size_m, spacing_m=0.0,
                        pad_lo=(8, 8, 8), pad_hi=(8, 8, 8),
                        extra_points_mm=(), extra_axis_offsets=(),
@@ -563,6 +803,81 @@ def write_materials(workdir, arrays):
     np.savez(os.path.join(workdir, "materials.npz"), **arrays)
 
 
+def _attach_mode_meshes(arrays, dom, port_pairs, materials, cell_size_m,
+                        origin_m, bg_eps, bg_mu, bg_pec):
+    """Attach a ``mode_mesh`` block to each port spec that needs one.
+
+    *port_pairs* is ``[(spec_dict, port_obj), ...]`` for every mode-solved port
+    (TEM sources + SPICE-TEM ports). For each, :func:`build_mode_mesh` decides
+    whether the coarse voxelisation fragments its PEC cross-section; when it does,
+    the fine 2D arrays land in *arrays* as ``modemesh_<i>_{pec,eps,mu}`` and the
+    spec gains ``mode_mesh`` (node coords shifted into the solver frame). Ports
+    whose connectivity is already stable are left untouched (coarse solve).
+    """
+    import numpy as np
+
+    from wavesim_gui import domain as domain_mod
+    from wavesim_gui import tem_source as tem_mod
+
+    mm_index = 0
+    for spec, obj in port_pairs:
+        face = str(getattr(obj, "Face", "z0"))
+        normal = domain_mod.face_axis(face)
+        # Span: the Session-A bounds rect (world mm) if one is selected, else the
+        # transverse extent of the geometry on the plane.
+        rect = tem_mod._bounds_rect_mm(dom, face, getattr(obj, "BoundsSel", None))
+        span_mm = rect if rect is not None else _plane_material_span_mm(
+            materials, normal)
+        if span_mm is None:
+            continue
+        ax_a, ax_b = _TRANSVERSE_AXES[normal]
+        ia, ib = _AXIS_IDX[ax_a], _AXIS_IDX[ax_b]
+        base_cell_mm = (cell_size_m[ia] * _MM_PER_M, cell_size_m[ib] * _MM_PER_M)
+        # Where to sample the CAD cross-section: at the geometry's own end (not
+        # the domain face, which sits in empty spacing/PML), so the slice hits the
+        # solid regardless of which face the port is on.
+        slice_pos_mm = _port_slice_pos_mm(
+            materials, normal, face.endswith("1"),
+            cell_size_m[_AXIS_IDX[normal]] * _MM_PER_M,
+        )
+        if slice_pos_mm is None:
+            continue
+        # NB: no MinCellSize clamp here -- the mode mesh deliberately refines
+        # *below* the (possibly coarsened) FDTD grid to recover connectivity;
+        # max_cells is the only bound.
+        mesh = build_mode_mesh(
+            materials, normal, slice_pos_mm, span_mm, base_cell_mm,
+            bg_eps=bg_eps, bg_mu=bg_mu, bg_pec=bg_pec,
+        )
+        if mesh is None:
+            FreeCAD.Console.PrintLog(
+                "Wavesim: TEM port on {} -- connectivity already stable at the "
+                "grid resolution; no mode mesh.\n".format(face)
+            )
+            continue
+        a_nodes_mm, b_nodes_mm, pec2d, eps2d, mu2d = mesh
+        FreeCAD.Console.PrintMessage(
+            "Wavesim: TEM port on {} -- coarse cross-section fragmented; solving "
+            "the mode on a {}x{} connectivity-preserving fine mesh ({} PEC "
+            "region(s), sampled at {}={:.3f} mm).\n".format(
+                face, pec2d.shape[0], pec2d.shape[1], _label_2d(pec2d),
+                normal, slice_pos_mm,
+            )
+        )
+        key = "modemesh_{}".format(mm_index)
+        spec["mode_mesh"] = {
+            "key": key,
+            "normal": normal,
+            "position": spec["position"],  # already solver frame
+            "a_nodes": [float(v) / _MM_PER_M - origin_m[ia] for v in a_nodes_mm],
+            "b_nodes": [float(v) / _MM_PER_M - origin_m[ib] for v in b_nodes_mm],
+        }
+        arrays[key + "_pec"] = pec2d.astype(np.uint8)
+        arrays[key + "_eps"] = eps2d
+        arrays[key + "_mu"] = mu2d
+        mm_index += 1
+
+
 def build_job_from_document(doc, steps=None, fmax=30.0e9, progress=None):
     """Build a solver job from the active simulation's materials.
 
@@ -657,19 +972,31 @@ def build_job_from_document(doc, steps=None, fmax=30.0e9, progress=None):
     from wavesim_gui import source as source_mod
     from wavesim_gui import spice_port as spice_mod
 
-    tem_sources = [tem_mod.tem_source_spec(t, origin_m)
-                   for t in tem_mod.find_tem_sources(sim)]
+    tem_objs = tem_mod.find_tem_sources(sim)
+    tem_sources = [tem_mod.tem_source_spec(t, origin_m) for t in tem_objs]
 
     # SPICE co-simulation ports (line + TEM); drop any that could not serialise
-    # (e.g. a line port with no curve assigned).
-    spice_ports = [
-        s for s in (
-            [spice_mod.spice_line_port_spec(p, origin_m)
-             for p in spice_mod.find_spice_line_ports(sim)]
-            + [spice_mod.spice_tem_port_spec(p, origin_m)
-               for p in spice_mod.find_spice_tem_ports(sim)]
-        ) if s
-    ]
+    # (e.g. a line port with no curve assigned). The TEM specs are kept paired
+    # with their objects so the mode-mesh pass below can size each port's plane.
+    spice_line_specs = [spice_mod.spice_line_port_spec(p, origin_m)
+                        for p in spice_mod.find_spice_line_ports(sim)]
+    spice_tem_objs = spice_mod.find_spice_tem_ports(sim)
+    spice_tem_specs = [spice_mod.spice_tem_port_spec(p, origin_m)
+                       for p in spice_tem_objs]
+    spice_ports = [s for s in (spice_line_specs + spice_tem_specs) if s]
+
+    # Connectivity-preserving mode mesh (Session B): for every TEM / SPICE-TEM
+    # port whose PEC cross-section fragments at the coarse cell size, attach a
+    # finely re-voxelised transverse plane so the runner solves the mode on a
+    # grid where the conductor count is correct, then interpolates it back onto
+    # the coarse grid to launch. Absent ⇒ the runner solves on the coarse slice.
+    _attach_mode_meshes(
+        vox["arrays"], dom,
+        list(zip(tem_sources, tem_objs))
+        + [(spec, obj) for spec, obj in zip(spice_tem_specs, spice_tem_objs)
+           if spec],
+        materials, cell_size_m, origin_m, bg_eps, bg_mu, bg_pec,
+    )
 
     sources = source_mod.find_sources(sim)
     if sources:

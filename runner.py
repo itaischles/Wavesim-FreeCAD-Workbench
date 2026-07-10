@@ -54,6 +54,11 @@ job.json schema (Session 2)
                        "bounds": [a0,a1,b0,b1], # optional in-plane subset (solver
                                                 # metres, transverse slice order);
                                                 # absent = the whole face
+                       "mode_mesh": {           # optional connectivity-preserving
+                         "key":"modemesh_0",    # fine transverse re-voxelisation
+                         "normal":"z","position":.., # of this plane; arrays live in
+                         "a_nodes":[..],"b_nodes":[..]}, # materials.npz (see below).
+                                                # Absent = solve on the coarse slice
                        "excitation": {"type":.., ...}, "fields":"EH"|"E"}, ...],
                        # legacy entries may carry flat "fmax"/"amplitude" keys
                        # and omit "direction" (defaults to +normal / low face)
@@ -101,6 +106,20 @@ optional ``bounds`` ``[a0,a1,b0,b1]`` (solver metres, transverse slice order)
 confines the mode solve to a sub-rectangle of the face — e.g. one connector's
 cross-section on a plane that cuts several — and is forwarded straight to
 ``solve_tem_modes(bounds=...)``; absent it solves on the whole face.
+
+At the FDTD cell size the voxeliser can shred a continuous PEC on the plane into
+disconnected cells, so ``ndimage.label`` miscounts conductors. When that happens
+the FreeCAD side ships a ``mode_mesh`` block: a finer transverse re-voxelisation
+of *that plane only*, auto-refined until the PEC component count stabilises. Its
+2D arrays travel in ``materials.npz`` as ``<key>_pec`` (uint8), ``<key>_eps`` and
+``<key>_mu`` (float64), shape ``(Na, Nb)`` in ``(a, b)`` transverse slice order.
+The runner (:func:`_mode_mesh_grid`) rebuilds them as a single-cell-thick fine
+grid, solves the mode there (conductor count now correct), and — for a launch —
+interpolates the mode back onto the coarse grid
+(:func:`_interp_coarse_profiles`) as a ``PlaneSource`` (or a rebuilt coarse
+``TEMMode`` for a SPICE port). The FDTD grid is untouched. Absent ⇒ the coarse
+slice is solved as before. ``mode_mesh`` and ``bounds`` are mutually exclusive
+per port: the fine grid already spans exactly the (bounded) box.
 
 SPICE co-simulation ports
 -------------------------
@@ -324,7 +343,120 @@ def _choose_mode(modes, wanted, name):
     return chosen
 
 
-def _solve_all_modes(ws, np, grid, job):
+# In-array slice-to-3D reshaping for a mode mesh: a 2D ``(Na, Nb)`` transverse
+# plane becomes a singleton-thick 3D block along the normal axis, matching how
+# ``mode_solver._slice`` extracts the plane (z→[:,:,k], y→[:,k,:], x→[k,:,:]).
+_MODEMESH_SHAPE = {"z": lambda Na, Nb: (Na, Nb, 1),
+                   "y": lambda Na, Nb: (Na, 1, Nb),
+                   "x": lambda Na, Nb: (1, Na, Nb)}
+
+
+def _mode_mesh_grid(ws, np, mm, material_data):
+    """Build a thin fine rectilinear grid carrying a mode mesh's cross-section.
+
+    A ``mode_mesh`` block (see the job schema) re-voxelises one port plane on a
+    connectivity-preserving fine transverse grid. This turns its 2D ``(Na, Nb)``
+    ``pec``/``eps``/``mu`` arrays (shipped in ``materials.npz`` under
+    ``<key>_pec``/``_eps``/``_mu``) into a single-cell-thick 3D grid normal to the
+    port, so :func:`wavesim.solve_tem_modes` runs on the fine cross-section where
+    the conductor count is correct. Returns the ``FDTDGrid``.
+    """
+    key = mm["key"]
+    normal = mm["normal"]
+    a_nodes = np.asarray(mm["a_nodes"], dtype=np.float64)
+    b_nodes = np.asarray(mm["b_nodes"], dtype=np.float64)
+    pec2d = np.ascontiguousarray(material_data[key + "_pec"]).astype(bool)
+    eps2d = np.ascontiguousarray(material_data[key + "_eps"], dtype=np.float64)
+    mu2d = np.ascontiguousarray(material_data[key + "_mu"], dtype=np.float64)
+    Na, Nb = pec2d.shape
+    position = float(mm["position"])
+
+    # One thin cell along the normal, centred on the plane; its thickness is
+    # immaterial to the purely transverse (2D) mode solve, so use a representative
+    # transverse spacing.
+    h = float(min(np.diff(a_nodes).min(), np.diff(b_nodes).min()))
+    norm_nodes = np.array([position - 0.5 * h, position + 0.5 * h], dtype=np.float64)
+    axes = {"z": (a_nodes, b_nodes, norm_nodes),
+            "y": (a_nodes, norm_nodes, b_nodes),
+            "x": (norm_nodes, a_nodes, b_nodes)}[normal]
+    grid_f = ws.set_vacuum(ws.create_grid_rectilinear(*axes))
+
+    shape3 = _MODEMESH_SHAPE[normal](Na, Nb)
+    eps3, mu3, pec3 = eps2d.reshape(shape3), mu2d.reshape(shape3), pec2d.reshape(shape3)
+    grid_f = ws.set_material_arrays(grid_f, eps3, eps3, eps3, mu3, mu3, mu3,
+                                    pec_mask=pec3)
+    return grid_f
+
+
+def _interp_coarse_profiles(np, mode, grid, fields):
+    """Resample a fine-grid mode's E/H profiles onto the coarse grid's plane.
+
+    A mode solved on the fine mode mesh must be launched on the coarse FDTD grid.
+    Each requested transverse field component is interpolated from the fine cell
+    centres onto the coarse grid's plane cell centres with a
+    :class:`RegularGridInterpolator` (zero outside the fine span), yielding a
+    ``{component: 2D-array}`` shaped like the coarse ``mode.normal``-slice — the
+    form :class:`wavesim.PlaneSource` (and a rebuilt coarse mode) expect.
+    """
+    from scipy.interpolate import RegularGridInterpolator
+
+    ta = mode.transverse_axes
+    a_nodes = np.asarray(mode.a_nodes, dtype=np.float64)
+    b_nodes = np.asarray(mode.b_nodes, dtype=np.float64)
+    a_c = 0.5 * (a_nodes[:-1] + a_nodes[1:])
+    b_c = 0.5 * (b_nodes[:-1] + b_nodes[1:])
+    a_coarse = _axis_centers(grid, ta[0])
+    b_coarse = _axis_centers(grid, ta[1])
+    CA, CB = np.meshgrid(a_coarse, b_coarse, indexing="ij")
+    query = np.stack([CA.ravel(), CB.ravel()], axis=-1)
+    out_shape = (a_coarse.size, b_coarse.size)
+
+    def _one(arr2d):
+        f = RegularGridInterpolator(
+            (a_c, b_c), np.asarray(arr2d, dtype=np.float64),
+            bounds_error=False, fill_value=0.0,
+        )
+        return f(query).reshape(out_shape)
+
+    profiles = {}
+    if "E" in fields:
+        for comp, arr in mode.E.items():
+            profiles[comp] = _one(arr)
+    if "H" in fields:
+        for comp, arr in mode.H.items():
+            profiles[comp] = _one(arr)
+    return profiles
+
+
+def _coarse_mode_from_fine(ws, np, mode, grid):
+    """Rebuild a fine mode mesh's mode as a coarse-grid :class:`TEMMode`.
+
+    A :class:`SpicePort` compiles its mode into a lumped-port kernel against the
+    *coarse* FDTD grid (:meth:`TEMMode.build_port_kernel`), so a fine-grid mode
+    cannot be handed to it directly — its cell indices reference the fine grid.
+    This produces an equivalent coarse-grid mode: the transverse E/H profiles are
+    resampled onto the coarse plane and the per-unit-length parameters carried
+    over unchanged (``phi``/``pec`` are unused by the port kernel, so left zero).
+    """
+    profs = _interp_coarse_profiles(np, mode, grid, "EH")
+    E = {c: a for c, a in profs.items() if c.startswith("E")}
+    H = {c: a for c, a in profs.items() if c.startswith("H")}
+    ta = mode.transverse_axes
+    slice_shape = (_axis_centers(grid, ta[0]).size, _axis_centers(grid, ta[1]).size)
+    return ws.TEMMode(
+        normal=mode.normal, position=mode.position,
+        slice_index=grid.axis_index(mode.normal, mode.position),
+        transverse_axes=ta, da=mode.da, db=mode.db,
+        phi=np.zeros(slice_shape, dtype=np.float64), E=E, H=H,
+        pec=np.zeros(slice_shape, dtype=bool), conductor_id=mode.conductor_id,
+        a_nodes=np.asarray(_axis_nodes(grid, ta[0]), dtype=np.float64),
+        b_nodes=np.asarray(_axis_nodes(grid, ta[1]), dtype=np.float64),
+        capacitance=mode.capacitance, inductance=mode.inductance,
+        impedance=mode.impedance, v_phase=mode.v_phase, eps_eff=mode.eps_eff,
+    )
+
+
+def _solve_all_modes(ws, np, grid, job, material_data=None):
     """Solve the TEM modes of every TEM-source and SPICE-TEM-port plane.
 
     Returns ``(plane_sources, spice_modes, mode_arrays, mode_meta)``:
@@ -337,6 +469,12 @@ def _solve_all_modes(ws, np, grid, job):
     * ``mode_arrays`` — the 2D field profiles for ``results.npz``
       (``mode_<si>_<mi>_phi`` / ``_pec`` / ``_E_<comp>``).
     * ``mode_meta`` — per-mode metadata for ``summary["modes"]``.
+
+    When an entry carries a ``mode_mesh`` block (and *material_data*, the loaded
+    ``materials.npz``, holds its arrays) the mode is solved on a thin fine grid
+    built from that connectivity-preserving re-voxelisation instead of the coarse
+    slice, then interpolated back onto *grid* to launch; otherwise the historical
+    coarse-slice solve (honouring any ``bounds``) runs.
     """
     mode_only = bool(job.get("mode_only", False))
 
@@ -376,23 +514,40 @@ def _solve_all_modes(ws, np, grid, job):
                 fmax = float(exc_spec.get("fmax", t.get("fmax", 0.0)))
             fields = t.get("fields", "EH")
 
+        # A connectivity-preserving mode mesh re-voxelises this plane on a fine
+        # transverse grid so the conductor count is right (the coarse cell size
+        # can shred one PEC into several cells). Solve there when present; the
+        # solved mode is interpolated back onto the coarse grid to launch.
+        mm = t.get("mode_mesh")
+        use_mesh = mm is not None and material_data is not None
+
         prefix = "Port {}/{}: ".format(si + 1, n_ports) if n_ports > 1 else ""
         _emit_status(
             "{}solving TEM mode on the {}-plane of '{}'\n"
-            "(factorising the {}x{}x{} cross-section; this scales with grid "
+            "({}factorising the cross-section; this scales with grid "
             "size)...".format(
-                prefix, normal, name, grid.Nx, grid.Ny, grid.Nz
+                prefix, normal, name,
+                "connectivity-preserving fine mesh; " if use_mesh else "",
             )
         )
-        # Optional in-plane bounds (solver-frame metres, transverse slice order):
-        # confine the mode solve to a sub-rectangle of the face. Absent => whole
-        # face, the historical behaviour.
-        bounds = t.get("bounds")
-        modes = ws.solve_tem_modes(
-            grid, normal=normal, position=position,
-            bounds=tuple(bounds) if bounds else None,
-            compute_params=True,
-        )
+        if use_mesh:
+            # The fine grid already spans exactly the (bounded) box, so no
+            # ``bounds`` is passed — the whole fine plane is the solve region.
+            solve_grid = _mode_mesh_grid(ws, np, mm, material_data)
+            modes = ws.solve_tem_modes(
+                solve_grid, normal=normal, position=position, compute_params=True,
+            )
+        else:
+            # Optional in-plane bounds (solver-frame metres, transverse slice
+            # order): confine the mode solve to a sub-rectangle of the face.
+            # Absent => whole face, the historical behaviour.
+            solve_grid = grid
+            bounds = t.get("bounds")
+            modes = ws.solve_tem_modes(
+                grid, normal=normal, position=position,
+                bounds=tuple(bounds) if bounds else None,
+                compute_params=True,
+            )
         _emit_status(
             "{}found {} TEM mode(s); building field profiles...".format(
                 prefix, len(modes)
@@ -412,11 +567,13 @@ def _solve_all_modes(ws, np, grid, job):
             # axes rather than assuming a constant da/db spacing.
             t_axes = list(getattr(mode, "transverse_axes", []))
             if len(t_axes) == 2:
+                # From the grid the mode was solved on (the fine mesh when used),
+                # so the results plot shows the true mode resolution.
                 mode_arrays[key + "_ca"] = np.asarray(
-                    _axis_centers(grid, t_axes[0]), dtype=np.float64
+                    _axis_centers(solve_grid, t_axes[0]), dtype=np.float64
                 )
                 mode_arrays[key + "_cb"] = np.asarray(
-                    _axis_centers(grid, t_axes[1]), dtype=np.float64
+                    _axis_centers(solve_grid, t_axes[1]), dtype=np.float64
                 )
             mode_meta.append({
                 "source_index": si, "mode_index": mi, "name": name,
@@ -439,14 +596,25 @@ def _solve_all_modes(ws, np, grid, job):
         chosen = _choose_mode(modes, int(t.get("conductor_id", 0)), name)
         if kind == "spice":
             # Hand the chosen mode to _build_spice_ports; the circuit drives it.
-            spice_modes[spice_index] = chosen
+            # A fine-mesh mode is rebuilt on the coarse grid first, since the
+            # SpicePort compiles its kernel against the coarse FDTD grid.
+            spice_modes[spice_index] = (
+                _coarse_mode_from_fine(ws, np, chosen, grid) if use_mesh else chosen
+            )
             continue
 
         # TEM source: launch the chosen mode as a directional plane source. It is
         # normalised to a 1 V drive, so the temporal waveform carries the
-        # amplitude and ``to_source`` is left at unit scale.
+        # amplitude and ``to_source`` is left at unit scale. A fine-mesh mode is
+        # resampled onto the coarse plane first (its profiles live on the fine
+        # grid); otherwise ``to_source`` places the coarse-slice profiles directly.
         waveform = _build_waveform(ws, t)
-        src = chosen.to_source(waveform, amplitude=1.0, fields=fields)
+        if use_mesh:
+            profiles = _interp_coarse_profiles(np, chosen, grid, fields)
+            src = ws.PlaneSource(waveform, axis=normal, position=position,
+                                 profiles=profiles)
+        else:
+            src = chosen.to_source(waveform, amplitude=1.0, fields=fields)
         # ``to_source`` builds H = (n̂ × E)/η for +normal propagation, so the
         # wave always flows toward +normal. A port on a high face launches
         # *into* the domain along -normal (direction < 0): flip H to reverse the
@@ -610,10 +778,14 @@ def run_job(workdir):
     grid = ws.set_vacuum(grid)
 
     # Optional voxelised materials (Session 3+). Absent in the Session 2 slice.
+    # ``material_data`` is kept for the mode solve: a port's ``mode_mesh`` block
+    # loads its fine ``modemesh_*`` arrays from here.
     materials_path = os.path.join(workdir, "materials.npz")
     voxel_summary = {}
+    material_data = None
     if os.path.isfile(materials_path):
         data = np.load(materials_path)
+        material_data = data
         pec_mask = data["pec_mask"] if "pec_mask" in data.files else None
         # Cast to the grid's dtype so the field and material arrays stay
         # matched — the CUDA backend keys its per-cell arithmetic and scalar
@@ -638,7 +810,7 @@ def run_job(workdir):
     # setup so the solved modes can be launched as directional plane sources
     # (and so a mode-only request can return without building the time loop).
     plane_sources, spice_modes, mode_arrays, mode_meta = _solve_all_modes(
-        ws, np, grid, job
+        ws, np, grid, job, material_data
     )
 
     if job.get("mode_only", False):

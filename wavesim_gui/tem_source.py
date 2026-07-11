@@ -53,7 +53,7 @@ from wavesim_gui import excitation as exc
 
 _WB_DIR = os.path.join(FreeCAD.getUserAppDataDir(), "Mod", "wavesim-workbench")
 _RESOURCES_DIR = os.path.join(_WB_DIR, "Resources")
-_TEM_ICON = os.path.join(_RESOURCES_DIR, "port.png")
+_TEM_ICON = os.path.join(_RESOURCES_DIR, "tem_port.png")
 
 _TYPE_PROP = "WavesimType"
 _TEM_TYPE = "TEMSource"

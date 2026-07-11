@@ -50,6 +50,8 @@ from wavesim_gui import tem_source as tem_mod
 _WB_DIR = os.path.join(FreeCAD.getUserAppDataDir(), "Mod", "wavesim-workbench")
 _RESOURCES_DIR = os.path.join(_WB_DIR, "Resources")
 _ICON = os.path.join(_RESOURCES_DIR, "port.png")
+_SPICE_TEM_PORT_ICON = os.path.join(_RESOURCES_DIR, "spice_tem_port.png")
+_SPICE_LINE_PORT_ICON = os.path.join(_RESOURCES_DIR, "spice_line_port.png")
 
 _TYPE_PROP = "WavesimType"
 _LINE_TYPE = "SpiceLinePort"
@@ -570,7 +572,7 @@ if _GUI_AVAILABLE:
             return mode
 
         def getIcon(self):
-            return _ICON
+            return _SPICE_LINE_PORT_ICON
 
         # -- Sketch assignment via drag & drop (mirrors path monitors) ------ #
 
@@ -628,7 +630,7 @@ if _GUI_AVAILABLE:
         """Teal launch plane (reused from the TEM source), editing this port."""
 
         def getIcon(self):
-            return _ICON
+            return _SPICE_TEM_PORT_ICON
 
         def setEdit(self, vobj, mode=0):
             _open_tem_panel(vobj.Object)
@@ -924,7 +926,7 @@ if _GUI_AVAILABLE:
 
         def GetResources(self):
             return {
-                "Pixmap": _ICON,
+                "Pixmap": _SPICE_LINE_PORT_ICON,
                 "MenuText": "Add SPICE Line Port",
                 "ToolTip": "Add a lumped port across a gap, coupled in lockstep "
                 "to a user ngspice netlist (SPICE co-simulation)",
@@ -961,7 +963,7 @@ if _GUI_AVAILABLE:
 
         def GetResources(self):
             return {
-                "Pixmap": _ICON,
+                "Pixmap": _SPICE_TEM_PORT_ICON,
                 "MenuText": "Add SPICE TEM Port",
                 "ToolTip": "Add a TEM waveguide-port plane coupled in lockstep "
                 "to a user ngspice netlist (SPICE co-simulation)",

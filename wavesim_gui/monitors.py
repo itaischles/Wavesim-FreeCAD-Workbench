@@ -55,6 +55,11 @@ _RESOURCES_DIR = os.path.join(_WB_DIR, "Resources")
 # mesh.png is otherwise unused (the old Grid object was merged into Domain), so
 # it serves as the shared monitor icon.
 _MONITOR_ICON = os.path.join(_RESOURCES_DIR, "mesh.png")
+_SNAPSHOT_MONITOR_ICON = os.path.join(_RESOURCES_DIR, "snapshot_monitor.png")
+_VOLTAGE_MONITOR_ICON = os.path.join(_RESOURCES_DIR, "voltage_monitor.png")
+_CURRENT_MONITOR_ICON = os.path.join(_RESOURCES_DIR, "current_monitor.png")
+_FIELD_PROBE_ICON = os.path.join(_RESOURCES_DIR, "field_probe.png")
+_ENERGY_MONITOR_ICON = os.path.join(_RESOURCES_DIR, "energy_monitor.png")
 
 # Marker property, mirroring the other entities' identity scheme so the object is
 # recognisable before its Python proxy is re-attached on reload.
@@ -701,7 +706,7 @@ if _GUI_AVAILABLE:
             return mode
 
         def getIcon(self):
-            return _MONITOR_ICON
+            return _FIELD_PROBE_ICON
 
         def setEdit(self, vobj, mode=0):
             _open_probe_panel(vobj.Object)
@@ -813,7 +818,7 @@ if _GUI_AVAILABLE:
             return mode
 
         def getIcon(self):
-            return _MONITOR_ICON
+            return _SNAPSHOT_MONITOR_ICON
 
         def setEdit(self, vobj, mode=0):
             _open_snapshot_panel(vobj.Object)
@@ -847,7 +852,7 @@ if _GUI_AVAILABLE:
             self.Object = vobj.Object
 
         def getIcon(self):
-            return _MONITOR_ICON
+            return _ENERGY_MONITOR_ICON
 
         def dumps(self):
             return None
@@ -1183,7 +1188,7 @@ if _GUI_AVAILABLE:
 
         def GetResources(self):
             return {
-                "Pixmap": _MONITOR_ICON,
+                "Pixmap": _FIELD_PROBE_ICON,
                 "MenuText": "Add Probe",
                 "ToolTip": "Add a point field probe that records a field value "
                 "over time",
@@ -1218,7 +1223,7 @@ if _GUI_AVAILABLE:
 
         def GetResources(self):
             return {
-                "Pixmap": _MONITOR_ICON,
+                "Pixmap": _SNAPSHOT_MONITOR_ICON,
                 "MenuText": "Add Snapshot",
                 "ToolTip": "Add a snapshot monitor capturing a 2D field slice "
                 "every N steps",
@@ -1255,7 +1260,7 @@ if _GUI_AVAILABLE:
 
         def GetResources(self):
             return {
-                "Pixmap": _MONITOR_ICON,
+                "Pixmap": _ENERGY_MONITOR_ICON,
                 "MenuText": "Add Energy Monitor",
                 "ToolTip": "Record the total electromagnetic energy in the "
                 "domain over time",
@@ -1331,7 +1336,7 @@ if _GUI_AVAILABLE:
 
         def GetResources(self):
             return {
-                "Pixmap": _MONITOR_ICON,
+                "Pixmap": _VOLTAGE_MONITOR_ICON,
                 "MenuText": "Add Voltage Monitor",
                 "ToolTip": "Record the voltage V(t) = ∫E·dl along an open "
                 "sketch curve (drag the sketch onto the monitor in the tree)",
@@ -1350,7 +1355,7 @@ if _GUI_AVAILABLE:
 
         def GetResources(self):
             return {
-                "Pixmap": _MONITOR_ICON,
+                "Pixmap": _CURRENT_MONITOR_ICON,
                 "MenuText": "Add Current Monitor",
                 "ToolTip": "Record the current I(t) = ∮H·dl around a closed "
                 "sketch curve (drag the sketch onto the monitor in the tree)",

@@ -48,6 +48,7 @@ from wavesim_gui import excitation as exc
 _WB_DIR = os.path.join(FreeCAD.getUserAppDataDir(), "Mod", "wavesim-workbench")
 _RESOURCES_DIR = os.path.join(_WB_DIR, "Resources")
 _SOURCE_ICON = os.path.join(_RESOURCES_DIR, "port.png")
+_POINT_SOURCE_ICON = os.path.join(_RESOURCES_DIR, "point_source.png")
 
 # Marker property, mirroring the other entities' identity scheme so the object is
 # recognisable before its Python proxy is re-attached on reload.
@@ -674,7 +675,7 @@ if _GUI_AVAILABLE:
 
         def GetResources(self):
             return {
-                "Pixmap": _SOURCE_ICON,
+                "Pixmap": _POINT_SOURCE_ICON,
                 "MenuText": "Add Point Source",
                 "ToolTip": "Add a soft point source with a selectable temporal "
                 "excitation (Gaussian, sine, rectangular, Gaussian+sine)",

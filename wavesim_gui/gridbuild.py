@@ -322,13 +322,15 @@ def build_axis_nodes(snaps, lo, hi, coarse, ratio, pad_lo, pad_hi, min_cell=0.0,
 # Domain-level entry point
 # --------------------------------------------------------------------------- #
 
-def build_domain_nodes(sim, domain):
+def build_domain_nodes(sim, domain, force_pml_faces=()):
     """Snapped, graded ``(NodesX, NodesY, NodesZ)`` (world mm) for *domain*.
 
     Uses the material geometry bounds (grown for sources/monitors, via
     ``combined_bbox_mm``) as the inner region, the Domain's ``Dx/Dy/Dz`` as the
     coarse (background) interior target, its ``MaxGradingRatio`` as the grading
-    bound and the per-face PML padding from ``domain_grid_params``. Each material
+    bound and the per-face PML padding from ``domain_grid_params``. *force_pml_faces*
+    (the TEM-port launch faces) is forwarded so their PML pad is present in the
+    node arrays even if the face is set to PEC, matching the run's boundary. Each material
     body additionally refines its own band down to its per-medium resolution (see
     :func:`collect_material_caps`), so higher-index regions are meshed finer than
     the void. Returns ``None`` when there is no geometry to bound (the caller
@@ -346,7 +348,7 @@ def build_domain_nodes(sim, domain):
     if bbox is None:
         return None
 
-    params = domain_mod.domain_grid_params(domain)
+    params = domain_mod.domain_grid_params(domain, force_pml_faces=force_pml_faces)
     sp_mm = params["spacing_m"] * _MM_PER_M
     pad_lo, pad_hi = params["pad_lo"], params["pad_hi"]
     coarse_mm = tuple(c * _MM_PER_M for c in domain_mod.cell_sizes_m(domain))

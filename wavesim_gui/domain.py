@@ -234,7 +234,11 @@ class DomainObject:
             obj.NodesX = obj.NodesY = obj.NodesZ = []
             return
 
-        params = domain_grid_params(obj)
+        # TEM-port launch faces are forced to PML here too (not just at run) so
+        # the drawn box and the node arrays include the absorber padding that the
+        # run's boundary assumes -- keeping the non-uniform grid consistent.
+        force_faces = tem_port_faces(sim)
+        params = domain_grid_params(obj, force_pml_faces=force_faces)
         sp_mm = params["spacing_m"] * _MM_PER_M
         pad_lo, pad_hi = params["pad_lo"], params["pad_hi"]
         dx, dy, dz = (c * _MM_PER_M for c in cell_sizes_m(obj))
@@ -262,7 +266,9 @@ class DomainObject:
         if getattr(obj, "UseNonuniformGrid", False):
             from wavesim_gui import gridbuild
             try:
-                nodes = gridbuild.build_domain_nodes(sim, obj)
+                nodes = gridbuild.build_domain_nodes(
+                    sim, obj, force_pml_faces=force_faces
+                )
             except Exception as exc:  # never let meshing break the recompute
                 FreeCAD.Console.PrintWarning(
                     "Wavesim: non-uniform grid build failed ({}); "
@@ -322,6 +328,45 @@ def background_material(domain):
     if domain is None:
         return None
     return getattr(domain, "Background", None)
+
+
+def tem_port_faces(sim):
+    """Domain faces (``'x0'``..``'z1'``) carrying a TEM or SPICE-TEM port.
+
+    A waveguide port launches a guided mode and must absorb it, so these faces
+    are forced to PML everywhere the grid is built (the drawn box, the node
+    arrays, and the run) regardless of the Domain's per-face setting -- otherwise
+    a face left (or set) to PEC would both trap the mode and, on a non-uniform
+    grid, desync the node arrays (no PML pad) from the forced boundary (crash).
+    Lazy imports avoid a circular import with the port modules; empty on failure.
+    """
+    if sim is None:
+        return []
+    faces = []
+    try:
+        from wavesim_gui import tem_source as tem_mod
+        faces += [str(t.Face) for t in tem_mod.find_tem_sources(sim)]
+    except Exception:
+        pass
+    try:
+        from wavesim_gui import spice_port as spice_mod
+        faces += [str(p.Face) for p in spice_mod.find_spice_tem_ports(sim)]
+    except Exception:
+        pass
+    return faces
+
+
+def material_is_vacuum(mat):
+    """True if *mat* is a plain vacuum medium (eps == mu == 1, not PEC).
+
+    Used by the Domain panel so it does not offer a synthetic "Vacuum" background
+    entry alongside a real Vacuum material (every new simulation seeds one) --
+    that material *is* the vacuum choice.
+    """
+    if mat is None or bool(getattr(mat, "Pec", False)):
+        return False
+    return (abs(float(getattr(mat, "Eps", 1.0)) - 1.0) < 1.0e-9
+            and abs(float(getattr(mat, "Mu", 1.0)) - 1.0) < 1.0e-9)
 
 
 def cell_sizes_m(obj):
@@ -512,16 +557,24 @@ def time_steps_for(domain, max_time_s):
     return max(1, int(math.ceil(max_time_s / dt)))
 
 
-def domain_grid_params(domain):
+def domain_grid_params(domain, force_pml_faces=()):
     """Map a domain's per-face boundary settings to grid/solver parameters.
 
     Returns a dict with ``spacing_m``, ``pad_lo``/``pad_hi`` (per-axis PML cells),
     ``pml_faces``, ``pec_faces`` and ``d_pml``. This is the one place the per-face
     properties are interpreted, so the drawn boxes, the voxelised grid and the
     runner all agree.
+
+    *force_pml_faces* names faces (``'x0'``..``'z1'``) that must be PML no matter
+    what the per-face property says -- TEM waveguide ports pass their launch faces
+    so a face left (or set) to PEC still absorbs the launched mode, with its PML
+    padding and boundary condition kept consistent (both derived from ``bc`` here).
     """
     d_pml = int(getattr(domain, "PMLThickness", 8))
     bc = {face: getattr(domain, prop) for face, prop, _doc in _FACE_PROPS}
+    for face in force_pml_faces or ():
+        if face in bc:
+            bc[face] = "PML"
 
     pml_faces = [f for f in _FACES if bc.get(f) == "PML"]
     pec_faces = [f for f in _FACES if bc.get(f) == "PEC"]
@@ -965,24 +1018,34 @@ if _GUI_AVAILABLE:
             self._dpml.setValue(int(getattr(obj, "PMLThickness", 8)))
 
             # Background (empty-voxel) material: a dropdown of the simulation's
-            # materials, with a leading vacuum entry for "unset". Index 0 maps to
-            # None (vacuum); index i maps to self._materials[i - 1].
+            # materials. ``self._bg_values`` runs parallel to the combo items,
+            # each mapping to a Material (or None = vacuum). A synthetic "Vacuum"
+            # entry is offered *only* when no real vacuum material exists, so the
+            # seeded Vacuum material isn't duplicated by a second vacuum choice.
             from wavesim_gui.commands import active_simulation
             from wavesim_gui import materials as materials_mod
 
             sim = active_simulation(obj.Document)
             self._materials = materials_mod.find_materials(sim) if sim else []
             self._background = QtWidgets.QComboBox()
-            self._background.addItem("Vacuum (eps=1, mu=1)")
+            self._bg_values = []
+            if not any(material_is_vacuum(m) for m in self._materials):
+                self._background.addItem("Vacuum (eps=1, mu=1)")
+                self._bg_values.append(None)
             for mat in self._materials:
                 self._background.addItem(mat.Label)
+                self._bg_values.append(mat)
             current_bg = getattr(obj, "Background", None)
-            bg_index = 0
-            for i, mat in enumerate(self._materials, start=1):
-                if mat is current_bg:
-                    bg_index = i
-                    break
-            self._background.setCurrentIndex(bg_index)
+            if current_bg in self._bg_values:
+                bg_index = self._bg_values.index(current_bg)
+            else:
+                # Unset (or a stale link): default to the vacuum material if there
+                # is one, else the synthetic vacuum entry (index 0).
+                bg_index = next(
+                    (i for i, m in enumerate(self._bg_values)
+                     if material_is_vacuum(m)), 0
+                )
+            self._background.setCurrentIndex(max(0, bg_index))
 
             layout.addRow(self._cubic)
             layout.addRow("Cell size dx:", self._dx)
@@ -1044,14 +1107,17 @@ if _GUI_AVAILABLE:
             for w in (self._dx, self._dy, self._dz, self._ratio, self._min_cell,
                       self._spacing):
                 w.valueChanged.connect(self._live_apply)
-            self._cpw.valueChanged.connect(self._live_apply)
             self._dpml.valueChanged.connect(self._live_apply)
-            # Toggling the grid mode / cubic-cells changes the mesh too, so apply
-            # after the enable/disable handlers have run.
+            # The resolution, background medium and grid mode all change the
+            # frequency-driven cell size, so they re-derive it and apply
+            # immediately (see _auto_fill_cell_size) -- no need to press the
+            # "Default from max frequency" button after each. The enable/disable
+            # handlers are connected first so they run before the re-derive.
+            self._cpw.valueChanged.connect(self._auto_fill_cell_size)
             self._nonuniform.toggled.connect(self._on_nonuniform)
-            self._nonuniform.toggled.connect(self._live_apply)
+            self._nonuniform.toggled.connect(self._auto_fill_cell_size)
             self._cubic.toggled.connect(self._live_apply)
-            self._background.currentIndexChanged.connect(self._live_apply)
+            self._background.currentIndexChanged.connect(self._auto_fill_cell_size)
             first_prop = self._bc_order[0]
             for prop, combo in self._combos.items():
                 if prop == first_prop:
@@ -1179,12 +1245,16 @@ if _GUI_AVAILABLE:
                 obj.MinCellSize = "{} mm".format(self._min_cell.value())
             obj.Spacing = "{} mm".format(self._spacing.value())
             obj.PMLThickness = int(self._dpml.value())
-            bg_index = self._background.currentIndex()
-            obj.Background = (
-                None if bg_index == 0 else self._materials[bg_index - 1]
-            )
+            obj.Background = self._selected_background()
             for prop, combo in self._combos.items():
                 setattr(obj, prop, combo.currentText())
+
+        def _selected_background(self):
+            """The Material (or None = vacuum) chosen in the background combo."""
+            idx = self._background.currentIndex()
+            if 0 <= idx < len(self._bg_values):
+                return self._bg_values[idx]
+            return None
 
         def _restore(self):
             """Restore the pre-edit state captured in :meth:`_snapshot`."""
@@ -1212,27 +1282,19 @@ if _GUI_AVAILABLE:
             self.obj.Document.recompute()
             self._counts.setText(self._counts_text())
 
-        def _apply_default_cell_size(self):
-            """Fill dx/dy/dz from the simulation's max frequency.
+        def _default_cell_size_mm(self):
+            """Cubic cell size (mm) from the max frequency, or None if it's unset.
 
-            Uses the live cells-per-wavelength spin box (not yet committed) and
-            the simulation's materials to compute a uniform cubic cell size, then
-            forces cubic cells so all three axes get the resolved size. In
-            non-uniform mode the filled size is the coarse *background* resolution
-            (the snapper refines each material below it by its index); in uniform
-            mode it is the global-finest size a single spacing needs.
+            Uses the live (uncommitted) cells-per-wavelength and background
+            selections. In non-uniform mode the size is the coarse *background*
+            resolution (the snapper refines each material below it by its index);
+            in uniform mode it is the global-finest size a single spacing needs.
             """
-            try:
-                from PySide import QtWidgets
-            except ImportError:
-                from PySide import QtGui as QtWidgets
             from wavesim_gui.commands import active_simulation
 
             sim = active_simulation(self.obj.Document)
             if self._nonuniform.isChecked():
-                # Coarse target = the (uncommitted) background medium's resolution.
-                bg_index = self._background.currentIndex()
-                bg = self._materials[bg_index - 1] if bg_index > 0 else None
+                bg = self._selected_background()
                 eps_bg = float(getattr(bg, "Eps", 1.0)) if bg is not None else 1.0
                 mu_bg = float(getattr(bg, "Mu", 1.0)) if bg is not None else 1.0
                 size_m = wavelength_cell_size_m(
@@ -1242,18 +1304,48 @@ if _GUI_AVAILABLE:
                 size_m = default_cell_size_m(
                     sim, cells_per_wavelength=self._cpw.value()
                 )
-            if size_m is None:
+            return None if size_m is None else size_m * _MM_PER_M
+
+        def _fill_cell_size(self, size_mm):
+            """Set cubic cells to *size_mm* on all three axes (via the cubic path)."""
+            self._cubic.setChecked(True)
+            self._dx.setValue(size_mm)
+            self._mirror_cubic()
+
+        def _auto_fill_cell_size(self, *_):
+            """Re-derive the cell size from the max frequency and apply at once.
+
+            Wired to every input that changes the frequency-driven default (the
+            resolution, the background medium, the uniform/non-uniform toggle) so
+            the mesh tracks them immediately -- pressing "Default from max
+            frequency" is never required. Silent when the max frequency is unset
+            (it just applies the other edits). Manual dx/dy/dz edits are left
+            alone, so a hand-picked cell size survives until one of these inputs
+            changes.
+            """
+            if self._initializing:
+                return
+            size_mm = self._default_cell_size_mm()
+            if size_mm is not None:
+                self._fill_cell_size(size_mm)
+            self._live_apply()
+
+        def _apply_default_cell_size(self):
+            """Button handler: fill dx/dy/dz from the max frequency (warn if unset)."""
+            try:
+                from PySide import QtWidgets
+            except ImportError:
+                from PySide import QtGui as QtWidgets
+
+            size_mm = self._default_cell_size_mm()
+            if size_mm is None:
                 QtWidgets.QMessageBox.warning(
                     Gui.getMainWindow(), "Wavesim Domain",
                     "Set a positive max frequency on the Simulation first "
                     "(double-click the Simulation object).",
                 )
                 return
-            size_mm = size_m * _MM_PER_M
-            # Cubic cells: set dx and mirror to dy/dz through the cubic path.
-            self._cubic.setChecked(True)
-            self._dx.setValue(size_mm)
-            self._mirror_cubic()
+            self._fill_cell_size(size_mm)
             self._update_counts()
 
         def accept(self):

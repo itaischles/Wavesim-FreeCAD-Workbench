@@ -124,6 +124,9 @@ class SimulationContainer:
             obj.setEditorMode("MaxTime", 1)
         if hasattr(obj, "MaxFrequency"):
             obj.setEditorMode("MaxFrequency", 1)
+        # Documents created before the Domain was ordered first still have it
+        # after the child groups; hoist it so it sits directly under Simulation.
+        _ensure_domain_first(obj)
 
     def execute(self, obj):
         # Pure container; nothing to recompute.
@@ -156,6 +159,28 @@ def active_simulation(doc):
         if getattr(obj, _TYPE_PROP, None) == _SIM_TYPE:
             return obj
     return None
+
+
+def _ensure_domain_first(sim):
+    """Reorder *sim*'s children so the Domain is the first (top) entry.
+
+    New simulations create the Domain before the child groups, so it already
+    leads; this fixes up older documents where it trails the Materials/Sources/
+    Monitors groups. Idempotent and a no-op when there is no Domain yet; guarded
+    so a reorder that a FreeCAD build disallows can never break restore.
+    """
+    if sim is None:
+        return
+    try:
+        from wavesim_gui import domain as domain_mod
+
+        group = list(getattr(sim, "Group", []) or [])
+        domain = next((c for c in group if domain_mod.is_domain(c)), None)
+        if domain is None or group[0] is domain:
+            return
+        sim.Group = [domain] + [c for c in group if c is not domain]
+    except Exception:
+        pass
 
 
 def max_frequency_hz(sim):
@@ -414,15 +439,17 @@ if _GUI_AVAILABLE:
                 if sim.ViewObject is not None:
                     SimulationViewProvider(sim.ViewObject)
 
+                # The domain is a singleton created with the simulation; it
+                # starts empty and auto-sizes once material geometry is assigned.
+                # Created first so it sits immediately below the Simulation in the
+                # tree (above the Materials/Sources/Monitors groups).
+                from wavesim_gui import domain as domain_mod
+                domain = domain_mod.create_domain(doc, sim)
+
                 for name in _CHILD_GROUPS:
                     grp = doc.addObject("App::DocumentObjectGroup", name)
                     grp.Label = name
                     sim.addObject(grp)
-
-                # The domain is a singleton created with the simulation; it
-                # starts empty and auto-sizes once material geometry is assigned.
-                from wavesim_gui import domain as domain_mod
-                domain = domain_mod.create_domain(doc, sim)
 
                 # Seed the two materials nearly every simulation needs, and make
                 # Vacuum the domain's default background (empty-voxel) medium.

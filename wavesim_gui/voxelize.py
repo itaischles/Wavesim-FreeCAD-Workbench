@@ -224,15 +224,19 @@ def _grid_extent(bbox, cell_mm, spacing_mm, pad_lo, pad_hi):
 def _sizing_for(sim, default_padding):
     """Resolve ``(spacing_m, pad_lo, pad_hi, domain)`` for *sim*.
 
-    Uses the Domain object's spacing and per-face PML padding when one exists;
-    otherwise falls back to the legacy uniform ``default_padding`` cells on every
-    side with no air spacing (so a document without a domain runs as before).
+    Uses the Domain object's spacing and per-face PML padding when one exists
+    (with TEM-port faces forced to PML, matching the drawn box and the run so the
+    derived cell counts include the port-face absorber padding); otherwise falls
+    back to the legacy uniform ``default_padding`` cells on every side with no air
+    spacing (so a document without a domain runs as before).
     """
     from wavesim_gui import domain as domain_mod
 
     dom = domain_mod.find_domain(sim) if sim else None
     if dom is not None:
-        p = domain_mod.domain_grid_params(dom)
+        p = domain_mod.domain_grid_params(
+            dom, force_pml_faces=domain_mod.tem_port_faces(sim)
+        )
         return p["spacing_m"], p["pad_lo"], p["pad_hi"], dom
     pad = (default_padding, default_padding, default_padding)
     return 0.0, pad, pad, None
@@ -923,16 +927,20 @@ def build_job_from_document(doc, steps=None, fmax=30.0e9, progress=None):
         steps = domain_mod.time_steps_for(dom, max_time_s) or 800
 
     from wavesim_gui import tem_source as tem_mod
-
-    spacing_m, pad_lo, pad_hi, _dom = _sizing_for(sim, 8)
-    # TEM-port faces have their cross-section extruded through the spacing + PML
-    # so the guided mode exits the absorber without re-reflecting back inside.
     from wavesim_gui import spice_port as spice_mod
 
+    # TEM (and SPICE-TEM) port faces launch a guided mode and must absorb it, so
+    # force them to PML regardless of the Domain's per-face setting -- a face left
+    # (or later set) to PEC would trap the launched mode. ``force_pml_faces`` makes
+    # the grid padding *and* the emitted boundary (below) both treat these faces
+    # as PML, so they stay consistent. Their cross-section is also extruded through
+    # the spacing + PML cells so the mode exits the absorber without re-reflecting.
     port_faces = [str(t.Face) for t in tem_mod.find_tem_sources(sim)]
-    # SPICE TEM ports launch a guided mode too, so extrude their cross-sections
-    # through the absorber as well.
     port_faces += [str(p.Face) for p in spice_mod.find_spice_tem_ports(sim)]
+
+    grid_params = domain_mod.domain_grid_params(dom, force_pml_faces=port_faces)
+    spacing_m = grid_params["spacing_m"]
+    pad_lo, pad_hi = grid_params["pad_lo"], grid_params["pad_hi"]
     # Background (empty-voxel) medium: the Domain's chosen background Material,
     # defaulting to vacuum when unset.
     bg_mat = domain_mod.background_material(dom)
@@ -1013,16 +1021,14 @@ def build_job_from_document(doc, steps=None, fmax=30.0e9, progress=None):
             "amplitude": 1.0,
         }
 
-    # Boundary: from the Domain's per-face settings when one exists, else the
-    # legacy auto heuristic (in-plane faces for a thin domain, all six otherwise;
-    # no PEC walls).
+    # Boundary: from the Domain's per-face settings when one exists (with TEM-port
+    # faces already forced to PML in ``grid_params`` above, so their padding and
+    # boundary condition agree), else the legacy auto heuristic (in-plane faces for
+    # a thin domain, all six otherwise; no PEC walls).
     if dom is not None:
-        from wavesim_gui import domain as domain_mod
-
-        p = domain_mod.domain_grid_params(dom)
-        pml_faces = p["pml_faces"]
-        pec_faces = p["pec_faces"]
-        d_pml = p["d_pml"]
+        pml_faces = grid_params["pml_faces"]
+        pec_faces = grid_params["pec_faces"]
+        d_pml = grid_params["d_pml"]
     else:
         if Nz == 1:
             pml_faces = ["x0", "x1", "y0", "y1"]

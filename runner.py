@@ -86,7 +86,10 @@ results.npz holds the recorded monitor series (e.g. ``energy_times`` /
 ``energy_values``); summary.json holds scalar run metadata (dt, steps, wall
 time, grid dims, voxel counts, final energy). Each snapshot also stores its two
 in-plane node/edge coordinate arrays (``snapshot_<idx>_edges0`` / ``_edges1``,
-metres, solver frame) and each TEM mode its two transverse cell-centre
+metres, solver frame). The saved frames and edges are **cropped to the domain
+interior** -- the PML padding cells on both in-plane axes are stripped so the
+animation/export shows only the physical region. Each TEM mode stores its two
+transverse cell-centre
 coordinate arrays (``mode_<si>_<mi>_ca`` / ``_cb``), so the workbench draws them
 on the real grid (uniform or non-uniform) instead of assuming a constant cell
 size.
@@ -1002,18 +1005,35 @@ def run_job(workdir):
     # Snapshots: a stack of frames (n_frames, N_axis1, N_axis2) plus their times.
     # Also save the two in-plane node (edge) coordinate arrays (metres, solver
     # frame) so the results plot honours non-uniform spacing via pcolormesh.
+    d_pml = int(boundary.get("d_pml", 10))
+    pml_set = set(pml_faces)
+
+    def _interior_pad(axis):
+        """PML cell counts (lo, hi) to strip off *axis* ('x'/'y'/'z')."""
+        return (
+            d_pml if (axis + "0") in pml_set else 0,
+            d_pml if (axis + "1") in pml_set else 0,
+        )
+
     snapshot_meta = []
     for idx, (name, mon) in enumerate(snapshots):
         if mon.snapshots:
-            result_arrays["snapshot_{}_data".format(idx)] = np.asarray(mon.snapshots)
-            result_arrays["snapshot_{}_times".format(idx)] = np.asarray(mon.snap_times)
+            data = np.asarray(mon.snapshots)
             ax0, ax1 = _INPLANE_AXES.get(getattr(mon, "normal", "z"), ("x", "y"))
-            result_arrays["snapshot_{}_edges0".format(idx)] = np.asarray(
-                _axis_nodes(grid, ax0), dtype=np.float64
-            )
-            result_arrays["snapshot_{}_edges1".format(idx)] = np.asarray(
-                _axis_nodes(grid, ax1), dtype=np.float64
-            )
+            edges0 = np.asarray(_axis_nodes(grid, ax0), dtype=np.float64)
+            edges1 = np.asarray(_axis_nodes(grid, ax1), dtype=np.float64)
+            # Crop the PML padding off both in-plane axes so the saved frames (and
+            # the animation/export built from them) show only the domain interior.
+            (lo0, hi0), (lo1, hi1) = _interior_pad(ax0), _interior_pad(ax1)
+            n0, n1 = data.shape[1], data.shape[2]
+            if lo0 + hi0 < n0 and lo1 + hi1 < n1:
+                data = data[:, lo0:n0 - hi0, lo1:n1 - hi1]
+                edges0 = edges0[lo0:n0 - hi0 + 1]
+                edges1 = edges1[lo1:n1 - hi1 + 1]
+            result_arrays["snapshot_{}_data".format(idx)] = data
+            result_arrays["snapshot_{}_times".format(idx)] = np.asarray(mon.snap_times)
+            result_arrays["snapshot_{}_edges0".format(idx)] = edges0
+            result_arrays["snapshot_{}_edges1".format(idx)] = edges1
         snapshot_meta.append({
             "name": name, "component": mon.component,
             "frames": len(mon.snapshots),

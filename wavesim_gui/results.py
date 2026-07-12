@@ -794,17 +794,24 @@ if _GUI_AVAILABLE:
         # vertical with a lower-left origin. Equal aspect so a square physical
         # extent renders square rather than stretched to fill the axes.
         if use_mesh:
-            # pcolormesh honours non-uniform edge spacing; C is (Ny, Nx) so pass
-            # the transposed frame against (xedges, yedges).
+            # Gouraud shading interpolates smoothly between cell centres (rather
+            # than drawing flat cells), so it takes centre coordinates matching
+            # C's shape -- not the N+1 edge arrays. C is (Ny, Nx), the transposed
+            # frame against (xcenters, ycenters). Non-uniform spacing is honoured.
+            xe = np.asarray(xedges)
+            ye = np.asarray(yedges)
+            xcenters = 0.5 * (xe[:-1] + xe[1:])
+            ycenters = 0.5 * (ye[:-1] + ye[1:])
             artist = ax.pcolormesh(
-                np.asarray(xedges), np.asarray(yedges),
-                np.asarray(frames[0]).T, cmap=cmap, norm=_make_norm(False),
+                xcenters, ycenters, np.asarray(frames[0]).T,
+                cmap=cmap, norm=_make_norm(False), shading="gouraud",
             )
             ax.set_aspect("equal")
         else:
             artist = ax.imshow(
                 np.asarray(frames[0]).T, origin="lower", extent=extent,
                 cmap=cmap, norm=_make_norm(False), aspect="equal",
+                interpolation="bilinear",
             )
 
         def _set_frame_data(idx):

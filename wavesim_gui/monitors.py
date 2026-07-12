@@ -43,6 +43,7 @@ import os
 
 import FreeCAD
 
+from wavesim_gui import units
 from wavesim_gui.commands import active_simulation
 
 
@@ -179,7 +180,12 @@ class SnapshotObject:
                            default), 'YZ' (perpendicular to x) or 'XZ' (to y).
         ``Offset``      -- position (mm, world) of the slice plane along its
                            normal axis.
-        ``EveryNSteps`` -- record a frame every this many time steps.
+        ``RecordInterval`` -- record a frame every this much simulated time
+                           (seconds, SI). The primary control; the step count is
+                           derived from it and the grid's CFL time step.
+        ``EveryNSteps`` -- record a frame every this many time steps (derived
+                           from ``RecordInterval``; the fallback when no grid /
+                           interval is set, and the value emitted to the solver).
 
     Hidden ``Corners`` carries the plane's four world-mm corners for the view
     provider; ``execute`` keeps them in sync with the domain bounds, the plane
@@ -217,9 +223,20 @@ class SnapshotObject:
         if not hasattr(obj, "EveryNSteps"):
             obj.addProperty(
                 "App::PropertyInteger", "EveryNSteps", "Monitor",
-                "Record a frame every this many time steps",
+                "Record a frame every this many time steps (derived from "
+                "RecordInterval)",
             )
             obj.EveryNSteps = 20
+        if not hasattr(obj, "RecordInterval"):
+            # Seconds (SI). The recording cadence in real time; the step count is
+            # derived from it and the grid's CFL step at edit/job-build time so it
+            # stays fixed if the grid (and therefore dt) changes. 0 = unset (fall
+            # back to EveryNSteps).
+            obj.addProperty(
+                "App::PropertyFloat", "RecordInterval", "Monitor",
+                "Record a frame every this much simulated time (seconds)",
+            )
+            obj.RecordInterval = 0.0
 
         # Plane corners (hidden, four world-mm points) for the view provider.
         if not hasattr(obj, "Corners"):
@@ -496,11 +513,56 @@ def probe_spec(probe, origin_m):
     }
 
 
+def snapshot_dt_s(sim):
+    """The grid's CFL time step (seconds) for *sim*, or 0.0 when unavailable.
+
+    Snapshots record every so-many time steps; this is what converts a real-time
+    recording interval into that step count (and back for display).
+    """
+    from wavesim_gui import domain as domain_mod
+
+    dom = domain_mod.find_domain(sim) if sim is not None else None
+    if dom is None:
+        return 0.0
+    try:
+        return float(domain_mod.cfl_dt(dom))
+    except Exception:
+        return 0.0
+
+
+def steps_for_interval(interval_s, dt_s):
+    """Number of time steps closest to *interval_s* at CFL step *dt_s*.
+
+    Returns 0 when either is non-positive (the caller then falls back to the
+    stored ``EveryNSteps``).
+    """
+    if interval_s <= 0.0 or dt_s <= 0.0:
+        return 0
+    return max(1, int(round(interval_s / dt_s)))
+
+
+def snapshot_every_n(snap, sim=None):
+    """Resolve *snap*'s record cadence to a step count for the solver.
+
+    Derived from ``RecordInterval`` (real time) and the current grid's CFL step
+    when both are available; otherwise the stored ``EveryNSteps`` fallback.
+    """
+    if sim is None:
+        sim = active_simulation(snap.Document)
+    interval = float(getattr(snap, "RecordInterval", 0.0))
+    steps = steps_for_interval(interval, snapshot_dt_s(sim))
+    if steps <= 0:
+        steps = max(1, int(getattr(snap, "EveryNSteps", 20)))
+    return steps
+
+
 def snapshot_spec(snap, origin_m):
     """Return the ``job.json`` snapshot dict for *snap* in the solver frame.
 
     ``normal`` is the slice's normal axis ('x'/'y'/'z'); ``position`` is the
     plane's offset along that axis, in the solver frame (origin subtracted).
+    ``every_N_steps`` is derived from the real-time ``RecordInterval`` and the
+    current grid's CFL step (see :func:`snapshot_every_n`).
     """
     plane = str(snap.Plane)
     normal = _PLANE_NORMAL.get(plane, "z")
@@ -511,7 +573,7 @@ def snapshot_spec(snap, origin_m):
         "component": _solver_component(snap.Component),
         "normal": normal,
         "position": float(snap.Offset.Value) / _MM_PER_M - origin_along,
-        "every_N_steps": max(1, int(getattr(snap, "EveryNSteps", 20))),
+        "every_N_steps": snapshot_every_n(snap),
     }
 
 
@@ -628,9 +690,15 @@ def _snapshot_label(obj):
     plane = str(getattr(obj, "Plane", "XY"))
     axis = _PLANE_OFFSET_AXIS.get(plane, "z")
     off_mm = float(obj.Offset.Value) if hasattr(obj, "Offset") else 0.0
+    interval = float(getattr(obj, "RecordInterval", 0.0))
+    sim = active_simulation(obj.Document)
+    if interval > 0.0 and sim is not None:
+        unit = units.get_time_unit(sim)
+        every = "{:g} {}".format(units.time_from_si(interval, unit), unit)
+    else:
+        every = "{} steps".format(int(getattr(obj, "EveryNSteps", 20)))
     return "Snapshot ({} {} @ {}={:g} mm, every {})".format(
-        getattr(obj, "Component", "Ez"), plane, axis, off_mm,
-        int(getattr(obj, "EveryNSteps", 20)),
+        getattr(obj, "Component", "Ez"), plane, axis, off_mm, every,
     )
 
 
@@ -1077,28 +1145,42 @@ if _GUI_AVAILABLE:
             self._offset.setSingleStep(0.5)
             self._offset.setValue(float(obj.Offset.Value))
 
-            self._every = QtWidgets.QSpinBox()
-            self._every.setRange(1, 1_000_000)
-            self._every.setSuffix(" time steps")
-            self._every.setValue(int(getattr(obj, "EveryNSteps", 20)))
+            # Recording cadence entered as real (simulated) time in the sim's
+            # display unit; the equivalent step count is derived from the grid's
+            # CFL step and shown live.
+            sim = active_simulation(obj.Document)
+            self._time_unit = units.get_time_unit(sim)
+            self._dt_s = snapshot_dt_s(sim)
+            self._interval = QtWidgets.QDoubleSpinBox()
+            self._interval.setRange(0.0, 1.0e12)
+            self._interval.setDecimals(6)
+            self._interval.setSuffix(" " + self._time_unit)
+            self._interval.setSingleStep(0.1)
+            self._interval.setValue(self._initial_interval_display(obj))
 
             layout.addRow("Field quantity:", self._component)
             layout.addRow("Slice plane:", self._plane)
             self._offset_label = QtWidgets.QLabel()
             layout.addRow(self._offset_label, self._offset)
-            layout.addRow("Record every:", self._every)
+            layout.addRow("Record every:", self._interval)
+            self._steps_label = QtWidgets.QLabel()
+            layout.addRow("Time steps:", self._steps_label)
 
             info = QtWidgets.QLabel(
                 "The snapshot captures a 2D slice of the chosen field quantity on "
-                "the selected plane, offset along its normal axis, every N time "
-                "steps. The recorded frames feed the snapshot animation in the "
-                "results view."
+                "the selected plane, offset along its normal axis. It records a "
+                "frame every 'Record every' of simulated time; the equivalent "
+                "number of time steps is computed from the grid's CFL time step. "
+                "The recorded frames feed the snapshot animation in the results "
+                "view."
             )
             info.setWordWrap(True)
             layout.addRow(info)
 
             self._plane.currentTextChanged.connect(self._update_offset_label)
             self._update_offset_label(self._plane.currentText())
+            self._interval.valueChanged.connect(self._update_steps)
+            self._update_steps()
 
             # Live-update the slice plane in the 3D view as the plane orientation
             # or offset change, rather than only on OK.
@@ -1106,6 +1188,28 @@ if _GUI_AVAILABLE:
             self._plane.currentTextChanged.connect(self._live_plane)
 
             self.form = form
+
+        def _initial_interval_display(self, obj):
+            """Recording interval to pre-fill, in the display time unit.
+
+            Uses the stored ``RecordInterval`` (seconds) when set; otherwise
+            derives an equivalent from the legacy ``EveryNSteps`` and the grid's
+            CFL step so existing snapshots open showing a sensible time.
+            """
+            interval_s = float(getattr(obj, "RecordInterval", 0.0))
+            if interval_s <= 0.0 and self._dt_s > 0.0:
+                interval_s = int(getattr(obj, "EveryNSteps", 20)) * self._dt_s
+            return units.time_from_si(interval_s, self._time_unit)
+
+        def _update_steps(self, *_):
+            si = units.time_to_si(self._interval.value(), self._time_unit)
+            steps = steps_for_interval(si, self._dt_s)
+            if steps > 0:
+                self._steps_label.setText("{:,}".format(steps))
+            elif self._dt_s <= 0.0:
+                self._steps_label.setText("(set a grid cell size)")
+            else:
+                self._steps_label.setText("(set a record interval)")
 
         def _update_offset_label(self, plane):
             axis = _PLANE_OFFSET_AXIS.get(str(plane), "z")
@@ -1130,7 +1234,13 @@ if _GUI_AVAILABLE:
             self.obj.Component = self._component.currentText()
             self.obj.Plane = self._plane.currentText()
             self.obj.Offset = "{} mm".format(self._offset.value())
-            self.obj.EveryNSteps = int(self._every.value())
+            interval_s = units.time_to_si(self._interval.value(), self._time_unit)
+            self.obj.RecordInterval = interval_s
+            # Keep the derived step count in sync so it stays a sensible fallback
+            # (and the value emitted to the solver) even if the grid later changes.
+            steps = steps_for_interval(interval_s, self._dt_s)
+            if steps > 0:
+                self.obj.EveryNSteps = steps
             self.obj.Label = _snapshot_label(self.obj)
             doc.commitTransaction()
             doc.recompute()
@@ -1226,7 +1336,7 @@ if _GUI_AVAILABLE:
                 "Pixmap": _SNAPSHOT_MONITOR_ICON,
                 "MenuText": "Add Snapshot",
                 "ToolTip": "Add a snapshot monitor capturing a 2D field slice "
-                "every N steps",
+                "at a chosen time interval",
             }
 
         def Activated(self):

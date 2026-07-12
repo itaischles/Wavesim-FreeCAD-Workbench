@@ -585,11 +585,123 @@ def _port_slice_pos_mm(materials, normal, face_is_high, normal_cell_mm):
     return (hi - nudge) if face_is_high else (lo + nudge)
 
 
+# --------------------------------------------------------------------------- #
+# Subpixel smoothing of dielectric interfaces (see wavesim_gui.subpixel)
+#
+# The plain sweep above snaps a material boundary to whole cells (staircasing),
+# which drops the FDTD to first-order accuracy off-grid and makes derived
+# quantities jump as geometry is nudged by sub-cell amounts. When enabled, a
+# dielectric body is instead *fine-sampled* over its bounding-box sub-block and
+# reduced to an anisotropic effective permittivity (the diagonal Kottke tensor),
+# anti-staircasing the boundary cells. PEC stays binary -- a perfect conductor is
+# a hard field constraint, not a material average.
+# --------------------------------------------------------------------------- #
+
+def _cell_span(nodes_mm, lo, hi, margin=1):
+    """Half-open coarse cell range ``[a, b)`` whose cells overlap ``[lo, hi]``.
+
+    ``nodes_mm`` are the ``N+1`` cell edges (world mm). Grown by *margin* cells on
+    each side (so boundary cells keep valid fine-gradient neighbours for the
+    normal estimate) and clamped to ``[0, N]``. Works on a non-uniform grid.
+    """
+    import numpy as np
+
+    ncell = len(nodes_mm) - 1
+    left = nodes_mm[:-1]
+    right = nodes_mm[1:]
+    overlap = np.nonzero((right > lo) & (left < hi))[0]
+    if overlap.size == 0:
+        # Shape falls between cell edges -- still touch the nearest cell.
+        c = int(np.clip(np.searchsorted(nodes_mm, 0.5 * (lo + hi)) - 1,
+                        0, ncell - 1))
+        return max(0, c - margin), min(ncell, c + 1 + margin)
+    a = max(0, int(overlap[0]) - margin)
+    b = min(ncell, int(overlap[-1]) + 1 + margin)
+    return a, b
+
+
+def _smooth_dielectric_body(arrays, body_shape, eps_r, mu_r,
+                            nodes_mm, span, oversample, on_layer=None):
+    """Subpixel-smooth one dielectric body into ``eps_x/y/z`` (+ mu) in place.
+
+    *span* is ``((ia, ib), (ja, jb), (ka, kb))`` -- the half-open coarse sub-block
+    covering the body's bbox (plus margin) from :func:`_cell_span`. The body is
+    fine-sampled at *oversample* ``(ox, oy, oz)`` sub-cells per coarse cell per
+    axis (one OCC section per fine Z sub-layer, matplotlib point-in-polygon over
+    the fine XY sub-centres), then reduced with
+    :func:`wavesim_gui.subpixel.reduce_fine_eps` to a diagonal effective tensor.
+
+    The **background** inside the block is the current ``eps_x`` there, so bodies
+    compose in placement order (mirrors the solver's repeated
+    ``smooth_shape_region`` calls). ``mu_r != 1`` is applied by volume-fraction
+    averaging; a dielectric that majority-covers a cell clears a PEC background.
+    ``on_layer()`` is called once per fine Z sub-layer (progress + cancellation);
+    a truthy return raises :class:`VoxelizationCancelled`.
+    """
+    import numpy as np
+
+    from wavesim_gui import subpixel as sp
+
+    nx_mm, ny_mm, nz_mm = nodes_mm
+    (ia, ib), (ja, jb), (ka, kb) = span
+    ox, oy, oz = sp.as_triplet(oversample)
+
+    xf = sp.fine_axis(nx_mm, ox, ia, ib)
+    yf = sp.fine_axis(ny_mm, oy, ja, jb)
+    zf = sp.fine_axis(nz_mm, oz, ka, kb)
+
+    # Chord tolerance for the fine section polygons: a quarter of the smallest
+    # fine sub-cell width, so curves are tracked well below sub-cell resolution.
+    def _min_sub(nodes, o, a, b):
+        w = np.diff(nodes[a:b + 1])
+        return (float(w.min()) / o) if w.size else 1.0
+
+    df = min(_min_sub(nx_mm, ox, ia, ib), _min_sub(ny_mm, oy, ja, jb))
+    deflection = max(0.25 * df, df * 1.0e-6)
+
+    Z_AXIS = FreeCAD.Vector(0.0, 0.0, 1.0)
+    gx, gy = np.meshgrid(xf, yf, indexing="ij")
+    pts = np.column_stack([gx.ravel(), gy.ravel()])
+    shape2d = (xf.size, yf.size)
+    inside_fine = np.zeros((xf.size, yf.size, zf.size), dtype=bool)
+    for kz in range(zf.size):
+        layer = _layer_inside(body_shape, Z_AXIS, float(zf[kz]), pts, deflection)
+        if layer is not None and layer.any():
+            inside_fine[:, :, kz] = layer.reshape(shape2d)
+        if on_layer is not None and on_layer():
+            raise VoxelizationCancelled()
+
+    # Fine permittivity field: the body's eps where inside, else the existing
+    # (background) eps of the covering coarse cell, tiled to the sub-grid.
+    bg = arrays["eps_x"][ia:ib, ja:jb, ka:kb]
+    bg_fine = np.repeat(np.repeat(np.repeat(bg, ox, axis=0), oy, axis=1),
+                        oz, axis=2)
+    eps_fine = np.where(inside_fine, float(eps_r), bg_fine)
+    ex, ey, ez = sp.reduce_fine_eps(eps_fine, (ox, oy, oz))
+    arrays["eps_x"][ia:ib, ja:jb, ka:kb] = ex
+    arrays["eps_y"][ia:ib, ja:jb, ka:kb] = ey
+    arrays["eps_z"][ia:ib, ja:jb, ka:kb] = ez
+
+    frac = sp.block_mean(inside_fine.astype(np.float64), (ox, oy, oz))
+    if mu_r != 1.0:
+        for key in ("mu_x", "mu_y", "mu_z"):
+            mu_bg = arrays[key][ia:ib, ja:jb, ka:kb]
+            arrays[key][ia:ib, ja:jb, ka:kb] = (
+                frac * float(mu_r) + (1.0 - frac) * mu_bg
+            )
+    # A dielectric body clears a PEC background where it majority-covers a cell
+    # (matching the coarse centre-inside rule to within half a cell).
+    covered = frac >= 0.5
+    if covered.any():
+        sub = arrays["pec_mask"][ia:ib, ja:jb, ka:kb]
+        sub[covered] = False
+
+
 def voxelize_materials(materials, cell_size_m, spacing_m=0.0,
                        pad_lo=(8, 8, 8), pad_hi=(8, 8, 8),
                        extra_points_mm=(), extra_axis_offsets=(),
                        port_faces=(), bg_eps=1.0, bg_mu=1.0, bg_pec=False,
-                       nodes_m=None,
+                       nodes_m=None, subpixel=False, oversample=4,
                        max_total_cells=10_000_000, progress=None):
     """Voxelise *materials* onto a regular grid bounding all their bodies.
 
@@ -630,6 +742,18 @@ def voxelize_materials(materials, cell_size_m, spacing_m=0.0,
         a regular grid is derived from *cell_size_m* + the bounds, exactly as
         before. Cell centres are always ``0.5*(nodes[:-1]+nodes[1:])``, so the
         two paths coincide bit-for-bit on a uniform grid.
+    subpixel : bool
+        When True, each **dielectric** body is placed with subpixel smoothing:
+        its boundary cells receive the anisotropic effective permittivity from
+        :func:`wavesim_gui.subpixel.reduce_fine_eps` instead of being snapped to
+        whole cells (anti-staircasing; ~2nd-order accuracy; smooth variation with
+        geometry). PEC bodies are unaffected (a hard field constraint, not a
+        material average). When False (default) every body is snapped as before
+        and ``eps_x == eps_y == eps_z``.
+    oversample : int or (int, int, int)
+        Sub-samples per cell per axis used when ``subpixel=True`` (default 4).
+        Higher is more accurate but costs ``O(oversample^3)`` setup memory/time
+        per body's bounding box.
     bg_eps, bg_mu, bg_pec : float / float / bool
         The background medium filling every "empty" voxel -- the eps/mu/PEC of
         the Domain's chosen background Material (vacuum: ``1.0, 1.0, False``).
@@ -696,9 +820,29 @@ def voxelize_materials(materials, cell_size_m, spacing_m=0.0,
 
     shape = (Nx, Ny, Nz)
     # Start every voxel as the background medium; bodies overwrite their cells.
-    eps_arr = np.full(shape, float(bg_eps), dtype=np.float64)
-    mu_arr = np.full(shape, float(bg_mu), dtype=np.float64)
+    # eps/mu are per-axis (diagonal) from the outset so subpixel smoothing can
+    # make boundary cells anisotropic; with smoothing off the three stay equal
+    # (bit-for-bit the old single-array behaviour).
+    eps_x = np.full(shape, float(bg_eps), dtype=np.float64)
+    eps_y = np.full(shape, float(bg_eps), dtype=np.float64)
+    eps_z = np.full(shape, float(bg_eps), dtype=np.float64)
+    mu_x = np.full(shape, float(bg_mu), dtype=np.float64)
+    mu_y = np.full(shape, float(bg_mu), dtype=np.float64)
+    mu_z = np.full(shape, float(bg_mu), dtype=np.float64)
     pec_mask = np.full(shape, bool(bg_pec), dtype=bool)
+    arrays = {
+        "eps_x": eps_x, "eps_y": eps_y, "eps_z": eps_z,
+        "mu_x": mu_x, "mu_y": mu_y, "mu_z": mu_z,
+        "pec_mask": pec_mask,
+    }
+
+    # Subpixel oversampling factors (only used for dielectric bodies when on).
+    if subpixel:
+        from wavesim_gui import subpixel as _sp
+
+        ovr = _sp.as_triplet(oversample)
+    else:
+        ovr = (1, 1, 1)
 
     Z_AXIS = FreeCAD.Vector(0.0, 0.0, 1.0)
     tol = min(dx_mm, dy_mm, dz_mm) * 1.0e-6
@@ -728,13 +872,42 @@ def voxelize_materials(materials, cell_size_m, spacing_m=0.0,
         i_idx = cell_range(bb.XMin, bb.XMax, xs)
         j_idx = cell_range(bb.YMin, bb.YMax, ys)
         k_idx = cell_range(bb.ZMin, bb.ZMax, zs)
-        plans.append((body_shape, eps, mu, pec, i_idx, j_idx, k_idx))
-        total_layers += len(k_idx)
+        # Dielectric bodies are subpixel-smoothed when the option is on; PEC is
+        # always snapped (a hard field constraint, not a material average).
+        smooth = bool(subpixel) and not pec
+        span = None
+        if smooth:
+            span = (
+                _cell_span(nx_mm, bb.XMin, bb.XMax),
+                _cell_span(ny_mm, bb.YMin, bb.YMax),
+                _cell_span(nz_mm, bb.ZMin, bb.ZMax),
+            )
+            # Fine Z sub-layers swept over the (margin-grown) sub-block.
+            (ka, kb) = span[2]
+            n_layers = ovr[2] * (kb - ka)
+        else:
+            n_layers = len(k_idx)
+        plans.append((body_shape, eps, mu, pec, i_idx, j_idx, k_idx, smooth, span))
+        total_layers += n_layers
 
     done_layers = 0
     if progress is not None:
         progress(0, total_layers)
-    for body_shape, eps, mu, pec, i_idx, j_idx, k_idx in plans:
+    for body_shape, eps, mu, pec, i_idx, j_idx, k_idx, smooth, span in plans:
+        if smooth:
+            # Subpixel dielectric: fine-sample the body over its bbox sub-block
+            # and reduce to an anisotropic effective permittivity (in place).
+            def _on_layer():
+                nonlocal done_layers
+                done_layers += 1
+                return bool(progress is not None
+                            and progress(done_layers, total_layers))
+
+            _smooth_dielectric_body(
+                arrays, body_shape, eps, mu, nodes_mm, span, ovr,
+                on_layer=_on_layer,
+            )
+            continue
         if len(i_idx) == 0 or len(j_idx) == 0 or len(k_idx) == 0:
             continue
         # XY cell centres for this body's bbox, flattened to an (M, 2) point list
@@ -751,19 +924,18 @@ def voxelize_materials(materials, cell_size_m, spacing_m=0.0,
                 if pec:
                     pec_mask[gi, gj, k] = True
                 else:
-                    eps_arr[gi, gj, k] = eps
-                    mu_arr[gi, gj, k] = mu
+                    eps_x[gi, gj, k] = eps
+                    eps_y[gi, gj, k] = eps
+                    eps_z[gi, gj, k] = eps
+                    mu_x[gi, gj, k] = mu
+                    mu_y[gi, gj, k] = mu
+                    mu_z[gi, gj, k] = mu
                     # A dielectric body overrides a PEC background at its cells.
                     pec_mask[gi, gj, k] = False
             done_layers += 1
             if progress is not None and progress(done_layers, total_layers):
                 raise VoxelizationCancelled()
 
-    arrays = {
-        "eps_x": eps_arr, "eps_y": eps_arr.copy(), "eps_z": eps_arr.copy(),
-        "mu_x": mu_arr, "mu_y": mu_arr.copy(), "mu_z": mu_arr.copy(),
-        "pec_mask": pec_mask,
-    }
     # Extend each TEM-port cross-section through its spacing + PML cells so a
     # guided mode stays supported into the absorber (modifies arrays in place;
     # done before the counts below so they reflect the extruded geometry).
@@ -792,7 +964,7 @@ def voxelize_materials(materials, cell_size_m, spacing_m=0.0,
         "grid": grid_dict,
         "origin_m": (ox / _MM_PER_M, oy / _MM_PER_M, oz / _MM_PER_M),
         "counts": {
-            "dielectric_cells": int(np.count_nonzero(eps_arr != float(bg_eps))),
+            "dielectric_cells": int(np.count_nonzero(eps_x != float(bg_eps))),
             "pec_cells": int(np.count_nonzero(pec_mask)),
         },
     }
@@ -956,6 +1128,10 @@ def build_job_from_document(doc, steps=None, fmax=30.0e9, progress=None):
         candidate = domain_mod.node_coords_m(dom)
         if all(len(a) >= 2 for a in candidate):
             nodes_m = candidate
+    # Subpixel smoothing of dielectric interfaces: on unless the Simulation
+    # container's checkbox is cleared (default True, and True for legacy
+    # documents that predate the property).
+    subpixel = bool(getattr(sim, "SubpixelSmoothing", True))
     # Grow the grid to include every source position and snapshot slice, so an
     # input outside the material bounds (or in the PML) still lands inside it.
     vox = voxelize_materials(
@@ -964,7 +1140,7 @@ def build_job_from_document(doc, steps=None, fmax=30.0e9, progress=None):
         extra_axis_offsets=snapshot_axis_offsets(sim),
         port_faces=port_faces,
         bg_eps=bg_eps, bg_mu=bg_mu, bg_pec=bg_pec,
-        nodes_m=nodes_m,
+        nodes_m=nodes_m, subpixel=subpixel,
         progress=progress,
     )
     grid = vox["grid"]

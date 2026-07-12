@@ -114,6 +114,19 @@ class SimulationContainer:
             obj.MaxFrequency = 1.0e9  # 1 GHz
             obj.setEditorMode("MaxFrequency", 1)  # read-only; edit through panel
 
+        # Subpixel smoothing of dielectric interfaces: when on, the voxeliser
+        # anti-staircases each dielectric body's boundary cells with an
+        # anisotropic effective permittivity (Kottke/Meep averaging) instead of
+        # snapping to whole cells -- ~2nd-order accuracy and smooth variation of
+        # results with geometry. On by default; edited via the Simulation panel.
+        if not hasattr(obj, "SubpixelSmoothing"):
+            obj.addProperty(
+                "App::PropertyBool", "SubpixelSmoothing", "Run",
+                "Anti-staircase dielectric interfaces with an anisotropic "
+                "effective permittivity (subpixel smoothing). PEC is unaffected.",
+            )
+            obj.SubpixelSmoothing = True
+
     def onDocumentRestored(self, obj):
         # Re-assert the back-reference after a reload.
         obj.Proxy = self
@@ -310,11 +323,27 @@ if _GUI_AVAILABLE:
 
             self._steps = QtWidgets.QLabel()
 
+            # Subpixel smoothing of dielectric interfaces (on by default). True
+            # for legacy documents that predate the property.
+            self._subpixel = QtWidgets.QCheckBox(
+                "Subpixel smoothing of dielectric interfaces"
+            )
+            self._subpixel.setChecked(
+                bool(getattr(obj, "SubpixelSmoothing", True))
+            )
+            self._subpixel.setToolTip(
+                "Anti-staircase off-grid dielectric boundaries with an "
+                "anisotropic effective permittivity, restoring ~2nd-order "
+                "accuracy and smooth variation of results with geometry. PEC "
+                "conductors are unaffected."
+            )
+
             layout.addRow("Time unit:", self._time)
             layout.addRow("Frequency unit:", self._freq)
             layout.addRow("Max simulation time:", self._max_time)
             layout.addRow("Max frequency:", self._max_freq)
             layout.addRow("Time steps:", self._steps)
+            layout.addRow(self._subpixel)
 
             info = QtWidgets.QLabel(
                 "The simulation runs until the maximum time is reached. The "
@@ -371,6 +400,14 @@ if _GUI_AVAILABLE:
             self.obj.MaxTime = units.time_to_si(
                 self._max_time.value(), self._time_unit
             )
+            if not hasattr(self.obj, "SubpixelSmoothing"):
+                self.obj.addProperty(
+                    "App::PropertyBool", "SubpixelSmoothing", "Run",
+                    "Anti-staircase dielectric interfaces with an anisotropic "
+                    "effective permittivity (subpixel smoothing). PEC is "
+                    "unaffected.",
+                )
+            self.obj.SubpixelSmoothing = self._subpixel.isChecked()
             new_max_freq = units.freq_to_si(self._max_freq.value(), self._freq_unit)
             self.obj.MaxFrequency = new_max_freq
             # The max frequency drives the default cell size, so when it changes

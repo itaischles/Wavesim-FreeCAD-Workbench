@@ -58,7 +58,13 @@ job.json schema (Session 2)
                          "key":"modemesh_0",    # fine transverse re-voxelisation
                          "normal":"z","position":.., # of this plane; arrays live in
                          "a_nodes":[..],"b_nodes":[..]}, # materials.npz (see below).
-                                                # Absent = solve on the coarse slice
+                                                # Absent = solve on the coarse slice.
+                                                # A *convergence* mode mesh instead
+                                                # carries "levels":[{"a_nodes","b_nodes"},
+                                                # ...] (finest last) + "convergence":
+                                                # {"max_iter","rel_tol"}: the runner
+                                                # walks the ladder, re-solving Z0 until
+                                                # it settles (arrays <key>_lvl<j>_*)
                        "excitation": {"type":.., ...}, "fields":"EH"|"E"}, ...],
                        # legacy entries may carry flat "fmax"/"amplitude" keys
                        # and omit "direction" (defaults to +normal / low face)
@@ -131,6 +137,17 @@ interpolates the mode back onto the coarse grid
 ``TEMMode`` for a SPICE port). The FDTD grid is untouched. Absent ⇒ the coarse
 slice is solved as before. ``mode_mesh`` and ``bounds`` are mutually exclusive
 per port: the fine grid already spans exactly the (bounded) box.
+
+When the workbench's **characteristic-impedance convergence study** is on, the
+``mode_mesh`` carries a ``levels`` ladder (progressively finer transverse
+re-voxelisations of the plane, finest last; each level's 2D arrays in
+``materials.npz`` as ``<key>_lvl<j>_{pec,eps,mu}``) plus a ``convergence``
+``{max_iter, rel_tol}`` criterion. :func:`_solve_mode_convergence` solves the mode
+on each level in turn and stops once the chosen conductor's impedance changes by
+less than ``rel_tol`` between levels (or ``max_iter`` levels are used). The finest
+solved level is then used exactly like a single mode mesh (saved, launched,
+interpolated back onto the coarse grid). The per-iteration Z0 history rides along
+in ``summary["modes"][*]["convergence"]`` for the results plot.
 
 SPICE co-simulation ports
 -------------------------
@@ -386,25 +403,21 @@ _MODEMESH_SHAPE = {"z": lambda Na, Nb: (Na, Nb, 1),
                    "x": lambda Na, Nb: (1, Na, Nb)}
 
 
-def _mode_mesh_grid(ws, np, mm, material_data):
-    """Build a thin fine rectilinear grid carrying a mode mesh's cross-section.
+def _thin_mode_grid(ws, np, normal, position, a_nodes, b_nodes,
+                    pec2d, eps2d, mu2d):
+    """Build a single-cell-thick fine grid from one plane's 2D material arrays.
 
-    A ``mode_mesh`` block (see the job schema) re-voxelises one port plane on a
-    connectivity-preserving fine transverse grid. This turns its 2D ``(Na, Nb)``
-    ``pec``/``eps``/``mu`` arrays (shipped in ``materials.npz`` under
-    ``<key>_pec``/``_eps``/``_mu``) into a single-cell-thick 3D grid normal to the
-    port, so :func:`wavesim.solve_tem_modes` runs on the fine cross-section where
-    the conductor count is correct. Returns the ``FDTDGrid``.
+    Turns the ``(Na, Nb)`` transverse ``pec``/``eps``/``mu`` arrays (``(a, b)``
+    slice order) into a grid one cell thick along *normal*, centred on *position*,
+    so :func:`wavesim.solve_tem_modes` runs on that fine cross-section. Shared by
+    the single mode mesh and each level of a convergence ladder.
     """
-    key = mm["key"]
-    normal = mm["normal"]
-    a_nodes = np.asarray(mm["a_nodes"], dtype=np.float64)
-    b_nodes = np.asarray(mm["b_nodes"], dtype=np.float64)
-    pec2d = np.ascontiguousarray(material_data[key + "_pec"]).astype(bool)
-    eps2d = np.ascontiguousarray(material_data[key + "_eps"], dtype=np.float64)
-    mu2d = np.ascontiguousarray(material_data[key + "_mu"], dtype=np.float64)
+    a_nodes = np.asarray(a_nodes, dtype=np.float64)
+    b_nodes = np.asarray(b_nodes, dtype=np.float64)
+    pec2d = np.ascontiguousarray(pec2d).astype(bool)
+    eps2d = np.ascontiguousarray(eps2d, dtype=np.float64)
+    mu2d = np.ascontiguousarray(mu2d, dtype=np.float64)
     Na, Nb = pec2d.shape
-    position = float(mm["position"])
 
     # One thin cell along the normal, centred on the plane; its thickness is
     # immaterial to the purely transverse (2D) mode solve, so use a representative
@@ -421,6 +434,94 @@ def _mode_mesh_grid(ws, np, mm, material_data):
     grid_f = ws.set_material_arrays(grid_f, eps3, eps3, eps3, mu3, mu3, mu3,
                                     pec_mask=pec3)
     return grid_f
+
+
+def _mode_mesh_grid(ws, np, mm, material_data):
+    """Build a thin fine rectilinear grid carrying a mode mesh's cross-section.
+
+    A single-level ``mode_mesh`` block (see the job schema) re-voxelises one port
+    plane on a connectivity-preserving fine transverse grid. This turns its 2D
+    ``(Na, Nb)`` ``pec``/``eps``/``mu`` arrays (shipped in ``materials.npz`` under
+    ``<key>_pec``/``_eps``/``_mu``) into a single-cell-thick 3D grid normal to the
+    port, so :func:`wavesim.solve_tem_modes` runs on the fine cross-section where
+    the conductor count is correct. Returns the ``FDTDGrid``.
+    """
+    key = mm["key"]
+    return _thin_mode_grid(
+        ws, np, mm["normal"], float(mm["position"]),
+        mm["a_nodes"], mm["b_nodes"],
+        material_data[key + "_pec"], material_data[key + "_eps"],
+        material_data[key + "_mu"],
+    )
+
+
+def _solve_mode_convergence(ws, np, mm, material_data, wanted_conductor,
+                            name, prefix):
+    """Walk a mode-mesh refinement ladder until the characteristic impedance settles.
+
+    A convergence ``mode_mesh`` block carries ``levels`` (a list of
+    ``{a_nodes, b_nodes}``, finest last) whose per-level 2D arrays live in
+    ``materials.npz`` as ``<key>_lvl<j>_{pec,eps,mu}``, plus a ``convergence``
+    ``{max_iter, rel_tol}`` criterion. Each level is solved on its own thin fine
+    grid (:func:`_thin_mode_grid`); after each, the chosen conductor's impedance is
+    compared with the previous level's and the walk stops once the relative change
+    is within ``rel_tol`` (or ``max_iter`` levels are used). Coarse levels that
+    fail to resolve the wanted conductor are skipped for the comparison but still
+    advance the mesh.
+
+    Returns ``(modes, solve_grid, history)`` for the finest level actually solved:
+    *modes* are handed on exactly like a single mode mesh's (saved, launched,
+    interpolated back onto the coarse grid), and *history* is a per-iteration list
+    ``[{iteration, Na, Nb, impedance, delta_rel, converged}, ...]`` for the
+    summary / results plot.
+    """
+    key = mm["key"]
+    normal = mm["normal"]
+    position = float(mm["position"])
+    levels = mm.get("levels") or []
+    conv = mm.get("convergence") or {}
+    rel_tol = float(conv.get("rel_tol", 0.01))
+    max_iter = int(conv.get("max_iter", len(levels)))
+
+    modes = []
+    solve_grid = None
+    history = []
+    prev_z = None
+    for li, lvl in enumerate(levels[:max_iter]):
+        lkey = "{}_lvl{}".format(key, li)
+        pec2d = material_data[lkey + "_pec"]
+        solve_grid = _thin_mode_grid(
+            ws, np, normal, position, lvl["a_nodes"], lvl["b_nodes"],
+            pec2d, material_data[lkey + "_eps"], material_data[lkey + "_mu"],
+        )
+        modes = ws.solve_tem_modes(
+            solve_grid, normal=normal, position=position, compute_params=True,
+        )
+        Na, Nb = int(pec2d.shape[0]), int(pec2d.shape[1])
+        chosen = _choose_mode(modes, wanted_conductor, name) if modes else None
+        z = float(chosen.impedance) if (
+            chosen is not None and chosen.impedance is not None) else None
+        delta = None
+        converged = False
+        if z is not None and prev_z is not None and abs(prev_z) > 0.0:
+            delta = abs(z - prev_z) / abs(prev_z)
+            converged = delta <= rel_tol
+        history.append({
+            "iteration": li + 1, "Na": Na, "Nb": Nb,
+            "impedance": _f(z), "delta_rel": _f(delta), "converged": converged,
+        })
+        _emit_status(
+            "{}mode convergence iteration {}/{} on a {}x{} mesh: Z0 = {}{}".format(
+                prefix, li + 1, min(len(levels), max_iter), Na, Nb,
+                "{:.4g} ohm".format(z) if z is not None else "n/a",
+                "" if delta is None else " (change {:.3g}%)".format(100.0 * delta),
+            )
+        )
+        if z is not None:
+            if converged:
+                break
+            prev_z = z
+    return modes, solve_grid, history
 
 
 def _interp_coarse_profiles(np, mode, grid, fields):
@@ -555,10 +656,15 @@ def _solve_all_modes(ws, np, grid, job, material_data=None):
         # solved mode is interpolated back onto the coarse grid to launch.
         mm = t.get("mode_mesh")
         use_mesh = mm is not None and material_data is not None
+        # A convergence mode mesh carries a refinement ``levels`` ladder the runner
+        # walks until Z0 settles; a plain one carries a single ``a_nodes``/
+        # ``b_nodes`` grid.
+        use_convergence = use_mesh and bool(mm.get("levels"))
         # Optional in-plane bounds (solver-frame metres, transverse slice order).
         # Mutually exclusive with a mode mesh, whose fine grid already spans
         # exactly the (bounded) box.
         bounds = None if use_mesh else t.get("bounds")
+        conv_history = None
 
         prefix = "Port {}/{}: ".format(si + 1, n_ports) if n_ports > 1 else ""
         _emit_status(
@@ -566,10 +672,18 @@ def _solve_all_modes(ws, np, grid, job, material_data=None):
             "({}factorising the cross-section; this scales with grid "
             "size)...".format(
                 prefix, normal, name,
+                "impedance-convergence fine meshes; " if use_convergence else
                 "connectivity-preserving fine mesh; " if use_mesh else "",
             )
         )
-        if use_mesh:
+        if use_convergence:
+            # Walk the refinement ladder until the chosen conductor's Z0 settles.
+            # The finest solved level is used exactly like a single mode mesh.
+            modes, solve_grid, conv_history = _solve_mode_convergence(
+                ws, np, mm, material_data, int(t.get("conductor_id", 0)),
+                name, prefix,
+            )
+        elif use_mesh:
             # The fine grid already spans exactly the (bounded) box, so no
             # ``bounds`` is passed — the whole fine plane is the solve region.
             solve_grid = _mode_mesh_grid(ws, np, mm, material_data)
@@ -625,7 +739,7 @@ def _solve_all_modes(ws, np, grid, job, material_data=None):
                     ca, cb = ca[win[0]:win[1]], cb[win[2]:win[3]]
                 mode_arrays[key + "_ca"] = np.asarray(ca, dtype=np.float64)
                 mode_arrays[key + "_cb"] = np.asarray(cb, dtype=np.float64)
-            mode_meta.append({
+            meta = {
                 "source_index": si, "mode_index": mi, "name": name,
                 "conductor_id": int(mode.conductor_id),
                 "normal": mode.normal, "position": float(mode.position),
@@ -638,7 +752,12 @@ def _solve_all_modes(ws, np, grid, job, material_data=None):
                 "v_phase": _f(mode.v_phase),
                 "fmax": fmax, "amplitude": amplitude, "fields": fields,
                 "spice": kind == "spice",
-            })
+            }
+            # Attach the port's impedance-convergence history (same for every mode
+            # on this plane) so the results plot can show Z0 settling with mesh.
+            if conv_history is not None:
+                meta["convergence"] = conv_history
+            mode_meta.append(meta)
 
         if not modes or mode_only:
             continue

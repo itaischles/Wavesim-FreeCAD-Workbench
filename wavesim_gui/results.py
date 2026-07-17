@@ -992,6 +992,7 @@ if _GUI_AVAILABLE:
             "v_phase": _num(meta.get("v_phase")),
             "fmax": float(meta.get("fmax", 0.0)),
             "fields": str(meta.get("fields", "")),
+            "convergence": meta.get("convergence"),
         }
 
     def _draw_mode(figure, data):
@@ -1073,6 +1074,27 @@ if _GUI_AVAILABLE:
         ax.text(0.02, 0.98, "\n".join(lines), transform=ax.transAxes,
                 va="top", ha="left", fontsize=8,
                 bbox=dict(boxstyle="round", facecolor="white", alpha=0.75))
+
+        # Impedance-convergence history (when the study ran): Z0 per mesh
+        # refinement, so the user can see it settle. Drawn as a small inset table
+        # in the lower-right so it never overlaps the parameter box above.
+        history = data.get("convergence")
+        if history:
+            clines = ["Z₀ convergence (iter: N×N  Z₀  Δ)"]
+            for h in history:
+                z = h.get("impedance")
+                d = h.get("delta_rel")
+                zs = "{:.2f}Ω".format(z) if isinstance(z, (int, float)) \
+                    and math.isfinite(z) else "n/a"
+                ds = "" if not (isinstance(d, (int, float)) and math.isfinite(d)) \
+                    else "  Δ{:.2g}%".format(100.0 * d)
+                mark = " ✓" if h.get("converged") else ""
+                clines.append("{}: {}×{}  {}{}{}".format(
+                    h.get("iteration", "?"), h.get("Na", "?"), h.get("Nb", "?"),
+                    zs, ds, mark))
+            ax.text(0.98, 0.02, "\n".join(clines), transform=ax.transAxes,
+                    va="bottom", ha="right", fontsize=7, family="monospace",
+                    bbox=dict(boxstyle="round", facecolor="#f5f5dc", alpha=0.8))
 
     def _plot_mode(obj):
         """Open the figure of a mode leaf saved by a run (double-click in the tree)."""

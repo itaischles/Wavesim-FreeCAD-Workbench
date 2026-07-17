@@ -545,6 +545,68 @@ def build_mode_mesh(materials, normal, pos_mm, span_mm, base_cell_mm,
     return best
 
 
+def build_mode_mesh_levels(materials, normal, pos_mm, span_mm, base_cell_mm,
+                           bg_eps=1.0, bg_mu=1.0, bg_pec=False,
+                           max_levels=5, max_cells=300_000, min_start_cells=8):
+    """A sequence of progressively finer transverse re-voxelisations of one plane.
+
+    Unlike :func:`build_mode_mesh` (which auto-stops at the *connectivity* plateau
+    and returns a single mesh), this emits a whole refinement ladder for the
+    runner's characteristic-impedance convergence study: the port plane voxelised
+    over the transverse rectangle *span_mm* ``(a0, a1, b0, b1)`` (world mm, slice
+    order), each level having twice the transverse cell count of the last (finest
+    last). The runner solves the mode on each in turn and stops once its Z0 settles
+    (see ``runner._solve_mode_convergence``), so the ladder only needs to be long
+    enough to reach convergence; the tail is unused when it converges early.
+
+    The coarsest level resolves each transverse axis with at least
+    ``max(FDTD-cell count, min_start_cells)`` cells: *base_cell_mm* ``(ca, cb)`` is
+    the FDTD transverse cell, but on a coarse grid it can span the geometry in a
+    single cell, and the mode solver's ``np.gradient`` needs at least two cells per
+    axis (one-cell axes crash with an ``IndexError``). *min_start_cells* is that
+    floor, so even a coarse FDTD grid starts the study on a usable mesh.
+
+    Refinement stops after *max_levels* entries or once the next level would exceed
+    *max_cells* transverse cells (whichever comes first). Returns
+    ``[(a_nodes_mm, b_nodes_mm, pec2d, eps2d, mu2d), ...]`` (at least one entry),
+    or ``None`` when the plane carries no PEC (nothing to solve -> coarse path).
+    """
+    import numpy as np
+
+    a0, a1, b0, b1 = span_mm
+    span_a, span_b = a1 - a0, b1 - b0
+    ca0, cb0 = base_cell_mm
+    if span_a <= 0.0 or span_b <= 0.0 or ca0 <= 0.0 or cb0 <= 0.0:
+        return None
+
+    # Start count per axis: the FDTD-cell resolution over the span, floored so the
+    # coarsest mesh always has >= 2 cells (min_start_cells) for a valid gradient.
+    floor = max(2, int(min_start_cells))
+    Na0 = max(floor, int(math.ceil(span_a / ca0)))
+    Nb0 = max(floor, int(math.ceil(span_b / cb0)))
+
+    levels = []
+    for lvl in range(max(1, int(max_levels))):
+        Na, Nb = Na0 * (2 ** lvl), Nb0 * (2 ** lvl)
+        if Na * Nb > max_cells:
+            break  # too fine for this cap; keep the ladder built so far
+        a_nodes = a0 + np.arange(Na + 1) * (span_a / Na)
+        b_nodes = b0 + np.arange(Nb + 1) * (span_b / Nb)
+        pec2d, eps2d, mu2d = voxelize_port_plane(
+            materials, normal, pos_mm, a_nodes, b_nodes,
+            bg_eps=bg_eps, bg_mu=bg_mu, bg_pec=bg_pec,
+        )
+        if _label_2d(pec2d) == 0:
+            # No PEC at this resolution. If even the coarsest misses every
+            # conductor there is nothing to solve; a finer level would only find
+            # PEC the mode solve needs from level 0, so stop here.
+            if not levels:
+                return None
+            break
+        levels.append((a_nodes, b_nodes, pec2d, eps2d, mu2d))
+    return levels or None
+
+
 def _plane_material_span_mm(materials, normal):
     """Transverse ``(a0, a1, b0, b1)`` world-mm extent of all bodies, slice order.
 
@@ -979,48 +1041,124 @@ def write_materials(workdir, arrays):
     np.savez(os.path.join(workdir, "materials.npz"), **arrays)
 
 
+def _mode_mesh_geometry(dom, obj, materials, cell_size_m):
+    """Resolve ``(normal, span_mm, base_cell_mm, slice_pos_mm)`` for a port's plane.
+
+    Shared by the single-mesh and convergence-ladder attach paths. *span_mm* is
+    the Session-A bounds rect if one is selected, else the transverse extent of the
+    geometry; *slice_pos_mm* samples the CAD at the geometry's own boundary-most
+    end near the face (not the domain face, which sits in empty spacing/PML).
+    Returns ``None`` when there is no usable span or geometry to sample.
+    """
+    from wavesim_gui import domain as domain_mod
+    from wavesim_gui import tem_source as tem_mod
+
+    face = str(getattr(obj, "Face", "z0"))
+    normal = domain_mod.face_axis(face)
+    rect = tem_mod._bounds_rect_mm(dom, face, getattr(obj, "BoundsSel", None))
+    span_mm = rect if rect is not None else _plane_material_span_mm(
+        materials, normal)
+    if span_mm is None:
+        return None
+    ax_a, ax_b = _TRANSVERSE_AXES[normal]
+    ia, ib = _AXIS_IDX[ax_a], _AXIS_IDX[ax_b]
+    base_cell_mm = (cell_size_m[ia] * _MM_PER_M, cell_size_m[ib] * _MM_PER_M)
+    slice_pos_mm = _port_slice_pos_mm(
+        materials, normal, face.endswith("1"),
+        cell_size_m[_AXIS_IDX[normal]] * _MM_PER_M,
+    )
+    if slice_pos_mm is None:
+        return None
+    return normal, span_mm, base_cell_mm, slice_pos_mm
+
+
 def _attach_mode_meshes(arrays, dom, port_pairs, materials, cell_size_m,
-                        origin_m, bg_eps, bg_mu, bg_pec):
+                        origin_m, bg_eps, bg_mu, bg_pec, convergence=None):
     """Attach a ``mode_mesh`` block to each port spec that needs one.
 
     *port_pairs* is ``[(spec_dict, port_obj), ...]`` for every mode-solved port
-    (TEM sources + SPICE-TEM ports). For each, :func:`build_mode_mesh` decides
-    whether the coarse voxelisation fragments its PEC cross-section; when it does,
-    the fine 2D arrays land in *arrays* as ``modemesh_<i>_{pec,eps,mu}`` and the
-    spec gains ``mode_mesh`` (node coords shifted into the solver frame). Ports
-    whose connectivity is already stable are left untouched (coarse solve).
+    (TEM sources + SPICE-TEM ports). Two modes:
+
+    * *convergence* is ``None`` (the default) -- the historical single-mesh path.
+      :func:`build_mode_mesh` decides whether the coarse voxelisation fragments the
+      PEC cross-section; when it does the fine 2D arrays land in *arrays* as
+      ``modemesh_<i>_{pec,eps,mu}`` and the spec gains a single-level ``mode_mesh``.
+      Ports whose connectivity is already stable are left untouched (coarse solve).
+
+    * *convergence* ``{"max_iter", "rel_tol"}`` -- ship a whole refinement ladder
+      (:func:`build_mode_mesh_levels`) so the runner can converge the port's
+      characteristic impedance. The per-level arrays land as
+      ``modemesh_<i>_lvl<j>_{pec,eps,mu}`` and the spec's ``mode_mesh`` carries a
+      ``levels`` list plus the ``convergence`` criteria. Generated for every port
+      with PEC on the plane (even one already connectivity-stable, since Z0 may
+      still be under-resolved).
+
+    Node coords are shifted into the solver frame. ``mode_mesh`` and ``bounds``
+    stay mutually exclusive (the fine grid already spans the box), so a port that
+    gains one has its ``bounds`` dropped from the spec.
     """
     import numpy as np
-
-    from wavesim_gui import domain as domain_mod
-    from wavesim_gui import tem_source as tem_mod
 
     mm_index = 0
     for spec, obj in port_pairs:
         face = str(getattr(obj, "Face", "z0"))
-        normal = domain_mod.face_axis(face)
-        # Span: the Session-A bounds rect (world mm) if one is selected, else the
-        # transverse extent of the geometry on the plane.
-        rect = tem_mod._bounds_rect_mm(dom, face, getattr(obj, "BoundsSel", None))
-        span_mm = rect if rect is not None else _plane_material_span_mm(
-            materials, normal)
-        if span_mm is None:
+        geom = _mode_mesh_geometry(dom, obj, materials, cell_size_m)
+        if geom is None:
             continue
+        normal, span_mm, base_cell_mm, slice_pos_mm = geom
         ax_a, ax_b = _TRANSVERSE_AXES[normal]
         ia, ib = _AXIS_IDX[ax_a], _AXIS_IDX[ax_b]
-        base_cell_mm = (cell_size_m[ia] * _MM_PER_M, cell_size_m[ib] * _MM_PER_M)
-        # Where to sample the CAD cross-section: at the geometry's own end (not
-        # the domain face, which sits in empty spacing/PML), so the slice hits the
-        # solid regardless of which face the port is on.
-        slice_pos_mm = _port_slice_pos_mm(
-            materials, normal, face.endswith("1"),
-            cell_size_m[_AXIS_IDX[normal]] * _MM_PER_M,
-        )
-        if slice_pos_mm is None:
+        key = "modemesh_{}".format(mm_index)
+
+        def _solver_nodes(nodes_mm, axis_idx):
+            return [float(v) / _MM_PER_M - origin_m[axis_idx] for v in nodes_mm]
+
+        if convergence is not None:
+            # Convergence study: a refinement ladder the runner walks until Z0
+            # settles. NB: no MinCellSize clamp -- the mode mesh deliberately
+            # refines below the (possibly coarsened) FDTD grid.
+            levels = build_mode_mesh_levels(
+                materials, normal, slice_pos_mm, span_mm, base_cell_mm,
+                bg_eps=bg_eps, bg_mu=bg_mu, bg_pec=bg_pec,
+                max_levels=int(convergence["max_iter"]),
+            )
+            if not levels:
+                continue
+            level_specs = []
+            for li, (a_nodes_mm, b_nodes_mm, pec2d, eps2d, mu2d) in enumerate(levels):
+                lkey = "{}_lvl{}".format(key, li)
+                arrays[lkey + "_pec"] = pec2d.astype(np.uint8)
+                arrays[lkey + "_eps"] = eps2d
+                arrays[lkey + "_mu"] = mu2d
+                level_specs.append({
+                    "a_nodes": _solver_nodes(a_nodes_mm, ia),
+                    "b_nodes": _solver_nodes(b_nodes_mm, ib),
+                })
+            FreeCAD.Console.PrintMessage(
+                "Wavesim: TEM port on {} -- impedance convergence study over up to "
+                "{} mesh level(s) ({} to {}x{} cells, sampled at {}={:.3f} mm).\n"
+                .format(
+                    face, len(levels),
+                    "{}x{}".format(levels[0][2].shape[0], levels[0][2].shape[1]),
+                    levels[-1][2].shape[0], levels[-1][2].shape[1],
+                    normal, slice_pos_mm,
+                )
+            )
+            spec.pop("bounds", None)
+            spec["mode_mesh"] = {
+                "key": key,
+                "normal": normal,
+                "position": spec["position"],  # already solver frame
+                "levels": level_specs,
+                "convergence": {
+                    "max_iter": int(convergence["max_iter"]),
+                    "rel_tol": float(convergence["rel_tol"]),
+                },
+            }
+            mm_index += 1
             continue
-        # NB: no MinCellSize clamp here -- the mode mesh deliberately refines
-        # *below* the (possibly coarsened) FDTD grid to recover connectivity;
-        # max_cells is the only bound.
+
+        # Single connectivity-preserving mesh (convergence off).
         mesh = build_mode_mesh(
             materials, normal, slice_pos_mm, span_mm, base_cell_mm,
             bg_eps=bg_eps, bg_mu=bg_mu, bg_pec=bg_pec,
@@ -1040,13 +1178,13 @@ def _attach_mode_meshes(arrays, dom, port_pairs, materials, cell_size_m,
                 normal, slice_pos_mm,
             )
         )
-        key = "modemesh_{}".format(mm_index)
+        spec.pop("bounds", None)
         spec["mode_mesh"] = {
             "key": key,
             "normal": normal,
             "position": spec["position"],  # already solver frame
-            "a_nodes": [float(v) / _MM_PER_M - origin_m[ia] for v in a_nodes_mm],
-            "b_nodes": [float(v) / _MM_PER_M - origin_m[ib] for v in b_nodes_mm],
+            "a_nodes": _solver_nodes(a_nodes_mm, ia),
+            "b_nodes": _solver_nodes(b_nodes_mm, ib),
         }
         arrays[key + "_pec"] = pec2d.astype(np.uint8)
         arrays[key + "_eps"] = eps2d
@@ -1174,12 +1312,18 @@ def build_job_from_document(doc, steps=None, fmax=30.0e9, progress=None):
     # finely re-voxelised transverse plane so the runner solves the mode on a
     # grid where the conductor count is correct, then interpolates it back onto
     # the coarse grid to launch. Absent ⇒ the runner solves on the coarse slice.
+    # When the Simulation's impedance-convergence study is on, ship a whole
+    # refinement ladder instead (the runner walks it until Z0 converges).
+    from wavesim_gui import commands as commands_mod
+
+    convergence = commands_mod.mode_convergence_settings(sim)
     _attach_mode_meshes(
         vox["arrays"], dom,
         list(zip(tem_sources, tem_objs))
         + [(spec, obj) for spec, obj in zip(spice_tem_specs, spice_tem_objs)
            if spec],
         materials, cell_size_m, origin_m, bg_eps, bg_mu, bg_pec,
+        convergence=convergence,
     )
 
     sources = source_mod.find_sources(sim)

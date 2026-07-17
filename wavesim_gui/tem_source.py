@@ -738,7 +738,9 @@ if _GUI_AVAILABLE:
                 "Optionally select an edge/face to confine the mode solve to its "
                 "in-plane bounding box (e.g. a single connector's cross-section on "
                 "a shared plane); Clear restores the whole face. "
-                "Frequency/time units are set on the Simulation object."
+                "Frequency/time units — and the characteristic-impedance "
+                "convergence study (refine the mode mesh until Z₀ settles) — are "
+                "set on the Simulation object."
             )
             info.setWordWrap(True)
             layout.addRow(info)
@@ -867,8 +869,11 @@ if _GUI_AVAILABLE:
         spec["tem_sources"] = tem
         spec["spice_ports"] = spice
         keep = {e["mode_mesh"]["key"] for e in tem + spice if e.get("mode_mesh")}
+        # Array names are '<key>_pec/_eps/_mu' (single mesh) or
+        # '<key>_lvl<j>_pec/...' (convergence ladder); keep those whose '<key>'
+        # (the leading 'modemesh_<i>') belongs to a retained port.
         for key in [k for k in arrays if k.startswith("modemesh_")]:
-            if key.rsplit("_", 1)[0] not in keep:  # 'modemesh_<i>_pec' -> 'modemesh_<i>'
+            if not any(key.startswith(k + "_") for k in keep):
                 del arrays[key]
         return True
 

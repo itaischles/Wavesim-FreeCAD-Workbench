@@ -81,8 +81,10 @@ job.json schema (Session 2)
       "monitors": {
         "energy": true,
         "probes":    [{"name":.., "component":"Ez", "x":.., "y":.., "z":..}, ...],
-        "snapshots": [{"name":.., "component":"Ez", "normal":"z",
+        "snapshots": [{"name":.., "field":"E", "normal":"z",
                        "position":.., "every_N_steps":20}, ...],
+                      # "field" ('E'/'H') records all three components; a legacy
+                      # "component" ("Ez", "|E|") records only that one
         "voltages":  [{"name":.., "path": [[x,y,z], ...]}, ...],
         "currents":  [{"name":.., "path": [[x,y,z], ...]}, ...]
       }
@@ -90,9 +92,15 @@ job.json schema (Session 2)
 
 results.npz holds the recorded monitor series (e.g. ``energy_times`` /
 ``energy_values``); summary.json holds scalar run metadata (dt, steps, wall
-time, grid dims, voxel counts, final energy). Each snapshot also stores its two
-in-plane node/edge coordinate arrays (``snapshot_<idx>_edges0`` / ``_edges1``,
-metres, solver frame). The saved frames and edges are **cropped to the domain
+time, grid dims, voxel counts, final energy). A snapshot stores one frame stack
+per recorded component (``snapshot_<idx>_<comp>_data``, e.g. ``snapshot_0_Ex_data``)
+plus the ``snapshot_<idx>_times`` and the two in-plane node/edge coordinate arrays
+(``snapshot_<idx>_edges0`` / ``_edges1``, metres, solver frame) they share; its
+summary entry lists the ``field`` and the ``components`` actually saved. The
+magnitude |E|/|H| is *not* stored -- the workbench derives it from the three
+components (the same sqrt(Fx²+Fy²+Fz²) over the same slices the solver's own
+magnitude monitor would take), which keeps results.npz a third smaller.
+The saved frames and edges are **cropped to the domain
 interior** -- the PML padding cells on both in-plane axes are stripped so the
 animation/export shows only the physical region. Each TEM mode stores its two
 transverse cell-centre
@@ -337,6 +345,18 @@ def _f(value):
 # In-plane axes (in array-index order) of the slice perpendicular to a normal,
 # mirroring ``wavesim.monitors.record_snapshot``'s plane extraction.
 _INPLANE_AXES = {"z": ("x", "y"), "y": ("x", "z"), "x": ("y", "z")}
+
+
+def _field_components(field):
+    """The three component tokens of field ``'E'``/``'H'``."""
+    f = "H" if str(field).upper().startswith("H") else "E"
+    return [f + axis for axis in ("x", "y", "z")]
+
+
+def _field_of(component):
+    """The field ('E'/'H') a component token belongs to ('Ez', '|H|', ...)."""
+    text = str(component).replace("|", "")
+    return "H" if text[:1].upper() == "H" else "E"
 
 
 def _axis_nodes(grid, axis):
@@ -1041,16 +1061,24 @@ def run_job(workdir):
             ws.FieldProbe(p["component"], float(p["x"]), float(p["y"]), float(p["z"])),
         ))
 
-    snapshots = []  # (name, SnapshotMonitor)
+    # A snapshot records a whole field: one solver monitor per component, so the
+    # results window can offer Ex/Ey/Ez (and |E|, derived from them) from a single
+    # user-placed monitor. Legacy jobs naming one ``component`` record just that.
+    snapshots = []  # (name, field, [(component, SnapshotMonitor), ...])
     for s in mon_cfg.get("snapshots", []):
+        position = float(s.get("position", s.get("at_z", 0.0)))
+        every = max(1, int(s.get("every_N_steps", 20)))
+        normal = s.get("normal", "z")
+        field = s.get("field")
+        if field:
+            comps = _field_components(field)
+        else:
+            comps = [s["component"]]
+            field = _field_of(comps[0])
         snapshots.append((
-            s.get("name", "snapshot"),
-            ws.SnapshotMonitor(
-                s["component"],
-                float(s.get("position", s.get("at_z", 0.0))),
-                max(1, int(s.get("every_N_steps", 20))),
-                normal=s.get("normal", "z"),
-            ),
+            s.get("name", "snapshot"), field,
+            [(c, ws.SnapshotMonitor(c, position, every, normal=normal))
+             for c in comps],
         ))
 
     # Line-integral monitors: V = int E.dl / I = loop-int H.dl along a polyline
@@ -1067,7 +1095,7 @@ def run_job(workdir):
     if energy is not None:
         all_monitors.append(energy)
     all_monitors.extend(m for _name, m in probes)
-    all_monitors.extend(m for _name, m in snapshots)
+    all_monitors.extend(m for _name, _f, mons in snapshots for _c, m in mons)
     all_monitors.extend(m for _name, m in voltages)
     all_monitors.extend(m for _name, m in currents)
 
@@ -1121,9 +1149,10 @@ def run_job(workdir):
         result_arrays["probe_{}_values".format(idx)] = np.asarray(mon.values)
         probe_meta.append({"name": name, "component": mon.component})
 
-    # Snapshots: a stack of frames (n_frames, N_axis1, N_axis2) plus their times.
-    # Also save the two in-plane node (edge) coordinate arrays (metres, solver
-    # frame) so the results plot honours non-uniform spacing via pcolormesh.
+    # Snapshots: per recorded component a stack of frames (n_frames, N_axis1,
+    # N_axis2), plus the times and the two in-plane node (edge) coordinate arrays
+    # (metres, solver frame) shared by the components, so the results plot honours
+    # non-uniform spacing via pcolormesh.
     d_pml = int(boundary.get("d_pml", 10))
     pml_set = set(pml_faces)
 
@@ -1135,8 +1164,11 @@ def run_job(workdir):
         )
 
     snapshot_meta = []
-    for idx, (name, mon) in enumerate(snapshots):
-        if mon.snapshots:
+    for idx, (name, field, mons) in enumerate(snapshots):
+        saved = []
+        for comp, mon in mons:
+            if not mon.snapshots:
+                continue
             data = np.asarray(mon.snapshots)
             ax0, ax1 = _INPLANE_AXES.get(getattr(mon, "normal", "z"), ("x", "y"))
             edges0 = np.asarray(_axis_nodes(grid, ax0), dtype=np.float64)
@@ -1149,13 +1181,23 @@ def run_job(workdir):
                 data = data[:, lo0:n0 - hi0, lo1:n1 - hi1]
                 edges0 = edges0[lo0:n0 - hi0 + 1]
                 edges1 = edges1[lo1:n1 - hi1 + 1]
-            result_arrays["snapshot_{}_data".format(idx)] = data
-            result_arrays["snapshot_{}_times".format(idx)] = np.asarray(mon.snap_times)
-            result_arrays["snapshot_{}_edges0".format(idx)] = edges0
-            result_arrays["snapshot_{}_edges1".format(idx)] = edges1
+            result_arrays["snapshot_{}_{}_data".format(idx, comp)] = data
+            if not saved:
+                # Same plane and cadence for every component: save once.
+                result_arrays["snapshot_{}_times".format(idx)] = \
+                    np.asarray(mon.snap_times)
+                result_arrays["snapshot_{}_edges0".format(idx)] = edges0
+                result_arrays["snapshot_{}_edges1".format(idx)] = edges1
+            saved.append(comp)
+        # The two components lying *in* the slice plane, in array-index order —
+        # the in-plane vector the results plot draws as a quiver overlay. Named
+        # here because only this side knows the slice normal.
+        normal = getattr(mons[0][1], "normal", "z") if mons else "z"
+        pax0, pax1 = _INPLANE_AXES.get(normal, ("x", "y"))
         snapshot_meta.append({
-            "name": name, "component": mon.component,
-            "frames": len(mon.snapshots),
+            "name": name, "field": field, "components": saved,
+            "inplane": [field + pax0, field + pax1],
+            "frames": len(mons[0][1].snapshots) if mons else 0,
         })
 
     # Voltage/current line integrals: one time series each, keyed by index.

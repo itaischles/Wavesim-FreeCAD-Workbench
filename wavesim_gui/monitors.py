@@ -7,11 +7,12 @@ monitor dataclasses (:mod:`wavesim.monitors`):
 
 * **Probe** (``FieldProbe``) -- records a single field component (or ``|E|`` /
   ``|H|`` magnitude) at one point over time. Drawn as an orange point marker.
-* **Snapshot** (``SnapshotMonitor``) -- captures a 2D XY slice of a field
-  component every *N* steps. Drawn as a semi-transparent orange plane at the
-  slice's z position; several snapshot monitors at different z read as a stack of
-  parallel orange planes. (The solver only slices XY planes, so the plane is
-  always perpendicular to z; its position along z is editable.)
+* **Snapshot** (``SnapshotMonitor``) -- captures a 2D slice of a whole field
+  (``E`` or ``H``) every *N* steps. The user picks the field, not a component:
+  the runner puts one solver monitor on each of its three components and the
+  results window offers Ex/Ey/Ez/|E| (magnitude derived from the components), so
+  one monitor covers what used to take three. Drawn as a semi-transparent orange
+  plane on the chosen slice plane, offset along that plane's normal axis.
 * **Energy** (``EnergyMonitor``) -- the whole-domain total-energy diagnostic. It
   has no location, so it is a tree-only object with no 3D representation.
 * **Voltage** (``VoltageMonitor``) -- records V(t) = ∫E·dl along an *open*
@@ -96,6 +97,25 @@ def _solver_component(label):
     return _SOLVER_COMPONENT.get(str(label), str(label))
 
 
+# A Snapshot records a whole *field* rather than one component: the runner puts a
+# solver monitor on each of its three components, and the magnitude is derived
+# from them at plot time (exactly the solver's own sqrt(Fx²+Fy²+Fz²) over the same
+# slices). So the user picks E or H once and gets Ex/Ey/Ez/|E| in one monitor.
+_FIELDS = ["E", "H"]
+
+
+def _field_components(field):
+    """The three component tokens of field ``'E'``/``'H'``."""
+    f = "H" if str(field).upper().startswith("H") else "E"
+    return [f + axis for axis in ("x", "y", "z")]
+
+
+def _field_of(component):
+    """The field ('E'/'H') a legacy component label belongs to ('Ez', '∣H∣', ...)."""
+    text = str(component).replace(_BAR, "").replace("|", "")
+    return "H" if text[:1].upper() == "H" else "E"
+
+
 # Snapshot slice planes: display label -> (normal axis, in-plane axes).
 _PLANES = ["XY", "YZ", "XZ"]
 _PLANE_NORMAL = {"XY": "z", "YZ": "x", "XZ": "y"}
@@ -171,11 +191,35 @@ class ProbeObject:
     __setstate__ = loads
 
 
+def _ensure_snapshot_field(obj):
+    """Add the ``Field`` property, migrating a pre-merge ``Component`` choice.
+
+    Snapshots used to record a single component, so one monitor per component was
+    needed to see a whole field. They now record E or H whole; an old monitor's
+    ``Component`` picks the field it belonged to and the property is dropped.
+    """
+    if not hasattr(obj, "Field"):
+        obj.addProperty(
+            "App::PropertyEnumeration", "Field", "Monitor",
+            "Field captured in the slice. All three components are recorded "
+            "(and the magnitude derived), selectable when plotting",
+        )
+        obj.Field = _FIELDS
+        obj.Field = _field_of(getattr(obj, "Component", "E"))
+    if hasattr(obj, "Component"):
+        try:
+            obj.removeProperty("Component")
+        except Exception:
+            obj.setEditorMode("Component", 2)  # can't remove it: hide it
+
+
 class SnapshotObject:
     """``Proxy`` for a snapshot (2D slice) monitor document object.
 
     Properties:
-        ``Component``   -- field quantity recorded ('Ex'..'Hz', '|E|', '|H|').
+        ``Field``       -- field captured, 'E' or 'H'. Every component of it is
+                           recorded (the magnitude is derived at plot time), so
+                           one monitor covers Ex/Ey/Ez/|E|.
         ``Plane``       -- slice orientation: 'XY' (perpendicular to z, the
                            default), 'YZ' (perpendicular to x) or 'XZ' (to y).
         ``Offset``      -- position (mm, world) of the slice plane along its
@@ -197,13 +241,7 @@ class SnapshotObject:
         obj.Proxy = self
         _add_type_marker(obj, _SNAPSHOT_TYPE)
 
-        if not hasattr(obj, "Component"):
-            obj.addProperty(
-                "App::PropertyEnumeration", "Component", "Monitor",
-                "Field quantity captured in the slice",
-            )
-            obj.Component = _COMPONENTS
-            obj.Component = "Ez"
+        _ensure_snapshot_field(obj)
         if not hasattr(obj, "Plane"):
             obj.addProperty(
                 "App::PropertyEnumeration", "Plane", "Monitor",
@@ -246,6 +284,9 @@ class SnapshotObject:
     def onDocumentRestored(self, obj):
         obj.Proxy = self
         self.Type = getattr(self, "Type", _SNAPSHOT_TYPE)
+        # Documents saved before snapshots recorded whole fields carry a
+        # per-component ``Component`` instead of ``Field``.
+        _ensure_snapshot_field(obj)
 
     def execute(self, obj):
         """Size/orient the drawn plane to the domain bounds, plane and offset."""
@@ -559,6 +600,7 @@ def snapshot_every_n(snap, sim=None):
 def snapshot_spec(snap, origin_m):
     """Return the ``job.json`` snapshot dict for *snap* in the solver frame.
 
+    ``field`` is 'E' or 'H'; the runner records each of its three components.
     ``normal`` is the slice's normal axis ('x'/'y'/'z'); ``position`` is the
     plane's offset along that axis, in the solver frame (origin subtracted).
     ``every_N_steps`` is derived from the real-time ``RecordInterval`` and the
@@ -570,7 +612,7 @@ def snapshot_spec(snap, origin_m):
     origin_along = {"x": origin_m[0], "y": origin_m[1], "z": origin_m[2]}[axis]
     return {
         "name": str(snap.Label or snap.Name),
-        "component": _solver_component(snap.Component),
+        "field": str(getattr(snap, "Field", "E")),
         "normal": normal,
         "position": float(snap.Offset.Value) / _MM_PER_M - origin_along,
         "every_N_steps": snapshot_every_n(snap),
@@ -698,7 +740,7 @@ def _snapshot_label(obj):
     else:
         every = "{} steps".format(int(getattr(obj, "EveryNSteps", 20)))
     return "Snapshot ({} {} @ {}={:g} mm, every {})".format(
-        getattr(obj, "Component", "Ez"), plane, axis, off_mm, every,
+        getattr(obj, "Field", "E"), plane, axis, off_mm, every,
     )
 
 
@@ -1130,9 +1172,9 @@ if _GUI_AVAILABLE:
             form.setWindowTitle("Wavesim Snapshot")
             layout = QtWidgets.QFormLayout(form)
 
-            self._component = QtWidgets.QComboBox()
-            self._component.addItems(_COMPONENTS)
-            self._component.setCurrentText(str(getattr(obj, "Component", "Ez")))
+            self._field = QtWidgets.QComboBox()
+            self._field.addItems(_FIELDS)
+            self._field.setCurrentText(str(getattr(obj, "Field", "E")))
 
             self._plane = QtWidgets.QComboBox()
             self._plane.addItems(_PLANES)
@@ -1158,7 +1200,7 @@ if _GUI_AVAILABLE:
             self._interval.setSingleStep(0.1)
             self._interval.setValue(self._initial_interval_display(obj))
 
-            layout.addRow("Field quantity:", self._component)
+            layout.addRow("Field:", self._field)
             layout.addRow("Slice plane:", self._plane)
             self._offset_label = QtWidgets.QLabel()
             layout.addRow(self._offset_label, self._offset)
@@ -1167,12 +1209,13 @@ if _GUI_AVAILABLE:
             layout.addRow("Time steps:", self._steps_label)
 
             info = QtWidgets.QLabel(
-                "The snapshot captures a 2D slice of the chosen field quantity on "
-                "the selected plane, offset along its normal axis. It records a "
-                "frame every 'Record every' of simulated time; the equivalent "
-                "number of time steps is computed from the grid's CFL time step. "
-                "The recorded frames feed the snapshot animation in the results "
-                "view."
+                "The snapshot captures a 2D slice of the chosen field on the "
+                "selected plane, offset along its normal axis. All three "
+                "components are recorded, so one monitor is enough — the "
+                "component to view (Ex, Ey, Ez or |E|) is chosen in the results "
+                "window. It records a frame every 'Record every' of simulated "
+                "time; the equivalent number of time steps is computed from the "
+                "grid's CFL time step."
             )
             info.setWordWrap(True)
             layout.addRow(info)
@@ -1231,7 +1274,7 @@ if _GUI_AVAILABLE:
             self.obj.Offset = "{} mm".format(self._orig_offset)
             self.obj.Plane = self._orig_plane
             doc.openTransaction("Wavesim: Edit Snapshot")
-            self.obj.Component = self._component.currentText()
+            self.obj.Field = self._field.currentText()
             self.obj.Plane = self._plane.currentText()
             self.obj.Offset = "{} mm".format(self._offset.value())
             interval_s = units.time_to_si(self._interval.value(), self._time_unit)

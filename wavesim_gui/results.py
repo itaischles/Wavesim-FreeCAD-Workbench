@@ -7,7 +7,9 @@ Simulation tree holding one leaf object per monitor that produced data:
 * **Energy** -- the total-domain energy time series.
 * **Probe**  -- a single field component (or magnitude) at one point vs. time.
 * **Voltage** / **Current** -- line-integral (V = ∫E·dl / I = ∮H·dl) time series.
-* **Snapshot** -- a stack of 2D field slices animated over time.
+* **Snapshot** -- a whole field's 2D slices animated over time, with a dropdown
+  choosing the component to view (Ex/Ey/Ez, plus the |E| magnitude derived from
+  them) — one monitor, every component.
 
 Each leaf is self-contained: it stores the run's output directory and the key
 of its array inside ``results.npz``, so double-clicking it reopens the plot even
@@ -119,7 +121,9 @@ class ResultObject:
     Carries everything needed to (re)open its plot without the producing
     monitor: the run directory (``ResultsDir``), the ``results.npz`` array key
     (``DataKey``) and the kind/component. Snapshot leaves also store the slice's
-    physical in-plane extent and axis labels so the animation can be drawn in mm.
+    physical in-plane extent and axis labels so the animation can be drawn in mm,
+    plus the recorded ``Field``/``Components`` the plot's selector offers
+    (``Component`` is set only on pre-merge single-component leaves).
     """
 
     def __init__(self, obj, kind):
@@ -307,13 +311,23 @@ def build_results(doc, sim, workdir, summary):
         # Snapshots (frame stacks). Capture the slice's physical extent from the
         # producing monitor so the animation can be drawn in millimetres.
         for idx, meta in enumerate(summary.get("snapshots", [])):
-            if "snapshot_{}_data".format(idx) not in keys:
+            # A snapshot records a whole field as one stack per component; runs
+            # from before the merge carry a single unsuffixed stack instead.
+            comps = [c for c in meta.get("components", [])
+                     if "snapshot_{}_{}_data".format(idx, c) in keys]
+            legacy = meta.get("component", "") \
+                if "snapshot_{}_data".format(idx) in keys else ""
+            if not comps and not legacy:
                 continue
-            comp = meta.get("component", "")
             name = meta.get("name") or "Snapshot {}".format(idx)
             leaf = _new_leaf(
-                name, _KIND_SNAPSHOT, "snapshot_{}".format(idx), comp,
+                name, _KIND_SNAPSHOT, "snapshot_{}".format(idx), legacy,
             )
+            if comps:
+                _store_snapshot_components(
+                    leaf, meta.get("field", "E"), comps,
+                    meta.get("inplane", []),
+                )
             extent = _snapshot_extent(sim, name)
             if extent is not None:
                 _store_snapshot_extent(leaf, *extent)
@@ -358,6 +372,23 @@ def build_results(doc, sim, workdir, summary):
         "Wavesim: results added to the tree (double-click a node to plot).\n"
     )
     return grp
+
+
+def _store_snapshot_components(leaf, field, comps, inplane):
+    """Record which field (and components) a snapshot leaf's stacks hold.
+
+    The plot window offers these plus the derived magnitude; an empty
+    ``Components`` marks a pre-merge single-component leaf, which falls back to
+    its ``Component``. ``InPlane`` names the two components lying in the slice
+    plane (in array-index order), which the quiver overlay draws as a vector.
+    """
+    for prop, value in (("Field", str(field)),
+                        ("Components", ",".join(comps)),
+                        ("InPlane", ",".join(inplane))):
+        if not hasattr(leaf, prop):
+            leaf.addProperty("App::PropertyString", prop, "Snapshot", "")
+            leaf.setEditorMode(prop, 1)
+        setattr(leaf, prop, value)
 
 
 def _store_snapshot_extent(leaf, width, height, axis_x, axis_y, plane, offset):
@@ -736,15 +767,54 @@ if _GUI_AVAILABLE:
 
         workdir = str(obj.ResultsDir)
         key = str(obj.DataKey)
-        frames = _load_array(workdir, key + "_data")
         times = _load_array(workdir, key + "_times")
+
+        # What this leaf can show: every recorded component plus the magnitude
+        # derived from them. Pre-merge leaves recorded one quantity and offer
+        # only that.
+        comps = [c for c in str(getattr(obj, "Components", "")).split(",") if c]
+        field = str(getattr(obj, "Field", "")) or "E"
+        if comps:
+            magnitude = "|{}|".format(field)
+            choices = comps + [magnitude]
+        else:
+            magnitude = None
+            choices = [str(getattr(obj, "Component", "")) or "field"]
+
+        # Stacks are big, so load each component only when it is first shown
+        # (the magnitude pulls in all three).
+        _cache = {}
+
+        def _frames(choice):
+            """The frame stack for *choice*, or ``None`` if its array is gone."""
+            if choice not in _cache:
+                if choice == magnitude:
+                    total = None
+                    for c in comps:
+                        arr = _frames(c)
+                        if arr is None:
+                            _cache[choice] = None
+                            return None
+                        sq = np.asarray(arr, dtype=float) ** 2
+                        total = sq if total is None else total + sq
+                    _cache[choice] = None if total is None else np.sqrt(total)
+                else:
+                    suffix = "_{}_data".format(choice) if comps else "_data"
+                    _cache[choice] = _load_array(workdir, key + suffix)
+            return _cache[choice]
+
+        # Open on the magnitude: it is the one view that means the same thing for
+        # either field, and the components are a dropdown away.
+        comp = magnitude or choices[0]
+        frames = _frames(comp)
         if frames is None or len(frames) == 0:
             _missing(obj)
             return
 
         unit = _time_unit(obj)
-        comp = str(getattr(obj, "Component", "")) or "field"
-        is_magnitude = comp.startswith("|") or comp.startswith("∣")
+
+        def _is_magnitude(choice):
+            return choice.startswith("|") or choice.startswith("∣")
 
         # In-plane node/edge coordinates (mm) from the runner: when present the
         # frame is drawn with pcolormesh on the real (possibly non-uniform) grid.
@@ -766,14 +836,19 @@ if _GUI_AVAILABLE:
         # magnitudes (inferno). Log scaling mirrors wavesim's animate_snapshots:
         # SymLogNorm for signed fields (linear within +/-vmax/1e3, log beyond),
         # LogNorm for magnitudes.
+        # Each component is scaled on its own peak, so switching to a weak
+        # component rescales rather than showing it washed out.
         from matplotlib import colors as mcolors
 
-        vmax = float(np.nanmax(np.abs(frames))) or 1.0
-        cmap = "inferno" if is_magnitude else "RdBu_r"
-        linthresh = vmax / 1e3
+        view = {"comp": comp, "frames": frames}
+
+        def _cmap_for(choice):
+            return "inferno" if _is_magnitude(choice) else "RdBu_r"
 
         def _make_norm(log):
-            if is_magnitude:
+            vmax = float(np.nanmax(np.abs(view["frames"]))) or 1.0
+            linthresh = vmax / 1e3
+            if _is_magnitude(view["comp"]):
                 if log:
                     return mcolors.LogNorm(vmin=linthresh, vmax=vmax)
                 return mcolors.Normalize(vmin=0.0, vmax=vmax)
@@ -798,23 +873,117 @@ if _GUI_AVAILABLE:
             # the transposed frame against (xedges, yedges).
             artist = ax.pcolormesh(
                 np.asarray(xedges), np.asarray(yedges),
-                np.asarray(frames[0]).T, cmap=cmap, norm=_make_norm(False),
+                np.asarray(frames[0]).T, cmap=_cmap_for(comp),
+                norm=_make_norm(False),
             )
             ax.set_aspect("equal")
         else:
             artist = ax.imshow(
                 np.asarray(frames[0]).T, origin="lower", extent=extent,
-                cmap=cmap, norm=_make_norm(False), aspect="equal",
+                cmap=_cmap_for(comp), norm=_make_norm(False), aspect="equal",
             )
 
+        # --- in-plane vector overlay -------------------------------------- #
+        # The two components lying in the slice plane form a vector the colour
+        # map cannot show (it is one scalar at a time), so they are drawn as
+        # arrows over it. Independent of the displayed component: on an XY slice
+        # of E the arrows are always (Ex, Ey), whichever scalar is underneath.
+        inplane = [c for c in str(getattr(obj, "InPlane", "")).split(",") if c]
+        can_quiver = len(inplane) == 2 and all(c in comps for c in inplane)
+
+        # One arrow per this many cells at most, so a fine grid stays readable.
+        _MAX_ARROWS = 24
+
+        def _centres(edges, n, length):
+            """Cell-centre coordinates along an axis, in the drawn axis units."""
+            e = np.asarray(edges, dtype=float)
+            if len(e) >= n + 1:
+                return 0.5 * (e[:n] + e[1:n + 1])
+            if length:
+                return (np.arange(n) + 0.5) * (float(length) / n)
+            return np.arange(n, dtype=float)   # cell indices
+
+        def _build_quiver():
+            """Create the arrow overlay, or ``None`` if its components are gone.
+
+            Sized once for the whole run so arrow length stays comparable between
+            frames instead of rescaling per frame.
+            """
+            stacks = [_frames(c) for c in inplane]
+            if any(s is None or len(s) == 0 for s in stacks):
+                return None
+            n0, n1 = stacks[0].shape[1], stacks[0].shape[2]
+            s0 = max(1, int(np.ceil(n0 / float(_MAX_ARROWS))))
+            s1 = max(1, int(np.ceil(n1 / float(_MAX_ARROWS))))
+            cx = _centres(xedges, n0, size.x if have_size else 0.0)[::s0]
+            cy = _centres(yedges, n1, size.y if have_size else 0.0)[::s1]
+            gx, gy = np.meshgrid(cx, cy)
+
+            # Subsample first, then cast: a CUDA run's stacks are float32 and
+            # casting the whole thing would transiently double the run's frames
+            # in memory for arrows that use a fraction of them.
+            a0 = np.asarray(stacks[0][:, ::s0, ::s1], dtype=float)
+            a1 = np.asarray(stacks[1][:, ::s0, ::s1], dtype=float)
+            mags = np.sqrt(a0 ** 2 + a1 ** 2)
+            nonzero = mags[mags > 0]
+            # Reference magnitude drawn at full arrow length. A *percentile*, not
+            # the peak: a source cell or a conductor edge is often orders of
+            # magnitude above the propagating field, and scaling on it collapses
+            # every other arrow to nothing (unlike the colour map, a too-short
+            # arrow is invisible rather than merely faint). Longer vectors are
+            # clipped to full length, keeping their exact direction.
+            ref = float(np.percentile(nonzero, 99.0)) if nonzero.size else 0.0
+            if ref <= 0.0:
+                ref = float(mags.max()) or 1.0
+            # Longest arrow spans about one arrow spacing.
+            span = min(np.min(np.diff(cx)) if len(cx) > 1 else 1.0,
+                       np.min(np.diff(cy)) if len(cy) > 1 else 1.0)
+            if span <= 0:
+                span = 1.0
+            linthresh = ref / 1e3
+
+            def _uv(idx):
+                # Transposed to the (y, x) orientation the axes are drawn in,
+                # matching the frame's own .T above.
+                u = a0[idx].T.copy()
+                v = a1[idx].T.copy()
+                m = np.sqrt(u ** 2 + v ** 2)
+                with np.errstate(divide="ignore", invalid="ignore"):
+                    if log_check.isChecked():
+                        # Match the colour map's log compression, so both layers
+                        # say the same thing about a weak field.
+                        length = ref * (np.log10(1.0 + m / linthresh)
+                                        / np.log10(1.0 + ref / linthresh))
+                    else:
+                        length = np.minimum(m, ref)
+                    f = np.where(m > 0, length / m, 0.0)
+                return u * f, v * f
+
+            u0, v0 = _uv(slider.value())
+            art = ax.quiver(
+                gx, gy, u0, v0, angles="xy", scale_units="xy",
+                scale=ref / span, color=_arrow_color(view["comp"]),
+                width=0.004, pivot="mid", zorder=3,
+            )
+            quiver["art"], quiver["uv"] = art, _uv
+            return art
+
+        def _arrow_color(choice):
+            """Arrow colour that reads against the current colour map."""
+            return "white" if _is_magnitude(choice) else "black"
+
+        quiver = {"art": None, "uv": None}
+
         def _set_frame_data(idx):
-            data2d = np.asarray(frames[idx]).T
+            data2d = np.asarray(view["frames"][idx]).T
             if use_mesh:
                 artist.set_array(data2d.ravel())
             else:
                 artist.set_data(data2d)
+            if quiver["art"] is not None:
+                quiver["art"].set_UVC(*quiver["uv"](idx))
 
-        figure.colorbar(artist, ax=ax, label=comp)
+        cbar = figure.colorbar(artist, ax=ax, label=comp)
         ax.set_xlabel(xlabel)
         ax.set_ylabel(ylabel)
 
@@ -829,43 +998,96 @@ if _GUI_AVAILABLE:
 
         def _set_title(idx):
             ax.set_title("{}{}\nframe {}/{}  t = {:.4g} {}".format(
-                comp, suffix, idx + 1, len(frames), _frame_time(idx), unit,
+                view["comp"], suffix, idx + 1, len(view["frames"]),
+                _frame_time(idx), unit,
             ))
 
         _set_title(0)
         dialog._canvas.draw()
 
-        # --- frame controls: slider + Play + log-scale toggle ------------- #
+        # --- controls: component + slider + Play + log-scale toggle -------- #
         controls = QtWidgets.QHBoxLayout()
         play = QtWidgets.QPushButton("Play")
         play.setCheckable(True)
         slider = QtWidgets.QSlider(_QtCore.Qt.Horizontal)
         slider.setRange(0, len(frames) - 1)
         log_check = QtWidgets.QCheckBox("Log scale")
+        component = None
+        if len(choices) > 1:
+            component = QtWidgets.QComboBox()
+            component.addItems(choices)
+            component.setCurrentText(comp)
+            controls.addWidget(component)
         controls.addWidget(play)
         controls.addWidget(slider, 1)
         controls.addWidget(log_check)
+        vector_check = None
+        if can_quiver:
+            vector_check = QtWidgets.QCheckBox("Vectors")
+            vector_check.setToolTip(
+                "Overlay the in-plane field vector ({}, {}) as arrows".format(*inplane)
+            )
+            controls.addWidget(vector_check)
         layout.addLayout(controls)
 
         def on_log(checked):
             artist.set_norm(_make_norm(bool(checked)))
+            if quiver["art"] is not None:
+                # Arrow lengths follow the same compression as the colour map.
+                quiver["art"].set_UVC(*quiver["uv"](slider.value()))
             dialog._canvas.draw_idle()
 
         log_check.toggled.connect(on_log)
 
         def show_frame(idx):
-            idx = max(0, min(int(idx), len(frames) - 1))
+            idx = max(0, min(int(idx), len(view["frames"]) - 1))
             _set_frame_data(idx)
             _set_title(idx)
             dialog._canvas.draw_idle()
 
         slider.valueChanged.connect(show_frame)
 
+        def on_component(choice):
+            """Switch the animated quantity, keeping the current frame."""
+            choice = str(choice)
+            stack = _frames(choice)
+            if stack is None or len(stack) == 0:
+                _missing(obj)
+                # Put the combo back on what is actually displayed.
+                component.blockSignals(True)
+                component.setCurrentText(view["comp"])
+                component.blockSignals(False)
+                return
+            view["comp"], view["frames"] = choice, stack
+            artist.set_cmap(_cmap_for(choice))
+            artist.set_norm(_make_norm(log_check.isChecked()))
+            cbar.set_label(choice)
+            if quiver["art"] is not None:
+                # The vector is the same; only its contrast with the map changes.
+                quiver["art"].set_color(_arrow_color(choice))
+            show_frame(slider.value())
+
+        if component is not None:
+            component.currentTextChanged.connect(on_component)
+
+        def on_vectors(checked):
+            """Show/hide the arrow overlay, building it on first use."""
+            if checked and quiver["art"] is None and _build_quiver() is None:
+                _missing(obj)
+                vector_check.setChecked(False)
+                return
+            if quiver["art"] is not None:
+                quiver["art"].set_visible(bool(checked))
+                dialog._canvas.draw_idle()
+
+        if vector_check is not None:
+            vector_check.toggled.connect(on_vectors)
+
         timer = _QtCore.QTimer(dialog)
         timer.setInterval(100)  # ms between frames
 
         def advance():
-            nxt = (slider.value() + 1) % len(frames)
+            nxt = (slider.value() + 1) % len(view["frames"])
             slider.setValue(nxt)
 
         timer.timeout.connect(advance)

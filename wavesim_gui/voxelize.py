@@ -1386,6 +1386,11 @@ def build_job_from_document(doc, steps=None, fmax=30.0e9, progress=None):
         # which the runner resolves to the CUDA GPU when one is available).
         "steps": int(steps),
         "grid": grid,
+        # Run provenance, echoed into summary.json by the runner alongside
+        # backend/pml_faces: whether this run's dielectric boundaries were
+        # smoothed. Records what actually ran, which the Simulation container
+        # cannot answer later once the user flips the checkbox.
+        "subpixel": subpixel,
         "boundary": {
             "d_pml": int(d_pml),
             "faces": pml_faces,

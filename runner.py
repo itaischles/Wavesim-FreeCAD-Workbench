@@ -98,9 +98,15 @@ plus the ``snapshot_<idx>_times`` and the two in-plane node/edge coordinate arra
 (``snapshot_<idx>_edges0`` / ``_edges1``, metres, solver frame) they share; its
 summary entry lists the ``field`` and the ``components`` actually saved. The
 magnitude |E|/|H| is *not* stored -- the workbench derives it from the three
-components (the same sqrt(Fx²+Fy²+Fz²) over the same slices the solver's own
-magnitude monitor would take), which keeps results.npz a third smaller.
-The saved frames and edges are **cropped to the domain
+components (the same sqrt(Fx²+Fy²+Fz²) the solver's own magnitude monitor takes,
+over the same collocated slices), which keeps results.npz a third smaller.
+Every frame is **collocated to cell centres** by the solver's SnapshotMonitor,
+so all components share one coordinate grid and each frame is one cell shorter
+than the grid per in-plane axis; the edge arrays stay node coordinates and so
+remain one entry longer than the frame (pcolormesh's convention). H frames are
+additionally averaged across the half timestep onto the E timebase, so an E and
+an H snapshot sharing a ``times`` entry are simultaneous -- what a Poynting
+vector needs. The saved frames and edges are **cropped to the domain
 interior** -- the PML padding cells on both in-plane axes are stripped so the
 animation/export shows only the physical region. Each TEM mode stores its two
 transverse cell-centre
@@ -1175,12 +1181,25 @@ def run_job(workdir):
             edges1 = np.asarray(_axis_nodes(grid, ax1), dtype=np.float64)
             # Crop the PML padding off both in-plane axes so the saved frames (and
             # the animation/export built from them) show only the domain interior.
+            #
+            # The frames are collocated to cell centres by the solver's
+            # SnapshotMonitor and are therefore already one cell short per
+            # in-plane axis (cells 0..N-2). So the window is expressed in *grid*
+            # cells -- keep cells [lo, N-hi) -- and clamped to what the frame
+            # actually carries. Deriving the high edge from ``data.shape``
+            # instead would silently eat one extra interior cell per PML face,
+            # since collocation has already consumed the last one.
             (lo0, hi0), (lo1, hi1) = _interior_pad(ax0), _interior_pad(ax1)
             n0, n1 = data.shape[1], data.shape[2]
-            if lo0 + hi0 < n0 and lo1 + hi1 < n1:
-                data = data[:, lo0:n0 - hi0, lo1:n1 - hi1]
-                edges0 = edges0[lo0:n0 - hi0 + 1]
-                edges1 = edges1[lo1:n1 - hi1 + 1]
+            stop0 = min(len(edges0) - 1 - hi0, n0)
+            stop1 = min(len(edges1) - 1 - hi1, n1)
+            if stop0 > lo0 and stop1 > lo1:
+                data = data[:, lo0:stop0, lo1:stop1]
+                # Cell-centred values still sit inside their original cells, so
+                # the node array remains the correct pcolormesh edge array --
+                # one entry longer than the frame.
+                edges0 = edges0[lo0:stop0 + 1]
+                edges1 = edges1[lo1:stop1 + 1]
             result_arrays["snapshot_{}_{}_data".format(idx, comp)] = data
             if not saved:
                 # Same plane and cadence for every component: save once.
@@ -1241,6 +1260,7 @@ def run_job(workdir):
         "sim_time_s": float(grid.time_step * grid.dt),
         "pml_faces": list(pml_faces),
         "pec_faces": list(pec_faces),
+        "subpixel": bool(job.get("subpixel", False)),
     }
     summary.update(voxel_summary)
     if energy is not None and energy.values:

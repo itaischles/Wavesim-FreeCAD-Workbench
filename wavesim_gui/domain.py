@@ -6,10 +6,10 @@ DocumentObject created automatically when a Simulation is created. It unifies wh
 were previously separate "Grid" and "Domain" concepts. It holds:
 
 * the cell sizes ``Dx``/``Dy``/``Dz`` and the derived cell counts ``Nx``/``Ny``/``Nz``;
-* a ``Spacing`` air gap around the geometry;
+* a per-face ``Spacing`` gap of background medium around the geometry;
 * per-face boundary conditions (PML or PEC) and the PML cell thickness.
 
-The domain box auto-sizes to bound every material-assigned body plus ``Spacing``;
+The domain box auto-sizes to bound every material-assigned body plus the spacing;
 it starts empty (no geometry) and grows/shrinks as bodies are assigned (the
 material commands notify it via :func:`notify_materials_changed`).
 
@@ -28,7 +28,7 @@ settings to the per-side PML padding (cells), the PML ``faces`` tuple and the PE
 ``faces`` tuple that the voxeliser and runner consume.
 
 Units: FreeCAD geometry/properties are in millimetres; the solver works in
-metres. ``Dx``/``Dy``/``Dz``/``Spacing`` are lengths (mm internally);
+metres. ``Dx``/``Dy``/``Dz`` and the ``Spacing*`` gaps are lengths (mm internally);
 :func:`cell_sizes_m` / :func:`domain_grid_params` are the conversion points.
 """
 
@@ -66,6 +66,27 @@ _FACE_PROPS = (
 
 _BC_CHOICES = ["PML", "PEC"]
 
+# Per-face background-spacing property names, in face order (mirrors _FACE_PROPS).
+_SPACING_PROPS = (
+    ("x0", "SpacingXMin", "Background gap added outside the low-x material bound"),
+    ("x1", "SpacingXMax", "Background gap added outside the high-x material bound"),
+    ("y0", "SpacingYMin", "Background gap added outside the low-y material bound"),
+    ("y1", "SpacingYMax", "Background gap added outside the high-y material bound"),
+    ("z0", "SpacingZMin", "Background gap added outside the low-z material bound"),
+    ("z1", "SpacingZMax", "Background gap added outside the high-z material bound"),
+)
+
+# Pre-2026-07 documents carried one scalar gap for all six faces; migrated on
+# restore (see DomainObject.onDocumentRestored).
+_LEGACY_SPACING_PROP = "Spacing"
+
+# Task-panel row labels for the six faces (shared by the spacing and BC rows).
+_FACE_LABELS = {
+    "x0": "X min (x0):", "x1": "X max (x1):",
+    "y0": "Y min (y0):", "y1": "Y max (y1):",
+    "z0": "Z min (z0):", "z1": "Z max (z1):",
+}
+
 # Wireframe edge colours: a cool domain box and a warmer PML box.
 _DOMAIN_COLOR = (0.30, 0.55, 1.00)
 _PML_COLOR = (1.00, 0.45, 0.10)
@@ -86,7 +107,8 @@ class DomainObject:
     Properties:
         ``Dx`` / ``Dy`` / ``Dz`` -- cell sizes (editable).
         ``Nx`` / ``Ny`` / ``Nz`` -- derived cell counts (read-only).
-        ``Spacing``              -- air gap added around the material bounds.
+        ``SpacingX/Y/Z Min/Max`` -- per-face background gap outside the material
+                                    bounds.
         ``Background``           -- Material filling empty voxels (the default
                                     medium); vacuum when unset.
         ``PMLThickness``         -- PML depth in cells, on every PML face.
@@ -171,12 +193,10 @@ class DomainObject:
                     "internally)".format(name[-1].lower()),
                 )
                 obj.setEditorMode(name, 2)  # hidden
-        if not hasattr(obj, "Spacing"):
-            obj.addProperty(
-                "App::PropertyLength", "Spacing", "Domain",
-                "Air gap added around the material bounds on every side",
-            )
-            obj.Spacing = "0 mm"
+        for _face, prop, doc in _SPACING_PROPS:
+            if not hasattr(obj, prop):
+                obj.addProperty("App::PropertyLength", prop, "Domain", doc)
+                setattr(obj, prop, "0 mm")
         if not hasattr(obj, "Background"):
             obj.addProperty(
                 "App::PropertyLink", "Background", "Domain",
@@ -213,6 +233,26 @@ class DomainObject:
     def onDocumentRestored(self, obj):
         obj.Proxy = self
         self.Type = getattr(self, "Type", _DOMAIN_TYPE)
+        self._migrate_spacing(obj)
+
+    @staticmethod
+    def _migrate_spacing(obj):
+        """Ensure the six per-face spacings exist, carrying a legacy value over.
+
+        Documents saved before the gap became per-face hold one scalar
+        ``Spacing`` length; copy it onto every face (which is exactly what it
+        meant) and drop the old property, so the geometry of an existing model is
+        unchanged. Idempotent: a no-op once the six properties are in place.
+        """
+        legacy = getattr(obj, _LEGACY_SPACING_PROP, None)
+        for _face, prop, doc in _SPACING_PROPS:
+            if not hasattr(obj, prop):
+                obj.addProperty("App::PropertyLength", prop, "Domain", doc)
+                setattr(obj, prop, "0 mm")
+            if legacy is not None:
+                setattr(obj, prop, "{} mm".format(legacy.Value))
+        if legacy is not None:
+            obj.removeProperty(_LEGACY_SPACING_PROP)
 
     def execute(self, obj):
         """Resize the boxes and derived counts from the geometry + settings."""
@@ -239,12 +279,15 @@ class DomainObject:
         # run's boundary assumes -- keeping the non-uniform grid consistent.
         force_faces = tem_port_faces(sim)
         params = domain_grid_params(obj, force_pml_faces=force_faces)
-        sp_mm = params["spacing_m"] * _MM_PER_M
+        sp_lo = tuple(s * _MM_PER_M for s in params["spacing_lo"])
+        sp_hi = tuple(s * _MM_PER_M for s in params["spacing_hi"])
         pad_lo, pad_hi = params["pad_lo"], params["pad_hi"]
         dx, dy, dz = (c * _MM_PER_M for c in cell_sizes_m(obj))
 
-        dmin = FreeCAD.Vector(bbox.XMin - sp_mm, bbox.YMin - sp_mm, bbox.ZMin - sp_mm)
-        dmax = FreeCAD.Vector(bbox.XMax + sp_mm, bbox.YMax + sp_mm, bbox.ZMax + sp_mm)
+        dmin = FreeCAD.Vector(bbox.XMin - sp_lo[0], bbox.YMin - sp_lo[1],
+                              bbox.ZMin - sp_lo[2])
+        dmax = FreeCAD.Vector(bbox.XMax + sp_hi[0], bbox.YMax + sp_hi[1],
+                              bbox.ZMax + sp_hi[2])
         obj.DomainMin, obj.DomainMax = dmin, dmax
 
         if params["pml_faces"]:
@@ -285,7 +328,7 @@ class DomainObject:
             obj.Nz = len(nodes[2]) - 1
         else:
             (nx, ny, nz), (ox, oy, oz) = vox._grid_extent(
-                bbox, (dx, dy, dz), sp_mm, pad_lo, pad_hi
+                bbox, (dx, dy, dz), sp_lo, sp_hi, pad_lo, pad_hi
             )
             obj.NodesX = [ox + i * dx for i in range(nx + 1)]
             obj.NodesY = [oy + i * dy for i in range(ny + 1)]
@@ -557,10 +600,28 @@ def time_steps_for(domain, max_time_s):
     return max(1, int(math.ceil(max_time_s / dt)))
 
 
+def spacings_m(domain):
+    """Per-face background gap in metres, keyed by face name (``'x0'``..``'z1'``).
+
+    Falls back to a legacy scalar ``Spacing`` (same gap on every face) for a
+    domain that has not been through :meth:`DomainObject._migrate_spacing` yet,
+    and to zero for one with neither.
+    """
+    legacy = getattr(domain, _LEGACY_SPACING_PROP, None)
+    default = float(legacy.Value) if legacy is not None else 0.0
+    out = {}
+    for face, prop, _doc in _SPACING_PROPS:
+        value = getattr(domain, prop, None)
+        mm = float(value.Value) if value is not None else default
+        out[face] = mm / _MM_PER_M
+    return out
+
+
 def domain_grid_params(domain, force_pml_faces=()):
     """Map a domain's per-face boundary settings to grid/solver parameters.
 
-    Returns a dict with ``spacing_m``, ``pad_lo``/``pad_hi`` (per-axis PML cells),
+    Returns a dict with ``spacing_lo``/``spacing_hi`` (per-axis background gaps in
+    metres, low/high side), ``pad_lo``/``pad_hi`` (per-axis PML cells),
     ``pml_faces``, ``pec_faces`` and ``d_pml``. This is the one place the per-face
     properties are interpreted, so the drawn boxes, the voxelised grid and the
     runner all agree.
@@ -589,9 +650,10 @@ def domain_grid_params(domain, force_pml_faces=()):
         d_pml if bc["y1"] == "PML" else 0,
         d_pml if bc["z1"] == "PML" else 0,
     )
-    spacing_m = float(domain.Spacing.Value) / _MM_PER_M
+    spacing = spacings_m(domain)
     return {
-        "spacing_m": spacing_m,
+        "spacing_lo": (spacing["x0"], spacing["y0"], spacing["z0"]),
+        "spacing_hi": (spacing["x1"], spacing["y1"], spacing["z1"]),
         "pad_lo": pad_lo,
         "pad_hi": pad_hi,
         "pml_faces": pml_faces,
@@ -1005,12 +1067,28 @@ if _GUI_AVAILABLE:
 
             self._counts = QtWidgets.QLabel(self._counts_text())
 
-            self._spacing = QtWidgets.QDoubleSpinBox()
-            self._spacing.setRange(0.0, 1.0e6)
-            self._spacing.setDecimals(4)
-            self._spacing.setSuffix(" mm")
-            self._spacing.setSingleStep(0.5)
-            self._spacing.setValue(float(obj.Spacing.Value))
+            # Per-face background spacing, built like the per-face BCs below: a
+            # "same on all faces" checkbox drives every face from the first
+            # (X min) box and greys the rest out. The migration is re-run here so
+            # a document whose Proxy failed to restore still has the six
+            # properties the widgets read and write (it no-ops once migrated).
+            DomainObject._migrate_spacing(obj)
+            self._spacing_order = [prop for _f, prop, _d in _SPACING_PROPS]
+            self._spacings = {}
+            for _face, prop, _doc in _SPACING_PROPS:
+                spin = QtWidgets.QDoubleSpinBox()
+                spin.setRange(0.0, 1.0e6)
+                spin.setDecimals(4)
+                spin.setSuffix(" mm")
+                spin.setSingleStep(0.5)
+                spin.setValue(float(getattr(obj, prop).Value))
+                self._spacings[prop] = spin
+            self._same_spacing = QtWidgets.QCheckBox(
+                "Same background spacing on all faces"
+            )
+            self._same_spacing.setChecked(
+                len({round(s.value(), 6) for s in self._spacings.values()}) == 1
+            )
 
             self._dpml = QtWidgets.QSpinBox()
             self._dpml.setRange(1, 100)
@@ -1057,12 +1135,18 @@ if _GUI_AVAILABLE:
             layout.addRow("Max grading ratio:", self._ratio)
             layout.addRow("Min cell size:", self._min_cell)
             layout.addRow("Cell counts:", self._counts)
-            layout.addRow("Air spacing:", self._spacing)
+            # Per-face background spacing. Headed, because the six face rows here
+            # and the six boundary-condition rows below carry the same labels.
+            layout.addRow(QtWidgets.QLabel("<b>Background spacing</b>"))
+            layout.addRow(self._same_spacing)
+            for face, prop, _doc in _SPACING_PROPS:
+                layout.addRow(_FACE_LABELS[face], self._spacings[prop])
             layout.addRow("Background material:", self._background)
             layout.addRow("PML thickness:", self._dpml)
 
             # Per-face boundary conditions. A "same on all faces" checkbox drives
             # every face from the first (X min) combo and greys the rest out.
+            layout.addRow(QtWidgets.QLabel("<b>Boundary conditions</b>"))
             self._bc_order = [prop for _f, prop, _d in _FACE_PROPS]
             self._same_bc = QtWidgets.QCheckBox("Same condition on all faces")
             all_same = len({str(getattr(obj, p)) for p in self._bc_order}) == 1
@@ -1070,21 +1154,17 @@ if _GUI_AVAILABLE:
             layout.addRow(self._same_bc)
 
             self._combos = {}
-            labels = {
-                "BoundaryXMin": "X min (x0):", "BoundaryXMax": "X max (x1):",
-                "BoundaryYMin": "Y min (y0):", "BoundaryYMax": "Y max (y1):",
-                "BoundaryZMin": "Z min (z0):", "BoundaryZMax": "Z max (z1):",
-            }
-            for _face, prop, _doc in _FACE_PROPS:
+            for face, prop, _doc in _FACE_PROPS:
                 combo = QtWidgets.QComboBox()
                 combo.addItems(_BC_CHOICES)
                 combo.setCurrentText(str(getattr(obj, prop)))
                 self._combos[prop] = combo
-                layout.addRow(labels[prop], combo)
+                layout.addRow(_FACE_LABELS[face], combo)
 
             info = QtWidgets.QLabel(
-                "The domain box auto-sizes to the assigned geometry plus the air "
-                "spacing. PML faces absorb outgoing waves and enlarge the grid; "
+                "The domain box auto-sizes to the assigned geometry plus the "
+                "per-face background spacing (filled with the background "
+                "material). PML faces absorb outgoing waves and enlarge the grid; "
                 "PEC faces are perfectly-conducting walls. The CFL time step is "
                 "computed by the solver and reported in the run summary."
             )
@@ -1104,10 +1184,19 @@ if _GUI_AVAILABLE:
             self._dx.valueChanged.connect(self._mirror_cubic)
             # Live-apply: push edits onto the Domain and recompute so the derived
             # cell counts *and* the 3D mesh preview refresh immediately, before OK.
-            for w in (self._dx, self._dy, self._dz, self._ratio, self._min_cell,
-                      self._spacing):
+            for w in (self._dx, self._dy, self._dz, self._ratio, self._min_cell):
                 w.valueChanged.connect(self._live_apply)
             self._dpml.valueChanged.connect(self._live_apply)
+            first_spacing = self._spacing_order[0]
+            for prop, spin in self._spacings.items():
+                if prop != first_spacing:
+                    spin.valueChanged.connect(self._live_apply)
+            # As with the BCs, the first face's box drives the rest (when "same"
+            # is on) and then applies, so one recompute covers all six faces.
+            self._spacings[first_spacing].valueChanged.connect(
+                self._on_first_spacing
+            )
+            self._same_spacing.toggled.connect(self._on_same_spacing)
             # The resolution, background medium and grid mode all change the
             # frequency-driven cell size, so they re-derive it and apply
             # immediately (see _auto_fill_cell_size) -- no need to press the
@@ -1129,6 +1218,7 @@ if _GUI_AVAILABLE:
             self._same_bc.toggled.connect(self._on_same_bc)
             self._on_cubic(self._cubic.isChecked())
             self._on_nonuniform(self._nonuniform.isChecked())
+            self._on_same_spacing(self._same_spacing.isChecked())
             self._on_same_bc(self._same_bc.isChecked())
             self._initializing = False
 
@@ -1186,6 +1276,27 @@ if _GUI_AVAILABLE:
             else:
                 self._on_cubic(self._cubic.isChecked())
 
+        def _on_same_spacing(self, checked):
+            """Grey out all but the first spacing box and drive them from it."""
+            first = self._spacings[self._spacing_order[0]]
+            self._suspend = True
+            for prop in self._spacing_order[1:]:
+                spin = self._spacings[prop]
+                spin.setEnabled(not checked)
+                if checked:
+                    spin.setValue(first.value())
+            self._suspend = False
+            self._live_apply()
+
+        def _on_first_spacing(self, value):
+            """Mirror the first face's spacing onto the rest ('same' on), apply."""
+            if self._same_spacing.isChecked():
+                self._suspend = True
+                for prop in self._spacing_order[1:]:
+                    self._spacings[prop].setValue(value)
+                self._suspend = False
+            self._live_apply()
+
         def _on_same_bc(self, checked):
             """Grey out all but the first BC combo and drive them from it."""
             first = self._combos[self._bc_order[0]]
@@ -1226,7 +1337,8 @@ if _GUI_AVAILABLE:
                 "MaxGradingRatio": float(getattr(obj, "MaxGradingRatio", 1.5)),
                 "MinCellSize": (float(obj.MinCellSize.Value)
                                 if hasattr(obj, "MinCellSize") else 0.0),
-                "Spacing": obj.Spacing.Value,
+                "spacing": {p: getattr(obj, p).Value
+                            for p in self._spacing_order},
                 "PMLThickness": int(getattr(obj, "PMLThickness", 8)),
                 "Background": getattr(obj, "Background", None),
                 "bc": {p: str(getattr(obj, p)) for p in self._bc_order},
@@ -1243,7 +1355,8 @@ if _GUI_AVAILABLE:
             obj.MaxGradingRatio = float(self._ratio.value())
             if hasattr(obj, "MinCellSize"):
                 obj.MinCellSize = "{} mm".format(self._min_cell.value())
-            obj.Spacing = "{} mm".format(self._spacing.value())
+            for prop, spin in self._spacings.items():
+                setattr(obj, prop, "{} mm".format(spin.value()))
             obj.PMLThickness = int(self._dpml.value())
             obj.Background = self._selected_background()
             for prop, combo in self._combos.items():
@@ -1268,7 +1381,8 @@ if _GUI_AVAILABLE:
             obj.MaxGradingRatio = o["MaxGradingRatio"]
             if hasattr(obj, "MinCellSize"):
                 obj.MinCellSize = "{} mm".format(o["MinCellSize"])
-            obj.Spacing = "{} mm".format(o["Spacing"])
+            for prop, val in o["spacing"].items():
+                setattr(obj, prop, "{} mm".format(val))
             obj.PMLThickness = o["PMLThickness"]
             obj.Background = o["Background"]
             for prop, val in o["bc"].items():

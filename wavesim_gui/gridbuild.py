@@ -349,14 +349,15 @@ def build_domain_nodes(sim, domain, force_pml_faces=()):
         return None
 
     params = domain_mod.domain_grid_params(domain, force_pml_faces=force_pml_faces)
-    sp_mm = params["spacing_m"] * _MM_PER_M
+    sp_lo_mm = tuple(s * _MM_PER_M for s in params["spacing_lo"])
+    sp_hi_mm = tuple(s * _MM_PER_M for s in params["spacing_hi"])
     pad_lo, pad_hi = params["pad_lo"], params["pad_hi"]
     coarse_mm = tuple(c * _MM_PER_M for c in domain_mod.cell_sizes_m(domain))
     ratio = max(float(getattr(domain, "MaxGradingRatio", 1.5)), 1.0 + 1.0e-6)
     min_cell_mm = domain_mod.min_cell_size_m(domain) * _MM_PER_M
 
-    los = (bbox.XMin - sp_mm, bbox.YMin - sp_mm, bbox.ZMin - sp_mm)
-    his = (bbox.XMax + sp_mm, bbox.YMax + sp_mm, bbox.ZMax + sp_mm)
+    los = (bbox.XMin - sp_lo_mm[0], bbox.YMin - sp_lo_mm[1], bbox.ZMin - sp_lo_mm[2])
+    his = (bbox.XMax + sp_hi_mm[0], bbox.YMax + sp_hi_mm[1], bbox.ZMax + sp_hi_mm[2])
     snaps = collect_axis_snaps(materials)
     # Per-axis material cell-size caps: higher-index bodies refine their band
     # below the coarse (background) target. Scaled alongside ``coarse`` in the

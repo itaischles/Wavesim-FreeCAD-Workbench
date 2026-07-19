@@ -203,32 +203,36 @@ def combined_bbox_mm(sim, materials):
     return bbox
 
 
-def _grid_extent(bbox, cell_mm, spacing_mm, pad_lo, pad_hi):
+def _grid_extent(bbox, cell_mm, spacing_lo_mm, spacing_hi_mm, pad_lo, pad_hi):
     """Per-axis ``(counts, origin_mm)`` for the given sizing.
 
-    The inner region is the material bounds grown by ``spacing_mm`` on every
-    side and rounded up to whole cells; ``pad_lo``/``pad_hi`` add the per-side
-    PML cells outside that. The origin is the min corner of the *padded* grid.
+    The inner region is the material bounds grown by ``spacing_lo_mm`` /
+    ``spacing_hi_mm`` on the low/high side of each axis and rounded up to whole
+    cells; ``pad_lo``/``pad_hi`` add the per-side PML cells outside that. The
+    origin is the min corner of the *padded* grid.
     """
     exts = (bbox.XLength, bbox.YLength, bbox.ZLength)
     mins = (bbox.XMin, bbox.YMin, bbox.ZMin)
     counts = []
     origin = []
     for a in range(3):
-        inner = max(1, int(math.ceil((exts[a] + 2.0 * spacing_mm) / cell_mm[a])))
+        grown = exts[a] + float(spacing_lo_mm[a]) + float(spacing_hi_mm[a])
+        inner = max(1, int(math.ceil(grown / cell_mm[a])))
         counts.append(inner + int(pad_lo[a]) + int(pad_hi[a]))
-        origin.append(mins[a] - spacing_mm - int(pad_lo[a]) * cell_mm[a])
+        origin.append(
+            mins[a] - float(spacing_lo_mm[a]) - int(pad_lo[a]) * cell_mm[a]
+        )
     return tuple(counts), tuple(origin)
 
 
 def _sizing_for(sim, default_padding):
-    """Resolve ``(spacing_m, pad_lo, pad_hi, domain)`` for *sim*.
+    """Resolve ``(spacing_lo, spacing_hi, pad_lo, pad_hi, domain)`` for *sim*.
 
-    Uses the Domain object's spacing and per-face PML padding when one exists
+    Uses the Domain object's per-face spacing and PML padding when one exists
     (with TEM-port faces forced to PML, matching the drawn box and the run so the
     derived cell counts include the port-face absorber padding); otherwise falls
-    back to the legacy uniform ``default_padding`` cells on every side with no air
-    spacing (so a document without a domain runs as before).
+    back to the legacy uniform ``default_padding`` cells on every side with no
+    background spacing (so a document without a domain runs as before).
     """
     from wavesim_gui import domain as domain_mod
 
@@ -237,9 +241,9 @@ def _sizing_for(sim, default_padding):
         p = domain_mod.domain_grid_params(
             dom, force_pml_faces=domain_mod.tem_port_faces(sim)
         )
-        return p["spacing_m"], p["pad_lo"], p["pad_hi"], dom
+        return p["spacing_lo"], p["spacing_hi"], p["pad_lo"], p["pad_hi"], dom
     pad = (default_padding, default_padding, default_padding)
-    return 0.0, pad, pad, None
+    return (0.0, 0.0, 0.0), (0.0, 0.0, 0.0), pad, pad, None
 
 
 def derive_grid_dims(sim, cell_size_m, padding_cells=8):
@@ -256,10 +260,12 @@ def derive_grid_dims(sim, cell_size_m, padding_cells=8):
     bbox = combined_bbox_mm(sim, materials_mod.find_materials(sim))
     if bbox is None:
         return None
-    spacing_m, pad_lo, pad_hi, _dom = _sizing_for(sim, padding_cells)
+    sp_lo, sp_hi, pad_lo, pad_hi, _dom = _sizing_for(sim, padding_cells)
     cell_mm = tuple(c * _MM_PER_M for c in cell_size_m)
     (Nx, Ny, Nz), _origin = _grid_extent(
-        bbox, cell_mm, spacing_m * _MM_PER_M, pad_lo, pad_hi
+        bbox, cell_mm,
+        tuple(s * _MM_PER_M for s in sp_lo), tuple(s * _MM_PER_M for s in sp_hi),
+        pad_lo, pad_hi,
     )
     return {
         "Nx": Nx, "Ny": Ny, "Nz": Nz,
@@ -306,7 +312,7 @@ def _extrude_port_faces(arrays, port_faces, bg_eps=1.0, bg_mu=1.0, bg_pec=False)
     """Make the material arrays invariant along each TEM port's normal axis.
 
     For every face in *port_faces* (solver names ``'x0'``..``'z1'``) the
-    boundary-most material cross-section is copied outward across the air spacing
+    boundary-most material cross-section is copied outward across the background
     and PML cells, out to the grid edge. A waveguide mode is only guided where
     its PEC cross-section is invariant along the propagation axis; without this
     the conductors stop at the geometry and the PML behind a port plane is empty
@@ -759,7 +765,8 @@ def _smooth_dielectric_body(arrays, body_shape, eps_r, mu_r,
         sub[covered] = False
 
 
-def voxelize_materials(materials, cell_size_m, spacing_m=0.0,
+def voxelize_materials(materials, cell_size_m,
+                       spacing_lo_m=(0.0, 0.0, 0.0), spacing_hi_m=(0.0, 0.0, 0.0),
                        pad_lo=(8, 8, 8), pad_hi=(8, 8, 8),
                        extra_points_mm=(), extra_axis_offsets=(),
                        port_faces=(), bg_eps=1.0, bg_mu=1.0, bg_pec=False,
@@ -776,9 +783,10 @@ def voxelize_materials(materials, cell_size_m, spacing_m=0.0,
         is intentionally no auto-chosen default: the cell size is a deliberate
         user decision, so the caller must supply one (see
         :func:`build_job_from_document`, which refuses to run without a Grid).
-    spacing_m : float
-        Air gap (metres) added around the material bounds on every side, before
-        any PML padding. From the Domain object's ``Spacing`` (0 with no domain).
+    spacing_lo_m, spacing_hi_m : tuple of float
+        Background gap (metres) added outside the material bounds on the low/high
+        side of x, y, z, before any PML padding. From the Domain object's
+        per-face ``Spacing*`` properties (all zero with no domain).
     pad_lo, pad_hi : tuple of int
         Per-axis PML padding in cells on the low/high side of x, y, z. From the
         Domain's per-face boundary settings; the legacy default is 8 cells all
@@ -799,7 +807,7 @@ def voxelize_materials(materials, cell_size_m, spacing_m=0.0,
         Explicit per-axis node coordinates ``(x, y, z)`` in **world metres**
         (strictly increasing, PML pad cells included) from the Domain's graded
         grid. When given, the grid extent/cell centres come from these directly
-        and *cell_size_m*/*spacing_m*/*pad_lo*/*pad_hi*/*extra_** are ignored (the
+        and *cell_size_m*/*spacing_**/*pad_lo*/*pad_hi*/*extra_** are ignored (the
         node arrays already bake them in). When ``None`` (the uniform default),
         a regular grid is derived from *cell_size_m* + the bounds, exactly as
         before. Cell centres are always ``0.5*(nodes[:-1]+nodes[1:])``, so the
@@ -854,7 +862,10 @@ def voxelize_materials(materials, cell_size_m, spacing_m=0.0,
         bbox = _expand_bbox_axis(bbox, extra_axis_offsets)
         dx_mm, dy_mm, dz_mm = (c * _MM_PER_M for c in cell_size_m)
         (Nx, Ny, Nz), (ox, oy, oz) = _grid_extent(
-            bbox, (dx_mm, dy_mm, dz_mm), spacing_m * _MM_PER_M, pad_lo, pad_hi
+            bbox, (dx_mm, dy_mm, dz_mm),
+            tuple(s * _MM_PER_M for s in spacing_lo_m),
+            tuple(s * _MM_PER_M for s in spacing_hi_m),
+            pad_lo, pad_hi,
         )
         nodes_mm = (
             ox + np.arange(Nx + 1) * dx_mm,
@@ -1249,7 +1260,8 @@ def build_job_from_document(doc, steps=None, fmax=30.0e9, progress=None):
     port_faces += [str(p.Face) for p in spice_mod.find_spice_tem_ports(sim)]
 
     grid_params = domain_mod.domain_grid_params(dom, force_pml_faces=port_faces)
-    spacing_m = grid_params["spacing_m"]
+    spacing_lo = grid_params["spacing_lo"]
+    spacing_hi = grid_params["spacing_hi"]
     pad_lo, pad_hi = grid_params["pad_lo"], grid_params["pad_hi"]
     # Background (empty-voxel) medium: the Domain's chosen background Material,
     # defaulting to vacuum when unset.
@@ -1273,7 +1285,9 @@ def build_job_from_document(doc, steps=None, fmax=30.0e9, progress=None):
     # Grow the grid to include every source position and snapshot slice, so an
     # input outside the material bounds (or in the PML) still lands inside it.
     vox = voxelize_materials(
-        materials, cell_size_m, spacing_m=spacing_m, pad_lo=pad_lo, pad_hi=pad_hi,
+        materials, cell_size_m,
+        spacing_lo_m=spacing_lo, spacing_hi_m=spacing_hi,
+        pad_lo=pad_lo, pad_hi=pad_hi,
         extra_points_mm=source_points_mm(sim),
         extra_axis_offsets=snapshot_axis_offsets(sim),
         port_faces=port_faces,

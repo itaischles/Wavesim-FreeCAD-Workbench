@@ -762,6 +762,42 @@ if _GUI_AVAILABLE:
             obj, "current (A)", "SPICE port current vs. time", "#9467bd"
         )
 
+    # Colour-scale clip percentiles offered for snapshot maps, strongest first.
+    # 100 means "scale on the true peak" (the old behaviour).
+    _CLIP_CHOICES = (99.5, 99.9, 99.0, 98.0, 95.0, 100.0)
+
+    def _robust_vmax(stack, pct):
+        """Colour-scale limit for *stack*: the *pct* percentile of ``|stack|``.
+
+        Scaling a linear map on the true peak is usually wrong here. A source
+        cell, a PEC corner or a PML sliver sits orders of magnitude above the
+        propagating field, so the peak sets a limit the rest of the domain never
+        approaches and everything else renders as the colour map's midpoint —
+        near-white in RdBu_r. Taking a high percentile instead puts the full
+        colour range over the field that actually fills the picture and lets the
+        few hot cells saturate (the colour bar's arrows mark that).
+
+        Exact zeros are excluded: pre-arrival frames and conductor interiors are
+        zero over much of the stack, and counting them would drag the percentile
+        down by an amount that depends on domain size rather than on the field.
+        """
+        import numpy as np
+
+        arr = np.asarray(stack)
+        if arr.size == 0:
+            return 0.0
+        # Percentiles sort a copy, so sample rather than sort a whole run's
+        # frames; a strided view over the flat stack spans every frame evenly.
+        flat = arr.reshape(-1)
+        step = max(1, flat.size // 2000000)
+        v = np.abs(np.asarray(flat[::step], dtype=float))
+        v = v[np.isfinite(v) & (v > 0.0)]
+        if v.size == 0:
+            return 0.0
+        if pct >= 100.0:
+            return float(v.max())
+        return float(np.percentile(v, pct))
+
     def _plot_snapshot(obj):
         import numpy as np
 
@@ -840,13 +876,28 @@ if _GUI_AVAILABLE:
         # component rescales rather than showing it washed out.
         from matplotlib import colors as mcolors
 
-        view = {"comp": comp, "frames": frames}
+        view = {"comp": comp, "frames": frames, "clip": _CLIP_CHOICES[0]}
 
         def _cmap_for(choice):
             return "inferno" if _is_magnitude(choice) else "RdBu_r"
 
+        # (component, percentile) -> vmax. Each limit spans the whole run so the
+        # scale holds still while the animation plays, which makes recomputing
+        # it on every norm change pure waste.
+        _vmax_cache = {}
+
+        def _vmax_for(pct):
+            hit = _vmax_cache.get((view["comp"], pct))
+            if hit is None:
+                hit = _robust_vmax(view["frames"], pct) or 1.0
+                _vmax_cache[(view["comp"], pct)] = hit
+            return hit
+
         def _make_norm(log):
-            vmax = float(np.nanmax(np.abs(view["frames"]))) or 1.0
+            # Log scaling shows the whole dynamic range by construction, so it
+            # keeps the true peak; the clip percentile is what rescues the
+            # linear map from a handful of outlying cells.
+            vmax = _vmax_for(100.0 if log else view["clip"])
             linthresh = vmax / 1e3
             if _is_magnitude(view["comp"]):
                 if log:
@@ -983,7 +1034,27 @@ if _GUI_AVAILABLE:
             if quiver["art"] is not None:
                 quiver["art"].set_UVC(*quiver["uv"](idx))
 
-        cbar = figure.colorbar(artist, ax=ax, label=comp)
+        # Arrows on the clipped end(s): with a percentile scale the hottest cells
+        # are out of range by design, and the bar should say so rather than let
+        # them pass for the extreme colour. A magnitude has no bottom end to
+        # clip, so switching between the two kinds of map rebuilds the bar --
+        # `extend` is fixed at construction.
+        def _extend_for(choice):
+            return "max" if _is_magnitude(choice) else "both"
+
+        cbar = {"art": None, "extend": None}
+
+        def _make_cbar(choice):
+            ext = _extend_for(choice)
+            if cbar["art"] is not None:
+                if cbar["extend"] == ext:
+                    cbar["art"].set_label(choice)
+                    return
+                cbar["art"].remove()
+            cbar["art"] = figure.colorbar(artist, ax=ax, label=choice, extend=ext)
+            cbar["extend"] = ext
+
+        _make_cbar(comp)
         ax.set_xlabel(xlabel)
         ax.set_ylabel(ylabel)
 
@@ -1020,6 +1091,18 @@ if _GUI_AVAILABLE:
             controls.addWidget(component)
         controls.addWidget(play)
         controls.addWidget(slider, 1)
+        clip = QtWidgets.QComboBox()
+        for pct in _CLIP_CHOICES:
+            clip.addItem(
+                "peak" if pct >= 100.0 else "{:g}%".format(pct), float(pct)
+            )
+        clip.setToolTip(
+            "Percentile of |field| mapped to the end of the colour scale.\n"
+            "Below 'peak', the hottest cells saturate so the rest of the\n"
+            "domain uses the full colour range. Linear scale only."
+        )
+        controls.addWidget(QtWidgets.QLabel("Clip:"))
+        controls.addWidget(clip)
         controls.addWidget(log_check)
         vector_check = None
         if can_quiver:
@@ -1031,6 +1114,8 @@ if _GUI_AVAILABLE:
         layout.addLayout(controls)
 
         def on_log(checked):
+            # Log spans the full range on its own, so the clip has nothing to do.
+            clip.setEnabled(not checked)
             artist.set_norm(_make_norm(bool(checked)))
             if quiver["art"] is not None:
                 # Arrow lengths follow the same compression as the colour map.
@@ -1038,6 +1123,13 @@ if _GUI_AVAILABLE:
             dialog._canvas.draw_idle()
 
         log_check.toggled.connect(on_log)
+
+        def on_clip(idx):
+            view["clip"] = float(clip.itemData(idx))
+            artist.set_norm(_make_norm(log_check.isChecked()))
+            dialog._canvas.draw_idle()
+
+        clip.currentIndexChanged.connect(on_clip)
 
         def show_frame(idx):
             idx = max(0, min(int(idx), len(view["frames"]) - 1))
@@ -1061,7 +1153,7 @@ if _GUI_AVAILABLE:
             view["comp"], view["frames"] = choice, stack
             artist.set_cmap(_cmap_for(choice))
             artist.set_norm(_make_norm(log_check.isChecked()))
-            cbar.set_label(choice)
+            _make_cbar(choice)
             if quiver["art"] is not None:
                 # The vector is the same; only its contrast with the map changes.
                 quiver["art"].set_color(_arrow_color(choice))

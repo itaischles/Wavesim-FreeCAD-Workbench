@@ -879,7 +879,7 @@ if _GUI_AVAILABLE:
         view = {"comp": comp, "frames": frames, "clip": _CLIP_CHOICES[0]}
 
         def _cmap_for(choice):
-            return "inferno" if _is_magnitude(choice) else "RdBu_r"
+            return "turbo" if _is_magnitude(choice) else "RdBu_r"
 
         # (component, percentile) -> vmax. Each limit spans the whole run so the
         # scale holds still while the animation plays, which makes recomputing

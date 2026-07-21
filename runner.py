@@ -42,10 +42,13 @@ job.json schema (Session 2)
                  # uniform run stays on create_grid to keep dt/results exact.
       "boundary": {"d_pml": 10, "faces": ["x0",...], "pec_faces": ["z0",...]} | null,
       "source": {"component":"Ez", "x":.., "y":.., "z":..,
-                 "excitation": {"type":"gaussian"|"sine"|"rectangular"|
-                                "gaussian_sine", ...params (SI)...}} | null,
+                 "excitation": {"type":"gaussian"|"sine"|"sinusoid"|
+                                "rectangular"|"gaussian_sine",
+                                ...params (SI)...}} | null,
                  # legacy jobs may instead carry flat "fmax"/"amplitude" keys
                  # (a Gaussian pulse); see _build_waveform for the param set.
+                 # "sinusoid" is the ramped CW drive (raised-cosine turn-on over
+                 # "ramp_cycles" periods), built from the solver's Sinusoid.
       "tem_sources": [{"name":.., "normal":"z", "position":..,
                        "direction": 1.0|-1.0,   # +/-normal launch (into domain)
                        "conductor_id": 0,       # which solved mode to launch:
@@ -68,6 +71,13 @@ job.json schema (Session 2)
                        "excitation": {"type":.., ...}, "fields":"EH"|"E"}, ...],
                        # legacy entries may carry flat "fmax"/"amplitude" keys
                        # and omit "direction" (defaults to +normal / low face)
+      "plane_waves": [{"face":"x0".."z1", "angle_deg":.., "directional":true,
+                       "excitation": {"type":.., ...}}, ...],
+                       # directional plane waves launched from a boundary face,
+                       # one PML-depth in (d_pml taken from "boundary"). "angle_deg"
+                       # is the E polarization measured in that face's right-handed
+                       # transverse frame (see wavesim.sources._FACE_CFG). The face
+                       # must be a PML face (the workbench forces it).
       "ngspice_dll": "<path to ngspice.dll>", # optional; library_path for all
                                               # SPICE ports (else PySpice search)
       "spice_ports": [                        # SPICE co-simulation ports
@@ -180,6 +190,7 @@ for current.)
 """
 
 import json
+import math
 import os
 import sys
 import time
@@ -284,8 +295,6 @@ def _build_waveform(ws, s):
     valid waveform (see ``wavesim.sources``). Falls back to the legacy flat
     ``fmax``/``amplitude`` Gaussian for jobs written before excitation types.
     """
-    import math
-
     exc = s.get("excitation")
     if not exc:
         return ws.GaussianPulse.for_fmax(
@@ -306,6 +315,18 @@ def _build_waveform(ws, s):
         freq = float(exc.get("frequency", 30.0e9))
         phase = math.radians(float(exc.get("phase_deg", 0.0)))
         return lambda t: amp * math.sin(2.0 * math.pi * freq * t + phase)
+
+    if typ == "sinusoid":
+        # Ramped CW. Use the solver's native Sinusoid so the launch machinery can
+        # read its ``center_frequency`` (it tunes a directional plane-wave / TEM
+        # launch's H time shift to the numerical phase velocity). ``phase`` is in
+        # radians solver-side; ``ramp_cycles`` is the raised-cosine turn-on length.
+        return ws.Sinusoid(
+            frequency=float(exc.get("frequency", 30.0e9)),
+            amplitude=amp,
+            phase=math.radians(float(exc.get("phase_deg", 0.0))),
+            ramp_cycles=float(exc.get("ramp_cycles", 3.0)),
+        )
 
     if typ == "rectangular":
         start = float(exc.get("start_time", 0.0))
@@ -1047,6 +1068,21 @@ def run_job(workdir):
             s["component"], float(s["x"]), float(s["y"]), float(s["z"]), waveform
         ))
     sources.extend(plane_sources)
+
+    # Boundary plane waves: a one-way plane wave launched from a boundary face,
+    # one PML-depth inside it. The E sheet is placed at cell ``d_pml`` (low face)
+    # or ``N-1-d_pml`` (high face), so it sits on the first interior cell of the
+    # forced-PML launch face and its backward lobe is absorbed. ``d_pml`` comes
+    # from the run's boundary so the sheet matches the actual absorber thickness.
+    for pw in job.get("plane_waves") or []:
+        waveform = _build_waveform(ws, pw)
+        sources.append(ws.PlaneWave(
+            str(pw["face"]),
+            math.radians(float(pw.get("angle_deg", 0.0))),
+            waveform,
+            d_pml=int(boundary.get("d_pml", 10)),
+            directional=bool(pw.get("directional", True)),
+        ))
 
     # SPICE co-simulation ports: one live ngspice instance each, driven in
     # lockstep with the FDTD loop. Kept aside so their port records can be saved

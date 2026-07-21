@@ -744,6 +744,7 @@ if _GUI_AVAILABLE:
     from wavesim_gui import domain  # noqa: F401  (registers the Domain object/VP)
     from wavesim_gui import source  # noqa: F401  (registers Wavesim_AddSource)
     from wavesim_gui import tem_source  # noqa: F401  (registers Wavesim_AddTEMSource)
+    from wavesim_gui import plane_wave  # noqa: F401  (registers Wavesim_AddPlaneWave)
     from wavesim_gui import spice_port  # noqa: F401  (registers the SPICE port commands)
     from wavesim_gui import monitors  # noqa: F401  (registers the monitor commands)
     from wavesim_gui import results  # noqa: F401  (registers result proxies/VPs)

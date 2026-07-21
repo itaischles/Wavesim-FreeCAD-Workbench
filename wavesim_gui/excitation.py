@@ -25,15 +25,24 @@ workbench. Keep the maths here in step with ``runner._build_waveform``.
 
 Excitation spec dict (the job.json contract)
 --------------------------------------------
-    {"type": "gaussian"|"sine"|"rectangular"|"gaussian_sine",
+    {"type": "gaussian"|"sine"|"sinusoid"|"rectangular"|"gaussian_sine",
      "amplitude": <peak>,
      "fmax": <Hz>,          # gaussian (bandwidth), gaussian_sine (envelope BW)
-     "frequency": <Hz>,     # sine / gaussian_sine carrier
-     "phase_deg": <deg>,    # sine / gaussian_sine carrier phase
+     "frequency": <Hz>,     # sine / sinusoid / gaussian_sine carrier
+     "phase_deg": <deg>,    # sine / sinusoid / gaussian_sine carrier phase
+     "ramp_cycles": <n>,    # sinusoid: raised-cosine turn-on length, in periods
      "start_time": <s>,     # rectangular: delay before the ramp up
      "rise_time":  <s>,     # rectangular: linear ramp-up duration
      "flat_time":  <s>,     # rectangular: flat-top duration
      "fall_time":  <s>}     # rectangular: linear ramp-down duration
+
+The ``sinusoid`` family is the ramped continuous-wave drive: it mirrors the
+solver's :class:`wavesim.sources.Sinusoid`, multiplying the carrier by a
+raised-cosine envelope over the first ``ramp_cycles`` periods so both the value
+and its slope are continuous at turn-on. The older bare ``sine`` (an abrupt
+``amp*sin(2*pi*f*t + phase)``) is kept for reproducing earlier runs; prefer
+``sinusoid`` for any CW excitation, and for driving a TEM/plane-wave launch (its
+``center_frequency`` lets the solver tune the directional launch's H time shift).
 """
 
 import math
@@ -48,24 +57,27 @@ from wavesim_gui import units
 # --------------------------------------------------------------------------- #
 
 # Parameter *kinds* -- tell the panel how to show/convert a value (frequency and
-# time use the simulation's display unit; amplitude and phase are shown as-is).
+# time use the simulation's display unit; amplitude, phase and count are as-is).
 KIND_FREQ = "freq"
 KIND_TIME = "time"
 KIND_AMP = "amp"
 KIND_PHASE = "phase"
+KIND_COUNT = "count"  # a dimensionless count (e.g. ramp cycles), shown raw
 
 # Waveform type keys, in the order they appear in the panel's combo box.
 GAUSSIAN = "gaussian"
 SINE = "sine"
+SINUSOID = "sinusoid"
 RECTANGULAR = "rectangular"
 GAUSSIAN_SINE = "gaussian_sine"
 
-ORDER = [GAUSSIAN, SINE, RECTANGULAR, GAUSSIAN_SINE]
+ORDER = [GAUSSIAN, SINE, SINUSOID, RECTANGULAR, GAUSSIAN_SINE]
 
 # Human-readable names shown to the user (and stored in the Excitation enum).
 LABELS = {
     GAUSSIAN: "Gaussian Pulse",
     SINE: "Sine Wave",
+    SINUSOID: "Sinusoid (ramped CW)",
     RECTANGULAR: "Rectangular Pulse",
     GAUSSIAN_SINE: "Gaussian + Sine",
 }
@@ -80,6 +92,12 @@ PARAMS = {
         ("frequency", "Frequency", KIND_FREQ, 30.0e9),
         ("amplitude", "Amplitude", KIND_AMP, 1.0),
         ("phase_deg", "Phase offset", KIND_PHASE, 0.0),
+    ],
+    SINUSOID: [
+        ("frequency", "Frequency", KIND_FREQ, 30.0e9),
+        ("amplitude", "Amplitude", KIND_AMP, 1.0),
+        ("phase_deg", "Phase offset", KIND_PHASE, 0.0),
+        ("ramp_cycles", "Ramp-up cycles", KIND_COUNT, 3.0),
     ],
     RECTANGULAR: [
         ("amplitude", "Amplitude", KIND_AMP, 1.0),
@@ -142,6 +160,7 @@ PROP_FOR_KEY = {
     "amplitude": "Amplitude",
     "frequency": "Frequency",
     "phase_deg": "PhaseDeg",
+    "ramp_cycles": "RampCycles",
     "start_time": "StartTime",
     "rise_time": "RiseTime",
     "flat_time": "FlatTime",
@@ -153,9 +172,11 @@ PARAM_DESCRIPTIONS = {
     "fmax": "Gaussian bandwidth (and Gaussian+Sine envelope BW), in hertz "
             "(edit via the source panel)",
     "amplitude": "Peak amplitude of the excitation waveform",
-    "frequency": "Sine / Gaussian+Sine carrier frequency, in hertz "
+    "frequency": "Sine / Sinusoid / Gaussian+Sine carrier frequency, in hertz "
                  "(edit via the source panel)",
-    "phase_deg": "Sine / Gaussian+Sine carrier phase offset, in degrees",
+    "phase_deg": "Sine / Sinusoid / Gaussian+Sine carrier phase offset, in degrees",
+    "ramp_cycles": "Sinusoid: raised-cosine turn-on length, in carrier periods "
+                   "(0 = abrupt start)",
     "start_time": "Rectangular pulse: delay before the ramp up, seconds",
     "rise_time": "Rectangular pulse: linear ramp-up duration, seconds",
     "flat_time": "Rectangular pulse: flat-top duration, seconds",
@@ -233,7 +254,7 @@ def representative_fmax(spec):
     typ = spec.get("type", GAUSSIAN)
     if typ == GAUSSIAN:
         return float(spec.get("fmax", 0.0))
-    if typ in (SINE, GAUSSIAN_SINE):
+    if typ in (SINE, SINUSOID, GAUSSIAN_SINE):
         return float(spec.get("frequency", 0.0))
     return 0.0
 
@@ -288,6 +309,24 @@ def evaluate(spec, t):
         phase = math.radians(float(spec.get("phase_deg", 0.0)))
         return amp * np.sin(2.0 * math.pi * freq * t + phase)
 
+    if typ == SINUSOID:
+        # Ramped CW, mirroring the solver's wavesim.sources.Sinusoid: a
+        # raised-cosine envelope (0 -> 1, zero slope at both ends) over the first
+        # ``ramp_cycles`` periods, identically zero for t <= 0.
+        freq = max(float(spec.get("frequency", 30.0e9)), 1.0e-30)
+        phase = math.radians(float(spec.get("phase_deg", 0.0)))
+        ramp_cycles = float(spec.get("ramp_cycles", 3.0))
+        envelope = np.ones_like(t)
+        if ramp_cycles > 0.0:
+            t_ramp = ramp_cycles / freq
+            ramping = (t > 0.0) & (t < t_ramp)
+            envelope = np.where(
+                ramping, 0.5 * (1.0 - np.cos(np.pi * t / t_ramp)), envelope)
+        return np.where(
+            t > 0.0,
+            amp * envelope * np.sin(2.0 * math.pi * freq * t + phase),
+            0.0)
+
     if typ == RECTANGULAR:
         start = float(spec.get("start_time", 0.0))
         rise = float(spec.get("rise_time", 0.0))
@@ -324,6 +363,11 @@ def suggested_tmax(spec):
     if typ == SINE:
         freq = max(float(spec.get("frequency", 30.0e9)), 1.0e-30)
         return 5.0 / freq  # a few periods
+    if typ == SINUSOID:
+        freq = max(float(spec.get("frequency", 30.0e9)), 1.0e-30)
+        ramp_cycles = max(float(spec.get("ramp_cycles", 3.0)), 0.0)
+        # Show the whole turn-on ramp plus a few steady-state periods.
+        return (ramp_cycles + 5.0) / freq
     if typ == RECTANGULAR:
         span = (float(spec.get("start_time", 0.0))
                 + float(spec.get("rise_time", 0.0))

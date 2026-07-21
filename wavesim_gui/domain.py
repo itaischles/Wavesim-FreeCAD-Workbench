@@ -374,14 +374,16 @@ def background_material(domain):
 
 
 def tem_port_faces(sim):
-    """Domain faces (``'x0'``..``'z1'``) carrying a TEM or SPICE-TEM port.
+    """Domain faces (``'x0'``..``'z1'``) carrying a TEM/SPICE-TEM port or a plane
+    wave -- every source that launches from a face and must absorb its own launch.
 
-    A waveguide port launches a guided mode and must absorb it, so these faces
-    are forced to PML everywhere the grid is built (the drawn box, the node
-    arrays, and the run) regardless of the Domain's per-face setting -- otherwise
-    a face left (or set) to PEC would both trap the mode and, on a non-uniform
-    grid, desync the node arrays (no PML pad) from the forced boundary (crash).
-    Lazy imports avoid a circular import with the port modules; empty on failure.
+    A waveguide port launches a guided mode and a plane wave a directional sheet;
+    both must absorb the backward/reflected wave, so these faces are forced to PML
+    everywhere the grid is built (the drawn box, the node arrays, and the run)
+    regardless of the Domain's per-face setting -- otherwise a face left (or set)
+    to PEC would both trap the wave and, on a non-uniform grid, desync the node
+    arrays (no PML pad) from the forced boundary (crash). Lazy imports avoid a
+    circular import with the source modules; empty on failure.
     """
     if sim is None:
         return []
@@ -394,6 +396,11 @@ def tem_port_faces(sim):
     try:
         from wavesim_gui import spice_port as spice_mod
         faces += [str(p.Face) for p in spice_mod.find_spice_tem_ports(sim)]
+    except Exception:
+        pass
+    try:
+        from wavesim_gui import plane_wave as plane_mod
+        faces += [str(p.Face) for p in plane_mod.find_plane_waves(sim)]
     except Exception:
         pass
     return faces

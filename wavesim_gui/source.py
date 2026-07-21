@@ -421,6 +421,15 @@ if _GUI_AVAILABLE:
                 spin.setSingleStep(5.0)
                 spin.setValue(si_value)
                 to_si = lambda v: v
+            elif kind == exc.KIND_COUNT:
+                # A dimensionless count (e.g. Sinusoid ramp-up cycles): raw,
+                # non-negative, shown in the "cycles" unit.
+                spin.setRange(0.0, 1.0e6)
+                spin.setDecimals(2)
+                spin.setSuffix(" cycles")
+                spin.setSingleStep(1.0)
+                spin.setValue(si_value)
+                to_si = lambda v: v
             else:  # KIND_AMP
                 spin.setRange(-1.0e9, 1.0e9)
                 spin.setDecimals(4)

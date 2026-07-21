@@ -1252,14 +1252,21 @@ def build_job_from_document(doc, steps=None, fmax=30.0e9, progress=None):
 
     # TEM (and SPICE-TEM) port faces launch a guided mode and must absorb it, so
     # force them to PML regardless of the Domain's per-face setting -- a face left
-    # (or later set) to PEC would trap the launched mode. ``force_pml_faces`` makes
-    # the grid padding *and* the emitted boundary (below) both treat these faces
-    # as PML, so they stay consistent. Their cross-section is also extruded through
-    # the spacing + PML cells so the mode exits the absorber without re-reflecting.
+    # (or later set) to PEC would trap the launched mode. Their cross-section is
+    # also extruded through the spacing + PML cells so the mode exits the absorber
+    # without re-reflecting; a plane wave has no conductor to extrude, so it is
+    # kept out of ``port_faces`` (extrusion) here.
     port_faces = [str(t.Face) for t in tem_mod.find_tem_sources(sim)]
     port_faces += [str(p.Face) for p in spice_mod.find_spice_tem_ports(sim)]
 
-    grid_params = domain_mod.domain_grid_params(dom, force_pml_faces=port_faces)
+    # Force every face-launching source (TEM, SPICE-TEM *and* plane wave) to PML,
+    # via the single source of truth. ``force_pml_faces`` makes the grid padding
+    # *and* the emitted boundary (below) both treat these faces as PML, so they
+    # stay consistent with the drawn box and node arrays (built from the same
+    # ``tem_port_faces`` list) -- a plane-wave face left at PEC would reflect its
+    # own launch and, on a non-uniform grid, desync the node arrays.
+    grid_params = domain_mod.domain_grid_params(
+        dom, force_pml_faces=domain_mod.tem_port_faces(sim))
     spacing_lo = grid_params["spacing_lo"]
     spacing_hi = grid_params["spacing_hi"]
     pad_lo, pad_hi = grid_params["pad_lo"], grid_params["pad_hi"]
@@ -1307,9 +1314,16 @@ def build_job_from_document(doc, steps=None, fmax=30.0e9, progress=None):
     # so the fallback is skipped when one is present.
     from wavesim_gui import source as source_mod
     from wavesim_gui import spice_port as spice_mod
+    from wavesim_gui import plane_wave as plane_mod
 
     tem_objs = tem_mod.find_tem_sources(sim)
     tem_sources = [tem_mod.tem_source_spec(t, origin_m) for t in tem_objs]
+
+    # Boundary plane waves: launched from a (forced-PML) domain face; the runner
+    # places the sheet from the face + the boundary's PML depth, so no per-source
+    # geometry is needed here beyond the face/angle/directional flag.
+    plane_waves = [plane_mod.plane_wave_spec(p, origin_m)
+                   for p in plane_mod.find_plane_waves(sim)]
 
     # SPICE co-simulation ports (line + TEM); drop any that could not serialise
     # (e.g. a line port with no curve assigned). The TEM specs are kept paired
@@ -1343,9 +1357,9 @@ def build_job_from_document(doc, steps=None, fmax=30.0e9, progress=None):
     sources = source_mod.find_sources(sim)
     if sources:
         source = source_mod.source_spec(sources[0], origin_m)
-    elif tem_sources or spice_ports:
-        # A TEM source or a (driven) SPICE port is excitation enough; skip the
-        # centre-Gaussian fallback.
+    elif tem_sources or spice_ports or plane_waves:
+        # A TEM source, a plane wave or a (driven) SPICE port is excitation
+        # enough; skip the centre-Gaussian fallback.
         source = None
     else:
         source = {
@@ -1398,6 +1412,7 @@ def build_job_from_document(doc, steps=None, fmax=30.0e9, progress=None):
         },
         "source": source,
         "tem_sources": tem_sources,
+        "plane_waves": plane_waves,
         "spice_ports": spice_ports,
         "monitors": monitors,
     }

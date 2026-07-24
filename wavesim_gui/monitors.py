@@ -1007,6 +1007,11 @@ if _GUI_AVAILABLE:
             self.Object = vobj.Object
 
         def getIcon(self):
+            obj = getattr(self, "Object", None)
+            if obj is not None and is_current_monitor(obj):
+                return _CURRENT_MONITOR_ICON
+            if obj is not None and is_voltage_monitor(obj):
+                return _VOLTAGE_MONITOR_ICON
             return _MONITOR_ICON
 
         def claimChildren(self):

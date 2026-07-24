@@ -129,8 +129,10 @@ TEM ports (Session 9)
 Each ``tem_sources`` entry names a grid plane (the ``normal`` axis and the
 ``position`` of the plane along it, in the solver frame). The runner calls
 :func:`wavesim.mode_solver.solve_tem_modes` on that plane to find the TEM mode of
-the PEC cross-section, launches it as a directional ``PlaneSource`` (built via
-:meth:`TEMMode.to_source`) during the FDTD run, and saves each solved mode's 2D
+the PEC cross-section, launches it as an amplitude-calibrated directional modal
+source (:meth:`TEMMode.to_source`, which impresses the modal current a matched
+line turns into the requested forward voltage — so a 1 V mode launches ≈ 1 V on
+any grid or fill) during the FDTD run, and saves each solved mode's 2D
 field profiles into ``results.npz`` (keys ``mode_<si>_<mi>_phi`` / ``_pec`` /
 ``_E_<comp>``) with its per-unit-length parameters under ``summary["modes"]``.
 With ``mode_only`` true the runner solves and saves the modes and skips the FDTD
@@ -142,8 +144,8 @@ optional ``bounds`` ``[a0,a1,b0,b1]`` (solver metres, transverse slice order)
 confines the mode solve to a sub-rectangle of the face — e.g. one connector's
 cross-section on a plane that cuts several — and is forwarded straight to
 ``solve_tem_modes(bounds=...)``; absent it solves on the whole face. The solver
-embeds a bounded mode back into the full transverse plane (a ``PlaneSource``
-launch needs that shape), so the runner crops the *saved* ``mode_*`` profiles and
+embeds a bounded mode back into the full transverse plane (the modal launch needs
+that shape), so the runner crops the *saved* ``mode_*`` profiles and
 their ``_ca``/``_cb`` coords back to the solved sub-rect (:func:`_bounds_window`)
 — the results plot then shows the bounded region, not a face of zeros around it.
 The launched mode itself keeps its full shape.
@@ -156,9 +158,9 @@ of *that plane only*, auto-refined until the PEC component count stabilises. Its
 ``<key>_mu`` (float64), shape ``(Na, Nb)`` in ``(a, b)`` transverse slice order.
 The runner (:func:`_mode_mesh_grid`) rebuilds them as a single-cell-thick fine
 grid, solves the mode there (conductor count now correct), and — for a launch —
-interpolates the mode back onto the coarse grid
-(:func:`_interp_coarse_profiles`) as a ``PlaneSource`` (or a rebuilt coarse
-``TEMMode`` for a SPICE port). The FDTD grid is untouched. Absent ⇒ the coarse
+interpolates the mode back onto the coarse grid as a rebuilt coarse ``TEMMode``
+(:func:`_coarse_mode_from_fine`) that :meth:`TEMMode.to_source` (or a SPICE port)
+then launches. The FDTD grid is untouched. Absent ⇒ the coarse
 slice is solved as before. ``mode_mesh`` and ``bounds`` are mutually exclusive
 per port: the fine grid already spans exactly the (bounded) box.
 
@@ -579,7 +581,8 @@ def _interp_coarse_profiles(np, mode, grid, fields):
     centres onto the coarse grid's plane cell centres with a
     :class:`RegularGridInterpolator` (zero outside the fine span), yielding a
     ``{component: 2D-array}`` shaped like the coarse ``mode.normal``-slice — the
-    form :class:`wavesim.PlaneSource` (and a rebuilt coarse mode) expect.
+    form a rebuilt coarse :class:`~wavesim.mode_solver.TEMMode`
+    (:func:`_coarse_mode_from_fine`) expects.
     """
     from scipy.interpolate import RegularGridInterpolator
 
@@ -639,13 +642,29 @@ def _coarse_mode_from_fine(ws, np, mode, grid):
     )
 
 
+def _reverse_mode_h(mode):
+    """Return a shallow copy of *mode* with its H profiles negated.
+
+    Reverses the Poynting vector S = E × H so a directional ``to_source`` launch
+    flows toward -normal (a port on a high face fires *into* the domain). The E
+    profiles — which set the calibrated launch amplitude — and every per-unit
+    parameter are shared unchanged; only the H sheet's sign flips.
+    """
+    import copy
+
+    rev = copy.copy(mode)
+    rev.H = {comp: -arr for comp, arr in mode.H.items()}
+    return rev
+
+
 def _solve_all_modes(ws, np, grid, job, material_data=None):
     """Solve the TEM modes of every TEM-source and SPICE-TEM-port plane.
 
     Returns ``(plane_sources, spice_modes, mode_arrays, mode_meta)``:
 
-    * ``plane_sources`` — directional :class:`PlaneSource` launchers for the
-      ``tem_sources`` (one per port, the chosen mode); empty when ``mode_only``.
+    * ``plane_sources`` — amplitude-calibrated modal launchers
+      (:meth:`TEMMode.to_source`) for the ``tem_sources`` (one per port, the
+      chosen mode); empty when ``mode_only``.
     * ``spice_modes`` — ``{job_spice_index: TEMMode}`` giving the chosen mode for
       each ``kind:"tem"`` SPICE port, consumed by :func:`_build_spice_ports`;
       empty when ``mode_only`` (no FDTD to drive).
@@ -753,7 +772,7 @@ def _solve_all_modes(ws, np, grid, job, material_data=None):
         )
 
         # ``solve_tem_modes`` embeds a bounded solve back into the *full* plane
-        # (a PlaneSource launch needs the full transverse shape), padding it with
+        # (the modal launch needs the full transverse shape), padding it with
         # zeros. Crop the **saved** profiles back to the cells actually solved, so
         # the results plot draws the bounded region the user selected instead of a
         # face of zeros around it. The in-memory ``mode`` handed to ``to_source``
@@ -819,28 +838,31 @@ def _solve_all_modes(ws, np, grid, job, material_data=None):
             )
             continue
 
-        # TEM source: launch the chosen mode as a directional plane source. It is
-        # normalised to a 1 V drive, so the temporal waveform carries the
-        # amplitude and ``to_source`` is left at unit scale. A fine-mesh mode is
-        # resampled onto the coarse plane first (its profiles live on the fine
-        # grid); otherwise ``to_source`` places the coarse-slice profiles directly.
+        # TEM source: launch the chosen mode as an amplitude-calibrated modal
+        # source. ``to_source`` impresses the modal current that a matched line
+        # turns into ``amplitude·waveform(t)`` volts forward, using the same
+        # ``build_port_kernel`` current machinery a port uses — so the launched
+        # voltage is correct on any grid or fill permittivity (the older additive
+        # field write came out √ε_r / S_c too large). The waveform already carries
+        # the excitation amplitude, so ``amplitude`` stays at unit scale.
+        #
+        # A fine-mesh mode lives on the fine grid; rebuild it on the coarse launch
+        # grid first (exactly as the SPICE path does), since the port kernel
+        # indexes the coarse cells.
         waveform = _build_waveform(ws, t)
-        if use_mesh:
-            profiles = _interp_coarse_profiles(np, chosen, grid, fields)
-            src = ws.PlaneSource(waveform, axis=normal, position=position,
-                                 profiles=profiles)
-        else:
-            src = chosen.to_source(waveform, amplitude=1.0, fields=fields)
-        # ``to_source`` builds H = (n̂ × E)/η for +normal propagation, so the
-        # wave always flows toward +normal. A port on a high face launches
-        # *into* the domain along -normal (direction < 0): flip H to reverse the
-        # Poynting vector S = E × H (E-only launches are bidirectional, so the
-        # sign is moot there and there is no H to flip).
+        launch_mode = (
+            _coarse_mode_from_fine(ws, np, chosen, grid) if use_mesh else chosen
+        )
+        # ``to_source`` builds H = (n̂ × E)/η for a +normal launch, so the wave
+        # flows toward +normal. A port on a high face launches *into* the domain
+        # along -normal (direction < 0): negate the mode's H profiles to reverse
+        # the Poynting vector S = E × H (an E-only launch carries no H sheet and
+        # is bidirectional, so the sign is moot there). Any residual backward lobe
+        # is absorbed by the PML behind the launch face.
         direction = float(t.get("direction", 1.0))
-        if direction < 0 and getattr(src, "profiles", None):
-            for comp in list(src.profiles):
-                if comp.startswith("H"):
-                    src.profiles[comp] = -src.profiles[comp]
+        if direction < 0 and fields != "E":
+            launch_mode = _reverse_mode_h(launch_mode)
+        src = launch_mode.to_source(waveform, amplitude=1.0, fields=fields)
         plane_sources.append(src)
 
     return plane_sources, spice_modes, mode_arrays, mode_meta

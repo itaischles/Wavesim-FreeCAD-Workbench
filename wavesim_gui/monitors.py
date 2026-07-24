@@ -101,19 +101,24 @@ def _solver_component(label):
 # solver monitor on each of its three components, and the magnitude is derived
 # from them at plot time (exactly the solver's own sqrt(Fx²+Fy²+Fz²) over the same
 # slices). So the user picks E or H once and gets Ex/Ey/Ez/|E| in one monitor.
-_FIELDS = ["E", "H"]
+# 'S' is the Poynting vector S = E x H: the runner records it with one solver
+# ``PoyntingMonitor`` and splits it into Sx/Sy/Sz, so |S| (power-flux density) and
+# the in-plane power-flow quiver come out of the same plot machinery as a field.
+_FIELDS = ["E", "H", "S"]
 
 
 def _field_components(field):
-    """The three component tokens of field ``'E'``/``'H'``."""
-    f = "H" if str(field).upper().startswith("H") else "E"
+    """The three component tokens of field ``'E'``/``'H'``/``'S'`` (Poynting)."""
+    u = str(field).upper()
+    f = "S" if u.startswith("S") else ("H" if u.startswith("H") else "E")
     return [f + axis for axis in ("x", "y", "z")]
 
 
 def _field_of(component):
-    """The field ('E'/'H') a legacy component label belongs to ('Ez', '∣H∣', ...)."""
+    """The field ('E'/'H'/'S') a legacy component label belongs to ('Ez', '∣H∣')."""
     text = str(component).replace(_BAR, "").replace("|", "")
-    return "H" if text[:1].upper() == "H" else "E"
+    head = text[:1].upper()
+    return head if head in ("H", "S") else "E"
 
 
 # Snapshot slice planes: display label -> (normal axis, in-plane axes).
@@ -201,8 +206,9 @@ def _ensure_snapshot_field(obj):
     if not hasattr(obj, "Field"):
         obj.addProperty(
             "App::PropertyEnumeration", "Field", "Monitor",
-            "Field captured in the slice. All three components are recorded "
-            "(and the magnitude derived), selectable when plotting",
+            "Quantity captured in the slice: E, H, or S (the Poynting vector "
+            "S = E x H, i.e. power-flux density). All three components are "
+            "recorded (and the magnitude derived), selectable when plotting",
         )
         obj.Field = _FIELDS
         obj.Field = _field_of(getattr(obj, "Component", "E"))
@@ -1209,13 +1215,14 @@ if _GUI_AVAILABLE:
             layout.addRow("Time steps:", self._steps_label)
 
             info = QtWidgets.QLabel(
-                "The snapshot captures a 2D slice of the chosen field on the "
-                "selected plane, offset along its normal axis. All three "
+                "The snapshot captures a 2D slice of the chosen quantity on the "
+                "selected plane, offset along its normal axis. Pick E, H, or S "
+                "(the Poynting vector S = E x H, i.e. power flow). All three "
                 "components are recorded, so one monitor is enough — the "
-                "component to view (Ex, Ey, Ez or |E|) is chosen in the results "
-                "window. It records a frame every 'Record every' of simulated "
-                "time; the equivalent number of time steps is computed from the "
-                "grid's CFL time step."
+                "component to view (e.g. Ex, Ey, Ez or |E|) is chosen in the "
+                "results window. It records a frame every 'Record every' of "
+                "simulated time; the equivalent number of time steps is computed "
+                "from the grid's CFL time step."
             )
             info.setWordWrap(True)
             layout.addRow(info)

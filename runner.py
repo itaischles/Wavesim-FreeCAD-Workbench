@@ -93,7 +93,8 @@ job.json schema (Session 2)
         "probes":    [{"name":.., "component":"Ez", "x":.., "y":.., "z":..}, ...],
         "snapshots": [{"name":.., "field":"E", "normal":"z",
                        "position":.., "every_N_steps":20}, ...],
-                      # "field" ('E'/'H') records all three components; a legacy
+                      # "field" ('E'/'H') records all three components; 'S'
+                      # records the Poynting vector S = E x H (Sx/Sy/Sz); a legacy
                       # "component" ("Ez", "|E|") records only that one
         "voltages":  [{"name":.., "path": [[x,y,z], ...]}, ...],
         "currents":  [{"name":.., "path": [[x,y,z], ...]}, ...]
@@ -383,15 +384,51 @@ _INPLANE_AXES = {"z": ("x", "y"), "y": ("x", "z"), "x": ("y", "z")}
 
 
 def _field_components(field):
-    """The three component tokens of field ``'E'``/``'H'``."""
-    f = "H" if str(field).upper().startswith("H") else "E"
+    """The three component tokens of field ``'E'``/``'H'``/``'S'`` (Poynting)."""
+    u = str(field).upper()
+    f = "S" if u.startswith("S") else ("H" if u.startswith("H") else "E")
     return [f + axis for axis in ("x", "y", "z")]
 
 
 def _field_of(component):
-    """The field ('E'/'H') a component token belongs to ('Ez', '|H|', ...)."""
+    """The field ('E'/'H'/'S') a component token belongs to ('Ez', '|H|', 'Sx')."""
     text = str(component).replace("|", "")
-    return "H" if text[:1].upper() == "H" else "E"
+    head = text[:1].upper()
+    return head if head in ("H", "S") else "E"
+
+
+class _PoyntingComponentView:
+    """Presents one Cartesian component of a ``PoyntingMonitor`` as a
+    ``SnapshotMonitor``-shaped monitor so the snapshot save/crop loop can treat
+    Poynting (S = E x H) exactly like an E or H field.
+
+    A ``PoyntingMonitor`` records one ``(Na, Nb, 3)`` frame (Sx, Sy, Sz) per
+    step; a ``SnapshotMonitor`` records one ``(Na, Nb)`` scalar frame. This view
+    slices out component *comp_index* so its ``.snapshots`` is a list of 2D
+    frames, its ``.snap_times`` and ``.normal`` mirror the shared monitor, and
+    the results plot derives |S| and the in-plane power-flow quiver from the
+    three views just as it does for a field's components.
+    """
+
+    def __init__(self, poynting, comp_index, normal):
+        self._poynting = poynting
+        self._i = int(comp_index)
+        self.normal = normal
+        self._cache = None
+
+    @property
+    def snapshots(self):
+        # Recorded lazily during the run, so slice on first access afterwards.
+        # (numpy is imported inside ``run_job``, not at module scope.)
+        if self._cache is None:
+            import numpy as np
+            self._cache = [np.asarray(f)[..., self._i]
+                           for f in self._poynting.snapshots]
+        return self._cache
+
+    @property
+    def snap_times(self):
+        return self._poynting.snap_times
 
 
 def _axis_nodes(grid, axis):
@@ -1171,22 +1208,33 @@ def run_job(workdir):
     # A snapshot records a whole field: one solver monitor per component, so the
     # results window can offer Ex/Ey/Ez (and |E|, derived from them) from a single
     # user-placed monitor. Legacy jobs naming one ``component`` record just that.
-    snapshots = []  # (name, field, [(component, SnapshotMonitor), ...])
+    # A Poynting snapshot ("field": "S") is one ``PoyntingMonitor`` whose (Na,Nb,3)
+    # S = E x H frames are split into Sx/Sy/Sz views, so the same save/crop loop
+    # and results plot handle it like a field (|S| derived, in-plane quiver).
+    snapshots = []  # (name, field, [(component, monitor-or-view), ...])
+    snapshot_solver_monitors = []  # the actual solver monitors to register
     for s in mon_cfg.get("snapshots", []):
         position = float(s.get("position", s.get("at_z", 0.0)))
         every = max(1, int(s.get("every_N_steps", 20)))
         normal = s.get("normal", "z")
         field = s.get("field")
+        name = s.get("name", "snapshot")
+        if field and str(field).upper().startswith("S"):
+            poy = ws.PoyntingMonitor(position, every, normal=normal)
+            snapshot_solver_monitors.append(poy)
+            mons = [(c, _PoyntingComponentView(poy, i, normal))
+                    for i, c in enumerate(_field_components("S"))]
+            snapshots.append((name, "S", mons))
+            continue
         if field:
             comps = _field_components(field)
         else:
             comps = [s["component"]]
             field = _field_of(comps[0])
-        snapshots.append((
-            s.get("name", "snapshot"), field,
-            [(c, ws.SnapshotMonitor(c, position, every, normal=normal))
-             for c in comps],
-        ))
+        mons = [(c, ws.SnapshotMonitor(c, position, every, normal=normal))
+                for c in comps]
+        snapshot_solver_monitors.extend(m for _c, m in mons)
+        snapshots.append((name, field, mons))
 
     # Line-integral monitors: V = int E.dl / I = loop-int H.dl along a polyline
     # of solver-frame vertices (discretised from a sketch on the FreeCAD side).
@@ -1202,7 +1250,7 @@ def run_job(workdir):
     if energy is not None:
         all_monitors.append(energy)
     all_monitors.extend(m for _name, m in probes)
-    all_monitors.extend(m for _name, _f, mons in snapshots for _c, m in mons)
+    all_monitors.extend(snapshot_solver_monitors)
     all_monitors.extend(m for _name, m in voltages)
     all_monitors.extend(m for _name, m in currents)
 

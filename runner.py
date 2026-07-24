@@ -135,6 +135,12 @@ line turns into the requested forward voltage — so a 1 V mode launches ≈ 1 V
 any grid or fill) during the FDTD run, and saves each solved mode's 2D
 field profiles into ``results.npz`` (keys ``mode_<si>_<mi>_phi`` / ``_pec`` /
 ``_E_<comp>``) with its per-unit-length parameters under ``summary["modes"]``.
+A port sits on a domain face, which abuts the PML, so the runner clamps the
+launched plane onto the **first interior cell** (:func:`_clamp_launch_into_interior`,
+mirroring :class:`wavesim.sources.PlaneWave`'s ``d_pml`` / ``N-1-d_pml``): the
+plane's boundary node is shared by the last interior cell and the first PML cell,
+and the Mode source's nearest-node snap rounds a high-face launch into the
+absorber otherwise — firing the forward wave into the PML.
 With ``mode_only`` true the runner solves and saves the modes and skips the FDTD
 time-stepping entirely. The workbench's "Compute Mode" button uses this, sending a
 job that carries **only the one port** it wants previewed (it plots the modes and
@@ -657,6 +663,34 @@ def _reverse_mode_h(mode):
     return rev
 
 
+def _clamp_launch_into_interior(mode, grid, d_pml):
+    """Pull a boundary launch plane out of the PML onto the first interior cell.
+
+    A face port's plane sits on the domain boundary node. The Mode source injects
+    at ``grid.axis_index(normal, position)`` -- the *nearest node* used as a cell
+    index -- which on a low face is cell ``d_pml`` (the first interior cell,
+    correct) but on a high face is cell ``N-d_pml``: the boundary node is shared
+    by the last interior cell and the first PML cell, and the nearest-node rule
+    rounds toward the PML. The forward wave would then be launched one cell inside
+    the absorber. Clamp the injection cell into ``[d_pml, N-1-d_pml]`` -- exactly
+    :class:`wavesim.sources.PlaneWave`'s convention -- and move ``mode.position``
+    onto that cell's node so both the launch and any coarse-grid rebuild
+    (:func:`_coarse_mode_from_fine`, which reads ``mode.position``) follow.
+
+    A no-op for an interior port (its cell is already well inside the range). The
+    near bound is the PML pad on the port's own face, which a TEM/SPICE-TEM face
+    always has (the workbench forces it to PML); the far bound never binds.
+    """
+    normal = mode.normal
+    N = {"x": grid.Nx, "y": grid.Ny, "z": grid.Nz}[normal]
+    coords = {"x": grid.x, "y": grid.y, "z": grid.z}[normal]
+    k = grid.axis_index(normal, mode.position)
+    k_interior = min(max(k, d_pml), N - 1 - d_pml)
+    if k_interior != k:
+        mode.position = float(coords[k_interior])
+    return mode
+
+
 def _solve_all_modes(ws, np, grid, job, material_data=None):
     """Solve the TEM modes of every TEM-source and SPICE-TEM-port plane.
 
@@ -679,6 +713,9 @@ def _solve_all_modes(ws, np, grid, job, material_data=None):
     coarse-slice solve (honouring any ``bounds``) runs.
     """
     mode_only = bool(job.get("mode_only", False))
+    # PML depth (cells) used to keep a face-port launch plane just inside the
+    # absorber; see _clamp_launch_into_interior.
+    d_pml = int((job.get("boundary") or {}).get("d_pml", 10))
 
     # Every plane needing a mode solve: TEM sources first, then SPICE TEM ports.
     # ``spice_index`` is the entry's index in job["spice_ports"] (None for TEM
@@ -829,6 +866,12 @@ def _solve_all_modes(ws, np, grid, job, material_data=None):
             continue
 
         chosen = _choose_mode(modes, int(t.get("conductor_id", 0)), name)
+        # A port on a domain face abuts the PML; keep its launch plane on the
+        # first interior cell so the forward wave isn't fired into the absorber
+        # (nearest-node snapping otherwise lands a high-face launch one cell
+        # inside the PML). Applies to both the TEM and SPICE-TEM launch paths,
+        # which each read the chosen mode's ``position``.
+        _clamp_launch_into_interior(chosen, grid, d_pml)
         if kind == "spice":
             # Hand the chosen mode to _build_spice_ports; the circuit drives it.
             # A fine-mesh mode is rebuilt on the coarse grid first, since the

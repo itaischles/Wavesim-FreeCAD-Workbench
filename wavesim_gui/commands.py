@@ -221,6 +221,10 @@ def max_frequency_hz(sim):
 # properties). A modest iteration cap and a 1% tolerance suit most ports.
 _MODE_CONV_DEFAULT_ITERS = 5
 _MODE_CONV_DEFAULT_TOL_PCT = 1.0
+# Hard cap on transverse (face) cells for the finest mode-mesh level. Counts the
+# 2D port-plane cells only -- the mode solve runs on that plane -- so it bounds
+# mode-solver cost, not the 3D FDTD grid.
+_MODE_CONV_DEFAULT_MAX_CELLS = 300_000
 
 
 def _ensure_mode_convergence_props(obj):
@@ -251,6 +255,15 @@ def _ensure_mode_convergence_props(obj):
             "impedance changes by less than this percentage between iterations.",
         )
         obj.ModeImpedanceTolPct = _MODE_CONV_DEFAULT_TOL_PCT
+    if not hasattr(obj, "MaxModeFaceCells"):
+        obj.addProperty(
+            "App::PropertyInteger", "MaxModeFaceCells", "Mode convergence",
+            "Hard cap on the number of transverse (face) cells at the finest "
+            "mode-mesh refinement level. Counts the 2D port-plane cells only, so "
+            "it bounds mode-solver cost; refinement stops once the next level "
+            "would exceed it, even below the maximum iteration count.",
+        )
+        obj.MaxModeFaceCells = _MODE_CONV_DEFAULT_MAX_CELLS
 
 
 def mode_convergence_settings(sim):
@@ -264,9 +277,14 @@ def mode_convergence_settings(sim):
         return None
     max_iter = int(getattr(sim, "MaxModeIterations", _MODE_CONV_DEFAULT_ITERS))
     tol_pct = float(getattr(sim, "ModeImpedanceTolPct", _MODE_CONV_DEFAULT_TOL_PCT))
+    max_cells = int(getattr(sim, "MaxModeFaceCells", _MODE_CONV_DEFAULT_MAX_CELLS))
     if max_iter < 1:
         return None
-    return {"max_iter": max_iter, "rel_tol": max(tol_pct, 0.0) / 100.0}
+    return {
+        "max_iter": max_iter,
+        "rel_tol": max(tol_pct, 0.0) / 100.0,
+        "max_cells": max(max_cells, 4),
+    }
 
 
 # --------------------------------------------------------------------------- #
@@ -431,6 +449,20 @@ if _GUI_AVAILABLE:
                 float(getattr(obj, "ModeImpedanceTolPct",
                               _MODE_CONV_DEFAULT_TOL_PCT))
             )
+            self._max_cells = QtWidgets.QSpinBox()
+            self._max_cells.setRange(4, 100_000_000)
+            self._max_cells.setSingleStep(50_000)
+            self._max_cells.setGroupSeparatorShown(True)
+            self._max_cells.setToolTip(
+                "Hard cap on transverse (face) cells at the finest mode-mesh "
+                "level. Counts the 2D port-plane cells only; refinement stops "
+                "once the next level would exceed this, even below the maximum "
+                "iteration count."
+            )
+            self._max_cells.setValue(
+                int(getattr(obj, "MaxModeFaceCells",
+                            _MODE_CONV_DEFAULT_MAX_CELLS))
+            )
 
             layout.addRow("Time unit:", self._time)
             layout.addRow("Frequency unit:", self._freq)
@@ -441,11 +473,13 @@ if _GUI_AVAILABLE:
             layout.addRow(self._converge)
             layout.addRow("Max mode iterations:", self._max_iters)
             layout.addRow("Impedance tolerance:", self._tol_pct)
+            layout.addRow("Max mode face cells:", self._max_cells)
 
             def _sync_converge(*_):
                 on = self._converge.isChecked()
                 self._max_iters.setEnabled(on)
                 self._tol_pct.setEnabled(on)
+                self._max_cells.setEnabled(on)
 
             self._converge.toggled.connect(_sync_converge)
             _sync_converge()
@@ -517,6 +551,7 @@ if _GUI_AVAILABLE:
             self.obj.ConvergeModeImpedance = self._converge.isChecked()
             self.obj.MaxModeIterations = int(self._max_iters.value())
             self.obj.ModeImpedanceTolPct = float(self._tol_pct.value())
+            self.obj.MaxModeFaceCells = int(self._max_cells.value())
             new_max_freq = units.freq_to_si(self._max_freq.value(), self._freq_unit)
             self.obj.MaxFrequency = new_max_freq
             # The max frequency drives the default cell size, so when it changes

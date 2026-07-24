@@ -551,29 +551,41 @@ def build_mode_mesh(materials, normal, pos_mm, span_mm, base_cell_mm,
     return best
 
 
+_MODE_REFINE_RATIO = math.sqrt(2.0)  # per-axis cell growth per level (~2x face cells)
+
+
 def build_mode_mesh_levels(materials, normal, pos_mm, span_mm, base_cell_mm,
                            bg_eps=1.0, bg_mu=1.0, bg_pec=False,
-                           max_levels=5, max_cells=300_000, min_start_cells=8):
+                           max_levels=5, max_cells=300_000, min_start_cells=8,
+                           refine_ratio=_MODE_REFINE_RATIO):
     """A sequence of progressively finer transverse re-voxelisations of one plane.
 
     Unlike :func:`build_mode_mesh` (which auto-stops at the *connectivity* plateau
     and returns a single mesh), this emits a whole refinement ladder for the
     runner's characteristic-impedance convergence study: the port plane voxelised
     over the transverse rectangle *span_mm* ``(a0, a1, b0, b1)`` (world mm, slice
-    order), each level having twice the transverse cell count of the last (finest
-    last). The runner solves the mode on each in turn and stops once its Z0 settles
-    (see ``runner._solve_mode_convergence``), so the ladder only needs to be long
-    enough to reach convergence; the tail is unused when it converges early.
+    order), each level scaling the previous transverse cell count per axis by
+    *refine_ratio* (finest last). The default ratio is ``sqrt(2)`` per axis (~2x
+    the face-cell count per level), a gentler step than plain doubling so more
+    levels fit under *max_cells* while each remains a meaningful refinement. The
+    runner solves the mode on each in turn and stops once its Z0 settles (see
+    ``runner._solve_mode_convergence``), so the ladder only needs to be long enough
+    to reach convergence; the tail is unused when it converges early.
 
     The coarsest level resolves each transverse axis with at least
     ``max(FDTD-cell count, min_start_cells)`` cells: *base_cell_mm* ``(ca, cb)`` is
     the FDTD transverse cell, but on a coarse grid it can span the geometry in a
     single cell, and the mode solver's ``np.gradient`` needs at least two cells per
     axis (one-cell axes crash with an ``IndexError``). *min_start_cells* is that
-    floor, so even a coarse FDTD grid starts the study on a usable mesh.
+    floor, so even a coarse FDTD grid starts the study on a usable mesh. A
+    non-integer *refine_ratio* can round two successive levels to the same count, so
+    each axis is forced at least one cell finer than the previous level -- every
+    level is genuinely a refinement (no wasted duplicate solve).
 
+    *max_cells* counts transverse (face) cells only -- the mode solve happens on
+    this 2D plane, so the cap governs mode-solver resolution, not the 3D FDTD grid.
     Refinement stops after *max_levels* entries or once the next level would exceed
-    *max_cells* transverse cells (whichever comes first). Returns
+    *max_cells* face cells (whichever comes first). Returns
     ``[(a_nodes_mm, b_nodes_mm, pec2d, eps2d, mu2d), ...]`` (at least one entry),
     or ``None`` when the plane carries no PEC (nothing to solve -> coarse path).
     """
@@ -590,10 +602,15 @@ def build_mode_mesh_levels(materials, normal, pos_mm, span_mm, base_cell_mm,
     floor = max(2, int(min_start_cells))
     Na0 = max(floor, int(math.ceil(span_a / ca0)))
     Nb0 = max(floor, int(math.ceil(span_b / cb0)))
+    ratio = max(1.0, float(refine_ratio))
 
     levels = []
+    prev_na = prev_nb = 0
     for lvl in range(max(1, int(max_levels))):
-        Na, Nb = Na0 * (2 ** lvl), Nb0 * (2 ** lvl)
+        scale = ratio ** lvl
+        # >= one cell finer than the last level so a rounded ratio never stalls.
+        Na = max(prev_na + 1, int(round(Na0 * scale)))
+        Nb = max(prev_nb + 1, int(round(Nb0 * scale)))
         if Na * Nb > max_cells:
             break  # too fine for this cap; keep the ladder built so far
         a_nodes = a0 + np.arange(Na + 1) * (span_a / Na)
@@ -610,6 +627,7 @@ def build_mode_mesh_levels(materials, normal, pos_mm, span_mm, base_cell_mm,
                 return None
             break
         levels.append((a_nodes, b_nodes, pec2d, eps2d, mu2d))
+        prev_na, prev_nb = Na, Nb
     return levels or None
 
 
@@ -1132,6 +1150,7 @@ def _attach_mode_meshes(arrays, dom, port_pairs, materials, cell_size_m,
                 materials, normal, slice_pos_mm, span_mm, base_cell_mm,
                 bg_eps=bg_eps, bg_mu=bg_mu, bg_pec=bg_pec,
                 max_levels=int(convergence["max_iter"]),
+                max_cells=int(convergence.get("max_cells", 300_000)),
             )
             if not levels:
                 continue

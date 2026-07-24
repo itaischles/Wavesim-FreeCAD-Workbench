@@ -32,6 +32,9 @@ from wavesim_gui import units
 _WB_DIR = os.path.join(FreeCAD.getUserAppDataDir(), "Mod", "wavesim-workbench")
 _RESOURCES_DIR = os.path.join(_WB_DIR, "Resources")
 _SIM_ICON = os.path.join(_RESOURCES_DIR, "sim.png")
+# Tree/view-provider icon for the Simulation object (the "New Simulation"
+# toolbar command keeps _SIM_ICON).
+_SIM_TREE_ICON = os.path.join(_RESOURCES_DIR, "wave.png")
 _RUN_ICON = os.path.join(_RESOURCES_DIR, "run.png")
 
 # Marker property stamped on the container. Identifying the simulation by a
@@ -321,7 +324,7 @@ if _GUI_AVAILABLE:
             self.Object = vobj.Object
 
         def getIcon(self):
-            return _SIM_ICON
+            return _SIM_TREE_ICON
 
         def setEdit(self, vobj, mode=0):
             _open_simulation_panel(vobj.Object)

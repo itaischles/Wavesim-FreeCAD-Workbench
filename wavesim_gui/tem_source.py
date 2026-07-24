@@ -8,6 +8,20 @@ for the PEC cross-section lying on that plane (e.g. a coax, stripline or
 microstrip port). It is a scripted DocumentObject grouped under the simulation's
 "Sources" child group.
 
+Drive modes
+-----------
+A TEM source is driven one of two ways, chosen in its task panel
+(``ExcitationMode``):
+
+* **Waveform** -- a temporal excitation (Gaussian pulse, sine, ...), the classic
+  port source. Its spec goes into the job's ``tem_sources``.
+* **SPICE** -- co-simulated in lockstep with an external ngspice netlist (what
+  used to be a separate "SPICE TEM Port" command). Its spec goes into the job's
+  ``spice_ports`` (``kind: "tem"``), built by
+  :func:`wavesim_gui.spice_port.spice_tem_port_spec`.
+
+Both modes share the launch-plane geometry below; only the drive differs.
+
 Workflow
 --------
 * The user adds a TEM source, picks one of the six domain faces (the launch
@@ -79,6 +93,20 @@ _EXCITATIONS = exc.EXCITATION_LABELS
 _FIELDS_LABELS = ["E and H (directional)", "E only (bidirectional)"]
 _FIELDS_TOKEN = {"E and H (directional)": "EH", "E only (bidirectional)": "E"}
 _FIELDS_FROM_TOKEN = {v: k for k, v in _FIELDS_TOKEN.items()}
+
+# How the port is driven. A TEM source either launches a temporal *Waveform*
+# excitation (the classic port source) or is co-simulated with an external
+# *SPICE* circuit (what used to be a separate "SPICE TEM Port" command). Both
+# share the same launch-plane geometry; only the drive differs. Display labels
+# map to these tokens, stored in the object's ``ExcitationMode`` enum.
+MODE_WAVEFORM = "Waveform"
+MODE_SPICE = "SPICE"
+_MODE_LABELS = {
+    MODE_WAVEFORM: "Excitation waveform",
+    MODE_SPICE: "External SPICE circuit",
+}
+_MODE_ORDER = [MODE_WAVEFORM, MODE_SPICE]
+_MODE_FROM_LABEL = {label: mode for mode, label in _MODE_LABELS.items()}
 
 # Boundary condition forced on the launch face (absorbing port).
 _PORT_BC = "PML"
@@ -164,13 +192,27 @@ class TEMSourceObject:
             )
             obj.setEditorMode("BoundsSel", 2)  # hidden; set via the task panel
 
+        # Drive mode: temporal waveform or external SPICE circuit.
+        if not hasattr(obj, "ExcitationMode"):
+            obj.addProperty(
+                "App::PropertyEnumeration", "ExcitationMode", "Port",
+                "How the port is driven: a temporal Waveform excitation, or an "
+                "external SPICE circuit (co-simulation).",
+            )
+            obj.ExcitationMode = list(_MODE_ORDER)
+            obj.ExcitationMode = MODE_WAVEFORM
+
         # Excitation enum + one property per waveform parameter (shared scheme).
         exc.ensure_object_props(obj)
+        # SPICE netlist/node/advanced properties (used when ExcitationMode==SPICE).
+        _ensure_spice_props(obj)
 
         # Plane corners (hidden, four world-mm points) for the view provider.
         if not hasattr(obj, "Corners"):
             obj.addProperty("App::PropertyVectorList", "Corners", "Plane", "")
             obj.setEditorMode("Corners", 2)  # hidden
+
+        _sync_mode_visibility(obj)
 
     def onDocumentRestored(self, obj):
         obj.Proxy = self
@@ -194,9 +236,21 @@ class TEMSourceObject:
                 "face). Set via the task panel.",
             )
             obj.setEditorMode("BoundsSel", 2)  # hidden; set via the task panel
+        # Back-fill the drive-mode enum on ports saved before it existed (they
+        # were all waveform-driven; SPICE ports were a separate object type).
+        if not hasattr(obj, "ExcitationMode"):
+            obj.addProperty(
+                "App::PropertyEnumeration", "ExcitationMode", "Port",
+                "How the port is driven: a temporal Waveform excitation, or an "
+                "external SPICE circuit (co-simulation).",
+            )
+            obj.ExcitationMode = list(_MODE_ORDER)
+            obj.ExcitationMode = MODE_WAVEFORM
         # Re-run property setup so ports saved before the extra waveforms gain
         # the new options + parameter properties and editor modes are re-asserted.
         exc.ensure_object_props(obj)
+        _ensure_spice_props(obj)
+        _sync_mode_visibility(obj)
 
     def execute(self, obj):
         """Size/orient the drawn launch plane to the domain bounds and face."""
@@ -223,6 +277,47 @@ class TEMSourceObject:
 
     __getstate__ = dumps
     __setstate__ = loads
+
+
+# Property names carried for the SPICE drive mode (mirrors the group
+# ``spice_port.ensure_spice_props`` adds); toggled visible only in SPICE mode.
+_SPICE_PROPS = ("Netlist", "NodePlus", "NodeMinus",
+                "UseInitialConditions", "InvertPortCurrent")
+
+
+def _ensure_spice_props(obj):
+    """Add the netlist/node/advanced properties for the SPICE drive mode.
+
+    Delegates to :func:`wavesim_gui.spice_port.ensure_spice_props` (lazily
+    imported to avoid the import cycle with that module), so a TEM source and a
+    legacy SPICE TEM port expose exactly the same SPICE fields.
+    """
+    from wavesim_gui import spice_port as spice_mod
+    spice_mod.ensure_spice_props(obj)
+
+
+def excitation_mode(obj):
+    """Return the port's drive mode token (``MODE_WAVEFORM`` / ``MODE_SPICE``)."""
+    return str(getattr(obj, "ExcitationMode", MODE_WAVEFORM))
+
+
+def _sync_mode_visibility(obj):
+    """Show only the active drive mode's properties in the property editor.
+
+    Waveform mode hides the SPICE fields; SPICE mode hides the excitation enum
+    and all waveform parameters. (In waveform mode the waveform parameters'
+    visibility is already managed by :func:`excitation.sync_visibility`.)
+    """
+    spice = excitation_mode(obj) == MODE_SPICE
+    if hasattr(obj, "Excitation"):
+        obj.setEditorMode("Excitation", 2 if spice else 1)
+    if spice:
+        for _key, prop in exc.PROP_FOR_KEY.items():
+            if hasattr(obj, prop):
+                obj.setEditorMode(prop, 2)  # hide all waveform params
+    for prop in _SPICE_PROPS:
+        if hasattr(obj, prop):
+            obj.setEditorMode(prop, 1 if spice else 2)  # read-only vs hidden
 
 
 def _face_corners(mn, mx, face, rect=None):
@@ -417,12 +512,16 @@ def _add_bounds_spec(spec, dom, face, axis, bounds_sel, origin_m):
 def _describe(obj):
     """Short human label, e.g. ``z0, Gaussian Pulse @ 30 GHz``.
 
-    Uses the simulation's frequency unit; the rectangular pulse has no frequency.
+    Waveform mode uses the simulation's frequency unit (the rectangular pulse has
+    no frequency); SPICE mode names the linked netlist file instead.
     """
+    face = str(getattr(obj, "Face", "z0"))
+    if excitation_mode(obj) == MODE_SPICE:
+        from wavesim_gui import spice_port as spice_mod
+        return "{}, {}".format(face, spice_mod._netlist_name(obj))
     doc = getattr(obj, "Document", None)
     sim = active_simulation(doc) if doc is not None else None
-    return "{}, {}".format(getattr(obj, "Face", "z0"),
-                           exc.excitation_label(obj, sim))
+    return "{}, {}".format(face, exc.excitation_label(obj, sim))
 
 
 # --------------------------------------------------------------------------- #
@@ -652,12 +751,14 @@ if _GUI_AVAILABLE:
         __setstate__ = loads
 
     class TaskTEMSourcePanel(source_mod.ExcitationParamsMixin):
-        """Task panel to edit a TEM port: face, fields and excitation.
+        """Task panel to edit a TEM port: face, fields and drive.
 
-        "Compute Mode" solves and visualises *this* port's mode now (out of
-        process, no FDTD, nothing saved); OK commits the source and leaves the
-        mode for the main Run. Cancel removes a freshly-created source so it
-        leaves no trace.
+        The **Drive** combo picks how the port is excited — a temporal waveform
+        (the excitation widgets) or an external SPICE circuit (netlist + port
+        nodes) — showing one control group at a time. "Compute Mode" solves and
+        visualises *this* port's mode now (out of process, no FDTD, nothing
+        saved); OK commits the source and leaves the mode for the main Run.
+        Cancel removes a freshly-created source so it leaves no trace.
         """
 
         def __init__(self, obj, created=False):
@@ -717,20 +818,59 @@ if _GUI_AVAILABLE:
             pick.clicked.connect(self._pick_bounds)
             clear.clicked.connect(self._clear_bounds)
 
-            # Excitation combo + per-waveform parameter rows + preview button
-            # (shared with the point-source panel).
-            self.build_excitation_ui(layout, QtWidgets)
+            # Drive mode: temporal waveform or external SPICE circuit. The two
+            # sets of controls live in their own containers, shown one at a time.
+            self._mode = QtWidgets.QComboBox()
+            for m in _MODE_ORDER:
+                self._mode.addItem(_MODE_LABELS[m], m)
+            self._mode.setCurrentIndex(
+                max(0, _MODE_ORDER.index(excitation_mode(obj)))
+            )
+            layout.addRow("Drive:", self._mode)
+
+            # Waveform container: the excitation combo + parameter rows + preview
+            # button (shared with the point-source panel), inside its own form.
+            self._wave_widget = QtWidgets.QWidget()
+            wave_form = QtWidgets.QFormLayout(self._wave_widget)
+            wave_form.setContentsMargins(0, 0, 0, 0)
+            self.build_excitation_ui(wave_form, QtWidgets)
+            layout.addRow(self._wave_widget)
+
+            # SPICE container: netlist path + the two port node names.
+            self._spice_widget = QtWidgets.QWidget()
+            spice_form = QtWidgets.QFormLayout(self._spice_widget)
+            spice_form.setContentsMargins(0, 0, 0, 0)
+            self._netlist = QtWidgets.QLineEdit(str(getattr(obj, "Netlist", "")))
+            self._node_plus = QtWidgets.QLineEdit(
+                str(getattr(obj, "NodePlus", "port1p"))
+            )
+            self._node_minus = QtWidgets.QLineEdit(
+                str(getattr(obj, "NodeMinus", "0"))
+            )
+            from wavesim_gui import spice_port as spice_mod
+            spice_form.addRow("Netlist:", spice_mod._netlist_row(
+                QtWidgets, self._netlist, form))
+            spice_form.addRow("Node + :", self._node_plus)
+            spice_form.addRow("Node - :", self._node_minus)
+            layout.addRow(self._spice_widget)
 
             self._compute = QtWidgets.QPushButton("Compute Mode")
             layout.addRow(self._compute)
 
+            self._mode.currentIndexChanged.connect(self._on_mode_changed)
+            self._on_mode_changed()
+
             info = QtWidgets.QLabel(
                 "The port launches the TEM mode of the PEC cross-section on the "
                 "chosen face (which is set to PML automatically). The face must "
-                "cut at least two conductors. Pick a temporal waveform and its "
-                "parameters (preview with the plot button). 'Compute Mode' solves "
-                "and plots this port's mode(s) now, for viewing only; they are "
-                "re-solved and saved when you Run. "
+                "cut at least two conductors. Under 'Drive', pick a temporal "
+                "waveform (preview with the plot button) or couple the port to an "
+                "external ngspice netlist (SPICE co-simulation): the two nodes "
+                "must already exist in the netlist and have a DC path to ground "
+                "'0' — wavesim splices its own port companion across them (add no "
+                "port component); the ngspice library path is set in Wavesim → "
+                "Settings. 'Compute Mode' solves and plots this port's mode(s) "
+                "now, for viewing only; they are re-solved and saved when you Run. "
                 "With several conductors on the face (e.g. two coax cross-sections), "
                 "Compute Mode plots one mode per signal conductor (pick between "
                 "them in the plot window) — set 'Energize conductor' to that "
@@ -753,6 +893,15 @@ if _GUI_AVAILABLE:
 
         def _selected_face(self):
             return self._face.currentData() or _FACES[self._face.currentIndex()]
+
+        def _selected_mode(self):
+            return self._mode.currentData() or _MODE_ORDER[self._mode.currentIndex()]
+
+        def _on_mode_changed(self, *_):
+            """Show the controls for the selected drive mode, hide the other."""
+            spice = self._selected_mode() == MODE_SPICE
+            self._wave_widget.setVisible(not spice)
+            self._spice_widget.setVisible(spice)
 
         def _live_face(self, *_):
             self.obj.Face = self._selected_face()
@@ -802,7 +951,14 @@ if _GUI_AVAILABLE:
             self.obj.BoundsSel = new_bounds
             self.obj.Fields = _FIELDS_TOKEN[self._fields.currentText()]
             self.obj.Conductor = int(self._conductor.value())
+            self.obj.ExcitationMode = self._selected_mode()
+            # Persist both drives' inputs (only the active one is read at run
+            # time) so toggling the mode back and forth keeps what was entered.
             self.write_excitation(self.obj)
+            self.obj.Netlist = self._netlist.text().strip()
+            self.obj.NodePlus = self._node_plus.text().strip() or "port1p"
+            self.obj.NodeMinus = self._node_minus.text().strip() or "0"
+            _sync_mode_visibility(self.obj)
             self.obj.Label = "TEM Source ({})".format(_describe(self.obj))
             # Absorbing port: force the launch face to PML.
             domain_mod.set_face_bc(domain_mod.find_domain(active_simulation(doc)),
@@ -974,7 +1130,9 @@ if _GUI_AVAILABLE:
                 "Pixmap": _TEM_ICON,
                 "MenuText": "Add TEM Source",
                 "ToolTip": "Add a TEM waveguide-port source that launches the "
-                "modal field of a PEC cross-section on a domain face",
+                "modal field of a PEC cross-section on a domain face — driven by "
+                "a temporal waveform or an external SPICE circuit (chosen in the "
+                "task panel)",
             }
 
         def Activated(self):

@@ -53,7 +53,11 @@ class WavesimWorkbench(Gui.Workbench):
             self.command_list.append("Wavesim_AddTEMSource")
             self.command_list.append("Wavesim_AddPlaneWave")
             self.command_list.append("Wavesim_AddSpiceLinePort")
-            self.command_list.append("Wavesim_AddSpiceTEMPort")
+            # SPICE TEM ports are now a drive mode of the unified TEM Source
+            # (Wavesim_AddTEMSource), so no separate toolbar button. The
+            # Wavesim_AddSpiceTEMPort command stays registered for backward
+            # compatibility with documents that still hold legacy SpiceTEMPort
+            # objects.
             self.command_list.append("Wavesim_AddProbe")
             self.command_list.append("Wavesim_AddSnapshot")
             self.command_list.append("Wavesim_AddEnergyMonitor")

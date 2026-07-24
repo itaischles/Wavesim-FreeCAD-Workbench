@@ -1335,8 +1335,15 @@ def build_job_from_document(doc, steps=None, fmax=30.0e9, progress=None):
     from wavesim_gui import spice_port as spice_mod
     from wavesim_gui import plane_wave as plane_mod
 
+    # TEM sources split by drive mode: waveform-driven ones go into
+    # ``tem_sources``; SPICE-driven ones are co-simulated, so they join the SPICE
+    # ports below (as ``kind: "tem"`` entries) instead.
     tem_objs = tem_mod.find_tem_sources(sim)
-    tem_sources = [tem_mod.tem_source_spec(t, origin_m) for t in tem_objs]
+    tem_wave_objs = [t for t in tem_objs
+                     if tem_mod.excitation_mode(t) == tem_mod.MODE_WAVEFORM]
+    tem_spice_objs = [t for t in tem_objs
+                      if tem_mod.excitation_mode(t) == tem_mod.MODE_SPICE]
+    tem_sources = [tem_mod.tem_source_spec(t, origin_m) for t in tem_wave_objs]
 
     # Boundary plane waves: launched from a (forced-PML) domain face; the runner
     # places the sheet from the face + the boundary's PML depth, so no per-source
@@ -1349,7 +1356,9 @@ def build_job_from_document(doc, steps=None, fmax=30.0e9, progress=None):
     # with their objects so the mode-mesh pass below can size each port's plane.
     spice_line_specs = [spice_mod.spice_line_port_spec(p, origin_m)
                         for p in spice_mod.find_spice_line_ports(sim)]
-    spice_tem_objs = spice_mod.find_spice_tem_ports(sim)
+    # SPICE-driven TEM ports = legacy SpiceTEMPort objects + TEM sources whose
+    # drive mode is SPICE. Both share the same TEM-plane spec builder.
+    spice_tem_objs = spice_mod.find_spice_tem_ports(sim) + tem_spice_objs
     spice_tem_specs = [spice_mod.spice_tem_port_spec(p, origin_m)
                        for p in spice_tem_objs]
     spice_ports = [s for s in (spice_line_specs + spice_tem_specs) if s]
@@ -1366,7 +1375,7 @@ def build_job_from_document(doc, steps=None, fmax=30.0e9, progress=None):
     convergence = commands_mod.mode_convergence_settings(sim)
     _attach_mode_meshes(
         vox["arrays"], dom,
-        list(zip(tem_sources, tem_objs))
+        list(zip(tem_sources, tem_wave_objs))
         + [(spec, obj) for spec, obj in zip(spice_tem_specs, spice_tem_objs)
            if spec],
         materials, cell_size_m, origin_m, bg_eps, bg_mu, bg_pec,

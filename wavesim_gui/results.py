@@ -44,6 +44,10 @@ _RESOURCES_DIR = os.path.join(_WB_DIR, "Resources")
 _RESULTS_ICON = os.path.join(_RESOURCES_DIR, "run.png")
 _RESULT_ICON = os.path.join(_RESOURCES_DIR, "mesh.png")
 
+
+def _icon(name):
+    return os.path.join(_RESOURCES_DIR, name)
+
 _TYPE_PROP = "WavesimType"
 _RESULTS_TYPE = "Results"   # the container group
 _RESULT_TYPE = "Result"     # a single result leaf
@@ -57,6 +61,18 @@ _KIND_VOLTAGE = "voltage"
 _KIND_CURRENT = "current"
 _KIND_SPICE_V = "spice_v"   # SPICE co-simulation port voltage V(t)
 _KIND_SPICE_I = "spice_i"   # SPICE co-simulation port current I(t)
+
+# Each result leaf shows the toolbar icon of the monitor/port that produced it.
+_KIND_ICONS = {
+    _KIND_ENERGY: _icon("energy_monitor.png"),
+    _KIND_PROBE: _icon("field_probe.png"),
+    _KIND_SNAPSHOT: _icon("snapshot_monitor.png"),
+    _KIND_MODE: _icon("tem_port.png"),
+    _KIND_VOLTAGE: _icon("voltage_monitor.png"),
+    _KIND_CURRENT: _icon("current_monitor.png"),
+    _KIND_SPICE_V: _icon("spice_line_port.png"),
+    _KIND_SPICE_I: _icon("spice_line_port.png"),
+}
 
 _RESULTS_GROUP = "Results"
 
@@ -563,7 +579,9 @@ if _GUI_AVAILABLE:
             self.Object = vobj.Object
 
         def getIcon(self):
-            return _RESULT_ICON
+            obj = getattr(self, "Object", None)
+            kind = str(getattr(obj, "ResultKind", ""))
+            return _KIND_ICONS.get(kind, _RESULT_ICON)
 
         def setEdit(self, vobj, mode=0):
             open_result(vobj.Object)

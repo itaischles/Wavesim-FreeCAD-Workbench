@@ -58,8 +58,7 @@ from wavesim_gui import excitation as exc
 
 _WB_DIR = os.path.join(FreeCAD.getUserAppDataDir(), "Mod", "wavesim-workbench")
 _RESOURCES_DIR = os.path.join(_WB_DIR, "Resources")
-# No dedicated plane-wave icon; reuse the generic port marker.
-_PLANE_ICON = os.path.join(_RESOURCES_DIR, "port.png")
+_PLANE_ICON = os.path.join(_RESOURCES_DIR, "plane_wave.png")
 
 _TYPE_PROP = "WavesimType"
 _PLANE_TYPE = "PlaneWaveSource"

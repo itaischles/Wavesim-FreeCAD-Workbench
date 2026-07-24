@@ -44,7 +44,7 @@ import FreeCAD
 
 _WB_DIR = os.path.join(FreeCAD.getUserAppDataDir(), "Mod", "wavesim-workbench")
 _RESOURCES_DIR = os.path.join(_WB_DIR, "Resources")
-_DOMAIN_ICON = os.path.join(_RESOURCES_DIR, "mesh.png")
+_DOMAIN_ICON = os.path.join(_RESOURCES_DIR, "default.png")
 
 _TYPE_PROP = "WavesimType"
 _DOMAIN_TYPE = "Domain"

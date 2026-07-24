@@ -49,9 +49,10 @@ from wavesim_gui import tem_source as tem_mod
 
 _WB_DIR = os.path.join(FreeCAD.getUserAppDataDir(), "Mod", "wavesim-workbench")
 _RESOURCES_DIR = os.path.join(_WB_DIR, "Resources")
-_ICON = os.path.join(_RESOURCES_DIR, "port.png")
-_SPICE_TEM_PORT_ICON = os.path.join(_RESOURCES_DIR, "spice_tem_port.png")
 _SPICE_LINE_PORT_ICON = os.path.join(_RESOURCES_DIR, "spice_line_port.png")
+# The dedicated SPICE-TEM artwork was retired; legacy SPICE TEM ports (now a
+# drive mode of the TEM source) reuse the shared SPICE port icon.
+_SPICE_TEM_PORT_ICON = _SPICE_LINE_PORT_ICON
 
 _TYPE_PROP = "WavesimType"
 _LINE_TYPE = "SpiceLinePort"

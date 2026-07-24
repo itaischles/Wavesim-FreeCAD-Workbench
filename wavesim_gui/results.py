@@ -42,7 +42,7 @@ from wavesim_gui.commands import active_simulation
 _WB_DIR = os.path.join(FreeCAD.getUserAppDataDir(), "Mod", "wavesim-workbench")
 _RESOURCES_DIR = os.path.join(_WB_DIR, "Resources")
 _RESULTS_ICON = os.path.join(_RESOURCES_DIR, "run.png")
-_RESULT_ICON = os.path.join(_RESOURCES_DIR, "mesh.png")
+_RESULT_ICON = os.path.join(_RESOURCES_DIR, "default.png")
 
 
 def _icon(name):

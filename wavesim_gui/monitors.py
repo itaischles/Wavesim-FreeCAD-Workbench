@@ -54,9 +54,8 @@ from wavesim_gui.commands import active_simulation
 
 _WB_DIR = os.path.join(FreeCAD.getUserAppDataDir(), "Mod", "wavesim-workbench")
 _RESOURCES_DIR = os.path.join(_WB_DIR, "Resources")
-# mesh.png is otherwise unused (the old Grid object was merged into Domain), so
-# it serves as the shared monitor icon.
-_MONITOR_ICON = os.path.join(_RESOURCES_DIR, "mesh.png")
+# Generic monitor icon (placeholder; specific monitors set their own below).
+_MONITOR_ICON = os.path.join(_RESOURCES_DIR, "default.png")
 _SNAPSHOT_MONITOR_ICON = os.path.join(_RESOURCES_DIR, "snapshot_monitor.png")
 _VOLTAGE_MONITOR_ICON = os.path.join(_RESOURCES_DIR, "voltage_monitor.png")
 _CURRENT_MONITOR_ICON = os.path.join(_RESOURCES_DIR, "current_monitor.png")

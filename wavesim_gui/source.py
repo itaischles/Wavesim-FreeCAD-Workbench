@@ -47,8 +47,9 @@ from wavesim_gui import excitation as exc
 
 _WB_DIR = os.path.join(FreeCAD.getUserAppDataDir(), "Mod", "wavesim-workbench")
 _RESOURCES_DIR = os.path.join(_WB_DIR, "Resources")
-_SOURCE_ICON = os.path.join(_RESOURCES_DIR, "port.png")
 _POINT_SOURCE_ICON = os.path.join(_RESOURCES_DIR, "point_source.png")
+# Tree/view-provider icon for a point source (the toolbar command uses the same).
+_SOURCE_ICON = _POINT_SOURCE_ICON
 
 # Marker property, mirroring the other entities' identity scheme so the object is
 # recognisable before its Python proxy is re-attached on reload.

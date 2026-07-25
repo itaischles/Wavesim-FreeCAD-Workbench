@@ -1273,16 +1273,16 @@ def build_job_from_document(doc, steps=None, fmax=30.0e9, progress=None):
     # force them to PML regardless of the Domain's per-face setting -- a face left
     # (or later set) to PEC would trap the launched mode. Their cross-section is
     # also extruded through the spacing + PML cells so the mode exits the absorber
-    # without re-reflecting; a plane wave has no conductor to extrude, so it is
+    # without re-reflecting; a Gaussian beam has no conductor to extrude, so it is
     # kept out of ``port_faces`` (extrusion) here.
     port_faces = [str(t.Face) for t in tem_mod.find_tem_sources(sim)]
     port_faces += [str(p.Face) for p in spice_mod.find_spice_tem_ports(sim)]
 
-    # Force every face-launching source (TEM, SPICE-TEM *and* plane wave) to PML,
+    # Force every face-launching source (TEM, SPICE-TEM *and* Gaussian beam) to PML,
     # via the single source of truth. ``force_pml_faces`` makes the grid padding
     # *and* the emitted boundary (below) both treat these faces as PML, so they
     # stay consistent with the drawn box and node arrays (built from the same
-    # ``tem_port_faces`` list) -- a plane-wave face left at PEC would reflect its
+    # ``tem_port_faces`` list) -- a beam's face left at PEC would reflect its
     # own launch and, on a non-uniform grid, desync the node arrays.
     grid_params = domain_mod.domain_grid_params(
         dom, force_pml_faces=domain_mod.tem_port_faces(sim))
@@ -1333,7 +1333,7 @@ def build_job_from_document(doc, steps=None, fmax=30.0e9, progress=None):
     # so the fallback is skipped when one is present.
     from wavesim_gui import source as source_mod
     from wavesim_gui import spice_port as spice_mod
-    from wavesim_gui import plane_wave as plane_mod
+    from wavesim_gui import gaussian_beam as beam_mod
 
     # TEM sources split by drive mode: waveform-driven ones go into
     # ``tem_sources``; SPICE-driven ones are co-simulated, so they join the SPICE
@@ -1345,11 +1345,12 @@ def build_job_from_document(doc, steps=None, fmax=30.0e9, progress=None):
                       if tem_mod.excitation_mode(t) == tem_mod.MODE_SPICE]
     tem_sources = [tem_mod.tem_source_spec(t, origin_m) for t in tem_wave_objs]
 
-    # Boundary plane waves: launched from a (forced-PML) domain face; the runner
-    # places the sheet from the face + the boundary's PML depth, so no per-source
-    # geometry is needed here beyond the face/angle/directional flag.
-    plane_waves = [plane_mod.plane_wave_spec(p, origin_m)
-                   for p in plane_mod.find_plane_waves(sim)]
+    # Boundary Gaussian beams: launched from a (forced-PML) domain face; the
+    # runner places the sheet from the face + the boundary's PML depth, so no
+    # per-source geometry is needed here beyond the face/angle/waist/directional
+    # flag. An auto waist is resolved against the domain by the spec.
+    gaussian_beams = [beam_mod.gaussian_beam_spec(b, origin_m)
+                      for b in beam_mod.find_gaussian_beams(sim)]
 
     # SPICE co-simulation ports (line + TEM); drop any that could not serialise
     # (e.g. a line port with no curve assigned). The TEM specs are kept paired
@@ -1385,8 +1386,8 @@ def build_job_from_document(doc, steps=None, fmax=30.0e9, progress=None):
     sources = source_mod.find_sources(sim)
     if sources:
         source = source_mod.source_spec(sources[0], origin_m)
-    elif tem_sources or spice_ports or plane_waves:
-        # A TEM source, a plane wave or a (driven) SPICE port is excitation
+    elif tem_sources or spice_ports or gaussian_beams:
+        # A TEM source, a Gaussian beam or a (driven) SPICE port is excitation
         # enough; skip the centre-Gaussian fallback.
         source = None
     else:
@@ -1440,7 +1441,7 @@ def build_job_from_document(doc, steps=None, fmax=30.0e9, progress=None):
         },
         "source": source,
         "tem_sources": tem_sources,
-        "plane_waves": plane_waves,
+        "gaussian_beams": gaussian_beams,
         "spice_ports": spice_ports,
         "monitors": monitors,
     }

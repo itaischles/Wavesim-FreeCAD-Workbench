@@ -71,13 +71,20 @@ job.json schema (Session 2)
                        "excitation": {"type":.., ...}, "fields":"EH"|"E"}, ...],
                        # legacy entries may carry flat "fmax"/"amplitude" keys
                        # and omit "direction" (defaults to +normal / low face)
-      "plane_waves": [{"face":"x0".."z1", "angle_deg":.., "directional":true,
+      "gaussian_beams": [{"face":"x0".."z1", "angle_deg":.., "waist":<metres>,
+                       "directional":true,
                        "excitation": {"type":.., ...}}, ...],
-                       # directional plane waves launched from a boundary face,
+                       # directional Gaussian beams launched from a boundary face,
                        # one PML-depth in (d_pml taken from "boundary"). "angle_deg"
                        # is the E polarization measured in that face's right-handed
                        # transverse frame (see wavesim.sources._FACE_CFG). The face
-                       # must be a PML face (the workbench forces it).
+                       # must be a PML face (the workbench forces it). "waist" is
+                       # w0 in metres -- the 1/e E-amplitude radius, sitting at the
+                       # launch plane (flat phase front) -- and must be positive;
+                       # the workbench resolves its "auto" waist before writing.
+                       # The solver zeroes the sheet over the transverse PML slabs,
+                       # which is what keeps a DC-containing waveform from growing
+                       # without bound there.
       "ngspice_dll": "<path to ngspice.dll>", # optional; library_path for all
                                               # SPICE ports (else PySpice search)
       "spice_ports": [                        # SPICE co-simulation ports
@@ -138,7 +145,7 @@ field profiles into ``results.npz`` (keys ``mode_<si>_<mi>_phi`` / ``_pec`` /
 ``_E_<comp>``) with its per-unit-length parameters under ``summary["modes"]``.
 A port sits on a domain face, which abuts the PML, so the runner clamps the
 launched plane onto the **first interior cell** (:func:`_clamp_launch_into_interior`,
-mirroring :class:`wavesim.sources.PlaneWave`'s ``d_pml`` / ``N-1-d_pml``): the
+mirroring :class:`wavesim.sources.GaussianBeam`'s ``d_pml`` / ``N-1-d_pml``): the
 plane's boundary node is shared by the last interior cell and the first PML cell,
 and the Mode source's nearest-node snap rounds a high-face launch into the
 absorber otherwise — firing the forward wave into the PML.
@@ -327,7 +334,7 @@ def _build_waveform(ws, s):
 
     if typ == "sinusoid":
         # Ramped CW. Use the solver's native Sinusoid so the launch machinery can
-        # read its ``center_frequency`` (it tunes a directional plane-wave / TEM
+        # read its ``center_frequency`` (it tunes a directional beam / TEM
         # launch's H time shift to the numerical phase velocity). ``phase`` is in
         # radians solver-side; ``ramp_cycles`` is the raised-cosine turn-on length.
         return ws.Sinusoid(
@@ -710,7 +717,7 @@ def _clamp_launch_into_interior(mode, grid, d_pml):
     by the last interior cell and the first PML cell, and the nearest-node rule
     rounds toward the PML. The forward wave would then be launched one cell inside
     the absorber. Clamp the injection cell into ``[d_pml, N-1-d_pml]`` -- exactly
-    :class:`wavesim.sources.PlaneWave`'s convention -- and move ``mode.position``
+    :class:`wavesim.sources.GaussianBeam`'s convention -- and move ``mode.position``
     onto that cell's node so both the launch and any coarse-grid rebuild
     (:func:`_coarse_mode_from_fine`, which reads ``mode.position``) follow.
 
@@ -1171,19 +1178,23 @@ def run_job(workdir):
         ))
     sources.extend(plane_sources)
 
-    # Boundary plane waves: a one-way plane wave launched from a boundary face,
-    # one PML-depth inside it. The E sheet is placed at cell ``d_pml`` (low face)
-    # or ``N-1-d_pml`` (high face), so it sits on the first interior cell of the
+    # Boundary Gaussian beams: a one-way beam launched from a boundary face, one
+    # PML-depth inside it. The E sheet is placed at cell ``d_pml`` (low face) or
+    # ``N-1-d_pml`` (high face), so it sits on the first interior cell of the
     # forced-PML launch face and its backward lobe is absorbed. ``d_pml`` comes
-    # from the run's boundary so the sheet matches the actual absorber thickness.
-    for pw in job.get("plane_waves") or []:
-        waveform = _build_waveform(ws, pw)
-        sources.append(ws.PlaneWave(
-            str(pw["face"]),
-            math.radians(float(pw.get("angle_deg", 0.0))),
+    # from the run's boundary so the sheet matches the actual absorber thickness,
+    # and the solver zeroes the sheet that same depth off every transverse edge.
+    # ``waist`` is w0 in metres, at the launch plane; the workbench has already
+    # resolved it to a positive number (the solver rejects anything else).
+    for beam in job.get("gaussian_beams") or []:
+        waveform = _build_waveform(ws, beam)
+        sources.append(ws.GaussianBeam(
+            str(beam["face"]),
+            math.radians(float(beam.get("angle_deg", 0.0))),
             waveform,
+            float(beam["waist"]),
             d_pml=int(boundary.get("d_pml", 10)),
-            directional=bool(pw.get("directional", True)),
+            directional=bool(beam.get("directional", True)),
         ))
 
     # SPICE co-simulation ports: one live ngspice instance each, driven in

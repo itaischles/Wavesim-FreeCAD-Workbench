@@ -377,7 +377,7 @@ def tem_port_faces(sim):
     """Domain faces (``'x0'``..``'z1'``) carrying a TEM/SPICE-TEM port or a plane
     wave -- every source that launches from a face and must absorb its own launch.
 
-    A waveguide port launches a guided mode and a plane wave a directional sheet;
+    A waveguide port launches a guided mode and a Gaussian beam a directional sheet;
     both must absorb the backward/reflected wave, so these faces are forced to PML
     everywhere the grid is built (the drawn box, the node arrays, and the run)
     regardless of the Domain's per-face setting -- otherwise a face left (or set)
@@ -399,8 +399,8 @@ def tem_port_faces(sim):
     except Exception:
         pass
     try:
-        from wavesim_gui import plane_wave as plane_mod
-        faces += [str(p.Face) for p in plane_mod.find_plane_waves(sim)]
+        from wavesim_gui import gaussian_beam as beam_mod
+        faces += [str(b.Face) for b in beam_mod.find_gaussian_beams(sim)]
     except Exception:
         pass
     return faces

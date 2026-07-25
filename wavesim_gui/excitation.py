@@ -41,7 +41,7 @@ solver's :class:`wavesim.sources.Sinusoid`, multiplying the carrier by a
 raised-cosine envelope over the first ``ramp_cycles`` periods so both the value
 and its slope are continuous at turn-on. The older bare ``sine`` (an abrupt
 ``amp*sin(2*pi*f*t + phase)``) is kept for reproducing earlier runs; prefer
-``sinusoid`` for any CW excitation, and for driving a TEM/plane-wave launch (its
+``sinusoid`` for any CW excitation, and for driving a TEM/beam launch (its
 ``center_frequency`` lets the solver tune the directional launch's H time shift).
 """
 

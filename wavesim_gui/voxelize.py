@@ -1418,8 +1418,8 @@ def build_job_from_document(doc, steps=None, fmax=30.0e9, progress=None):
         d_pml = min(d_pml, min(Nx, Ny) // 4)
 
     # Monitors: the user-defined probes/snapshots/energy (Session 7), converted to
-    # the solver frame. With none defined this still yields the always-on energy
-    # diagnostic, so a bare sim behaves as in earlier sessions.
+    # the solver frame. With none defined the job records nothing -- add an Energy
+    # monitor explicitly to get the whole-domain energy diagnostic.
     from wavesim_gui import monitors as monitors_mod
 
     monitors = monitors_mod.monitors_spec(sim, origin_m)

@@ -96,7 +96,11 @@ job.json schema (Session 2)
          "directional":true, "sign":1.0, "uic":false}, ...],
       "mode_only": false,                     # solve TEM modes only; no FDTD run
       "monitors": {
-        "energy": true,
+        "energy": {"full": false, "interior": true},
+                      # one whole-domain energy monitor per true region:
+                      # "full" sums the entire grid, "interior" only the physical
+                      # domain (PML cells dropped). Both false records no energy;
+                      # a legacy bool true == {"full": true}
         "probes":    [{"name":.., "component":"Ez", "x":.., "y":.., "z":..}, ...],
         "snapshots": [{"name":.., "field":"E", "normal":"z",
                        "position":.., "every_N_steps":20}, ...],
@@ -109,9 +113,10 @@ job.json schema (Session 2)
     }
 
 results.npz holds the recorded monitor series (e.g. ``energy_times`` /
-``energy_values``); summary.json holds scalar run metadata (dt, steps, wall
-time, grid dims, voxel counts, final energy). A snapshot stores one frame stack
-per recorded component (``snapshot_<idx>_<comp>_data``, e.g. ``snapshot_0_Ex_data``)
+``energy_values`` for the whole grid, ``energy_interior_*`` for the PML-free
+interior); summary.json holds scalar run metadata (dt, steps, wall time, grid
+dims, voxel counts, and ``<key>_final``/``<key>_max`` per recorded energy
+region). A snapshot stores one frame stack per recorded component (``snapshot_<idx>_<comp>_data``, e.g. ``snapshot_0_Ex_data``)
 plus the ``snapshot_<idx>_times`` and the two in-plane node/edge coordinate arrays
 (``snapshot_<idx>_edges0`` / ``_edges1``, metres, solver frame) they share; its
 summary entry lists the ``field`` and the ``components`` actually saved. The
@@ -402,6 +407,23 @@ def _field_of(component):
     text = str(component).replace("|", "")
     head = text[:1].upper()
     return head if head in ("H", "S") else "E"
+
+
+# Energy monitors: solver region -> the base key its series takes in results.npz.
+# 'full' keeps the bare "energy" prefix the whole-domain series has always used,
+# so older runs and their result leaves still read.
+_ENERGY_KEY = {"full": "energy", "interior": "energy_interior"}
+
+
+def _energy_regions(cfg):
+    """The ``EnergyMonitor.region`` values requested by ``monitors.energy``.
+
+    *cfg* is either the per-region dict the GUI emits (``{"full": .., "interior":
+    ..}``) or a legacy bool, where true meant the one whole-domain monitor.
+    """
+    if isinstance(cfg, dict):
+        return [r for r in ("full", "interior") if cfg.get(r)]
+    return ["full"] if cfg else []
 
 
 class _PoyntingComponentView:
@@ -1203,11 +1225,17 @@ def run_job(workdir):
     spice_ports = _build_spice_ports(ws, job, spice_modes)
     sources.extend(port for _name, port in spice_ports)
 
-    # Monitors. The energy monitor is whole-domain; probes and snapshots
-    # (Session 7) are point/plane recorders described in the job. All locations
-    # are already in the solver frame (origin baked into the voxel arrays).
+    # Monitors. Probes and snapshots (Session 7) are point/plane recorders
+    # described in the job. All locations are already in the solver frame
+    # (origin baked into the voxel arrays).
     mon_cfg = job.get("monitors", {})
-    energy = ws.EnergyMonitor() if mon_cfg.get("energy", True) else None
+
+    # Energy: one solver monitor per requested region -- 'full' sums the entire
+    # grid, 'interior' only the physical domain, with the PML cells dropped. The
+    # solver takes the PML geometry off the CPML this run is built with, so the
+    # interior monitor needs nothing from us but the region name.
+    energy = [(region, ws.EnergyMonitor(region=region))
+              for region in _energy_regions(mon_cfg.get("energy", True))]
 
     probes = []  # (name, FieldProbe)
     for p in mon_cfg.get("probes", []):
@@ -1257,9 +1285,7 @@ def run_job(workdir):
     for c in mon_cfg.get("currents", []):
         currents.append((c.get("name", "current"), ws.CurrentMonitor(c["path"])))
 
-    all_monitors = []
-    if energy is not None:
-        all_monitors.append(energy)
+    all_monitors = [m for _region, m in energy]
     all_monitors.extend(m for _name, m in probes)
     all_monitors.extend(snapshot_solver_monitors)
     all_monitors.extend(m for _name, m in voltages)
@@ -1304,9 +1330,9 @@ def run_job(workdir):
     # Seed with the solved TEM-mode profiles so they ride along in the same
     # results.npz the monitors write into.
     result_arrays = dict(mode_arrays)
-    if energy is not None:
-        result_arrays["energy_times"] = np.asarray(energy.times)
-        result_arrays["energy_values"] = np.asarray(energy.values)
+    for region, mon in energy:
+        result_arrays[_ENERGY_KEY[region] + "_times"] = np.asarray(mon.times)
+        result_arrays[_ENERGY_KEY[region] + "_values"] = np.asarray(mon.values)
 
     # Probes: one time series each, keyed by index (names kept in the summary).
     probe_meta = []
@@ -1423,9 +1449,12 @@ def run_job(workdir):
         "subpixel": bool(job.get("subpixel", False)),
     }
     summary.update(voxel_summary)
-    if energy is not None and energy.values:
-        summary["energy_final"] = float(energy.values[-1])
-        summary["energy_max"] = float(max(energy.values))
+    # Per recorded region: <key>_final / <key>_max, so a run recording both the
+    # whole grid and the interior reports each ("energy_*" is the whole grid).
+    for region, mon in energy:
+        if mon.values:
+            summary[_ENERGY_KEY[region] + "_final"] = float(mon.values[-1])
+            summary[_ENERGY_KEY[region] + "_max"] = float(max(mon.values))
     if probe_meta:
         summary["probes"] = probe_meta
     if snapshot_meta:

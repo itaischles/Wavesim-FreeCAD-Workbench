@@ -13,8 +13,10 @@ monitor dataclasses (:mod:`wavesim.monitors`):
   results window offers Ex/Ey/Ez/|E| (magnitude derived from the components), so
   one monitor covers what used to take three. Drawn as a semi-transparent orange
   plane on the chosen slice plane, offset along that plane's normal axis.
-* **Energy** (``EnergyMonitor``) -- the whole-domain total-energy diagnostic. It
-  has no location, so it is a tree-only object with no 3D representation.
+* **Energy** (``EnergyMonitor``) -- the total-energy diagnostic. It has no
+  location, so it is a tree-only object with no 3D representation; its panel
+  instead picks the volume(s) summed: the PML-free interior (the default), the
+  whole grid including the PML, or both as two separate series.
 * **Voltage** (``VoltageMonitor``) -- records V(t) = ∫E·dl along an *open*
   curve, integrated from the curve's first vertex to its last.
 * **Current** (``CurrentMonitor``) -- records I(t) = ∮H·dl around a *closed*
@@ -333,20 +335,58 @@ class SnapshotObject:
     __setstate__ = loads
 
 
+def _ensure_energy_regions(obj, legacy=False):
+    """Add the two region-selection properties, defaulting per *legacy*.
+
+    A new monitor defaults to the interior alone: the PML absorbs whatever
+    reaches it, so whole-grid energy conflates the energy still stored in the
+    model with the energy already on its way out, while the interior series
+    decays to ~0 once the fields have left. A monitor restored from a document
+    saved before the regions existed recorded the whole grid, so it migrates to
+    that and keeps recording what it always did.
+    """
+    if not hasattr(obj, "RecordInterior"):
+        obj.addProperty(
+            "App::PropertyBool", "RecordInterior", "Monitor",
+            "Record the energy of the physical domain only, excluding the PML "
+            "absorbing layers",
+        )
+        obj.RecordInterior = not legacy
+    if not hasattr(obj, "RecordFullDomain"):
+        obj.addProperty(
+            "App::PropertyBool", "RecordFullDomain", "Monitor",
+            "Record the energy of the whole grid, including the PML absorbing "
+            "layers",
+        )
+        obj.RecordFullDomain = legacy
+
+
 class EnergyObject:
-    """``Proxy`` for the whole-domain total-energy monitor.
+    """``Proxy`` for the total-energy monitor.
 
     The energy monitor has no spatial location, so it carries no geometry and is
     purely a tree object recording that the total-energy diagnostic is active.
+
+    Properties:
+        ``RecordInterior``   -- sum only the physical domain, dropping the PML
+                                cells (the solver's ``region='interior'``).
+        ``RecordFullDomain`` -- sum the whole grid, PML included (``'full'``).
+
+    The two are independent: tick either, or both to record both series. The
+    panel keeps at least one ticked, since a monitor recording neither records
+    nothing at all.
     """
 
     def __init__(self, obj):
         self.Type = _ENERGY_TYPE
         obj.Proxy = self
         _add_type_marker(obj, _ENERGY_TYPE)
+        _ensure_energy_regions(obj)
 
     def onDocumentRestored(self, obj):
         obj.Proxy = self
+        # Documents saved before the region choice existed summed the whole grid.
+        _ensure_energy_regions(obj, legacy=True)
         self.Type = getattr(self, "Type", _ENERGY_TYPE)
 
     def execute(self, obj):
@@ -705,10 +745,10 @@ def _path_spec(mon, origin_m, deflection_mm):
 def monitors_spec(sim, origin_m):
     """Return the ``job.json`` ``monitors`` dict for the simulation *sim*.
 
-    ``energy`` is on when an explicit Energy monitor exists, or when no monitors
-    are defined at all (preserving the always-on energy diagnostic of earlier
-    sessions). When the user has defined only probes/snapshots/voltages/currents,
-    energy is left off so the job records exactly what was asked for.
+    Every entry is user-defined: ``energy`` names a volume only when an explicit
+    Energy monitor asks for it (see :func:`energy_spec`). A simulation with no
+    monitors records nothing, so the job contains exactly what was asked for and
+    nothing else.
     """
     probes = [probe_spec(p, origin_m) for p in find_probes(sim)]
     snapshots = [snapshot_spec(s, origin_m) for s in find_snapshots(sim)]
@@ -721,12 +761,41 @@ def monitors_spec(sim, origin_m):
         s for s in (_path_spec(m, origin_m, deflection)
                     for m in find_current_monitors(sim)) if s
     ]
-    energy_objs = find_energy_monitors(sim)
-    energy = bool(energy_objs) or not (probes or snapshots or voltages or currents)
     return {
-        "energy": energy, "probes": probes, "snapshots": snapshots,
+        "energy": energy_spec(find_energy_monitors(sim)),
+        "probes": probes, "snapshots": snapshots,
         "voltages": voltages, "currents": currents,
     }
+
+
+def energy_spec(energy_objs):
+    """Return the ``monitors.energy`` dict for the Energy monitors *energy_objs*.
+
+    One flag per solver ``EnergyMonitor.region``: ``interior`` sums the physical
+    domain with the PML cells dropped, ``full`` sums the whole grid. Both false
+    (the no-monitor case) means no energy is recorded at all.
+    """
+    return {
+        "full": any(bool(getattr(o, "RecordFullDomain", False))
+                    for o in energy_objs),
+        "interior": any(bool(getattr(o, "RecordInterior", True))
+                        for o in energy_objs),
+    }
+
+
+def _energy_label(obj):
+    """Tree label naming the volume(s) this energy monitor sums."""
+    interior = bool(getattr(obj, "RecordInterior", True))
+    full = bool(getattr(obj, "RecordFullDomain", False))
+    if interior and full:
+        what = "excl. + incl. PML"
+    elif full:
+        what = "incl. PML"
+    elif interior:
+        what = "excl. PML"
+    else:
+        what = "nothing selected"
+    return "Energy ({})".format(what)
 
 
 def _probe_label(obj):
@@ -953,10 +1022,11 @@ if _GUI_AVAILABLE:
         __setstate__ = loads
 
     class EnergyViewProvider:
-        """Tree-only view provider for the whole-domain energy monitor.
+        """Tree-only view provider for the energy monitor.
 
-        No 3D geometry (the energy monitor has no location); double-click does
-        nothing editable, so the object is simply listed under Monitors.
+        No 3D geometry (the energy monitor has no location), so the object is
+        simply listed under Monitors; double-click opens its panel to choose
+        which volume(s) the energy sum covers.
         """
 
         def __init__(self, vobj):
@@ -968,6 +1038,14 @@ if _GUI_AVAILABLE:
 
         def getIcon(self):
             return _ENERGY_MONITOR_ICON
+
+        def setEdit(self, vobj, mode=0):
+            _open_energy_panel(vobj.Object)
+            return True
+
+        def doubleClicked(self, vobj):
+            _open_energy_panel(vobj.Object)
+            return True
 
         def dumps(self):
             return None
@@ -1321,9 +1399,85 @@ if _GUI_AVAILABLE:
         def getStandardButtons(self):
             return _ok_cancel_buttons()
 
+    class TaskEnergyPanel:
+        """Task-tab panel: which volume(s) the total-energy sum covers."""
+
+        def __init__(self, obj, created=False):
+            QtWidgets = _qt_widgets()
+            self.obj = obj
+            self.created = created
+
+            form = QtWidgets.QWidget()
+            form.setWindowTitle("Wavesim Energy Monitor")
+            layout = QtWidgets.QVBoxLayout(form)
+
+            self._interior = QtWidgets.QCheckBox(
+                "Interior only — exclude the PML volume"
+            )
+            self._interior.setChecked(bool(getattr(obj, "RecordInterior", True)))
+            self._full = QtWidgets.QCheckBox(
+                "Whole domain — include the PML volume"
+            )
+            self._full.setChecked(bool(getattr(obj, "RecordFullDomain", False)))
+            layout.addWidget(self._interior)
+            layout.addWidget(self._full)
+
+            info = QtWidgets.QLabel(
+                "Records the total electromagnetic energy at every timestep. "
+                "The PML absorbs whatever reaches it, so the interior energy of "
+                "a stable run decays to ~0 once the fields have left, while the "
+                "whole-domain energy also counts what is still inside the "
+                "absorbing layers. Tick both to record both series."
+            )
+            info.setWordWrap(True)
+            layout.addWidget(info)
+            layout.addStretch(1)
+
+            # A monitor recording neither volume records nothing, so unticking
+            # the last remaining box ticks the other one instead.
+            self._interior.toggled.connect(
+                lambda on: self._keep_one_checked(on, self._full))
+            self._full.toggled.connect(
+                lambda on: self._keep_one_checked(on, self._interior))
+
+            self.form = form
+
+        @staticmethod
+        def _keep_one_checked(checked, other):
+            if not checked and not other.isChecked():
+                other.setChecked(True)
+
+        def accept(self):
+            doc = self.obj.Document
+            doc.openTransaction("Wavesim: Edit Energy Monitor")
+            self.obj.RecordInterior = self._interior.isChecked()
+            self.obj.RecordFullDomain = self._full.isChecked()
+            self.obj.Label = _energy_label(self.obj)
+            doc.commitTransaction()
+            doc.recompute()
+            Gui.Control.closeDialog()
+            return True
+
+        def reject(self):
+            doc = self.obj.Document
+            if self.created:
+                doc.openTransaction("Wavesim: Cancel Energy Monitor")
+                doc.removeObject(self.obj.Name)
+                doc.commitTransaction()
+                doc.recompute()
+            Gui.Control.closeDialog()
+            return True
+
+        def getStandardButtons(self):
+            return _ok_cancel_buttons()
+
     def _open_probe_panel(obj, created=False):
         Gui.Control.closeDialog()
         Gui.Control.showDialog(TaskProbePanel(obj, created=created))
+
+    def _open_energy_panel(obj, created=False):
+        Gui.Control.closeDialog()
+        Gui.Control.showDialog(TaskEnergyPanel(obj, created=created))
 
     def _open_snapshot_panel(obj, created=False):
         Gui.Control.closeDialog()
@@ -1420,14 +1574,14 @@ if _GUI_AVAILABLE:
             return active_simulation(FreeCAD.ActiveDocument) is not None
 
     class CommandAddEnergyMonitor:
-        """Add the whole-domain total-energy monitor (a tree-only object)."""
+        """Add the total-energy monitor (a tree-only object) and open its editor."""
 
         def GetResources(self):
             return {
                 "Pixmap": _ENERGY_MONITOR_ICON,
                 "MenuText": "Add Energy Monitor",
                 "ToolTip": "Record the total electromagnetic energy in the "
-                "domain over time",
+                "domain over time, with or without the PML volume",
             }
 
         def Activated(self):
@@ -1444,7 +1598,7 @@ if _GUI_AVAILABLE:
             try:
                 energy = doc.addObject("App::FeaturePython", "EnergyMonitor")
                 EnergyObject(energy)
-                energy.Label = "Energy Monitor"
+                energy.Label = _energy_label(energy)
                 if energy.ViewObject is not None:
                     EnergyViewProvider(energy.ViewObject)
                 monitors_group(sim).addObject(energy)
@@ -1453,6 +1607,7 @@ if _GUI_AVAILABLE:
                 raise
             doc.commitTransaction()
             doc.recompute()
+            _open_energy_panel(energy, created=True)
 
         def IsActive(self):
             return active_simulation(FreeCAD.ActiveDocument) is not None

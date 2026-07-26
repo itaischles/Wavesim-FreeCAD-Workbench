@@ -291,9 +291,12 @@ def build_results(doc, sim, workdir, summary):
             grp.addObject(leaf)
             return leaf
 
-        # Energy (whole-domain total energy).
-        if "energy_values" in keys:
-            _new_leaf("Energy", _KIND_ENERGY, "energy")
+        # Energy: one leaf per region the run recorded (the whole grid, the
+        # PML-free interior, or both as two independent series).
+        for data_key, name in (("energy", "Energy (incl. PML)"),
+                               ("energy_interior", "Energy (excl. PML)")):
+            if data_key + "_values" in keys:
+                _new_leaf(name, _KIND_ENERGY, data_key)
 
         # Probes (one time series each).
         for idx, meta in enumerate(summary.get("probes", [])):
@@ -754,7 +757,8 @@ if _GUI_AVAILABLE:
         _register_window(dialog)
 
     def _plot_energy(obj):
-        _plot_series(obj, "total energy", "Total domain energy", "#d65a00")
+        # Titled from the leaf label so the two regions' plots are told apart.
+        _plot_series(obj, "total energy", str(obj.Label), "#d65a00")
 
     def _plot_probe(obj):
         comp = str(getattr(obj, "Component", "")) or "field"

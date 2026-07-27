@@ -142,18 +142,33 @@ TEM ports (Session 9)
 Each ``tem_sources`` entry names a grid plane (the ``normal`` axis and the
 ``position`` of the plane along it, in the solver frame). The runner calls
 :func:`wavesim.mode_solver.solve_tem_modes` on that plane to find the TEM mode of
-the PEC cross-section, launches it as an amplitude-calibrated directional modal
-source (:meth:`TEMMode.to_source`, which impresses the modal current a matched
-line turns into the requested forward voltage — so a 1 V mode launches ≈ 1 V on
-any grid or fill) during the FDTD run, and saves each solved mode's 2D
+the PEC cross-section, drives it during the FDTD run from a **matched Thévenin
+port** (:class:`wavesim.sources.TEMPort` behind the mode's own Z₀, built by
+:func:`_matched_tem_port`) whose drive is scaled so the launched forward wave is
+the requested voltage on any grid or fill, and saves each solved mode's 2D
 field profiles into ``results.npz`` (keys ``mode_<si>_<mi>_phi`` / ``_pec`` /
 ``_E_<comp>``) with its per-unit-length parameters under ``summary["modes"]``.
 A port sits on a domain face, which abuts the PML, so the runner clamps the
-launched plane onto the **first interior cell** (:func:`_clamp_launch_into_interior`,
+plane onto the **first interior cell** (:func:`_interior_position`,
 mirroring :class:`wavesim.sources.GaussianBeam`'s ``d_pml`` / ``N-1-d_pml``): the
 plane's boundary node is shared by the last interior cell and the first PML cell,
-and the Mode source's nearest-node snap rounds a high-face launch into the
-absorber otherwise — firing the forward wave into the PML.
+and the nearest-node snap rounds a high-face plane into the
+absorber otherwise — firing the forward wave into the PML, and (since the pad
+holds no geometry) solving the mode on an empty cross-section.
+Because the port carries a real resistance rather than an ideal impressed
+current, it also **terminates** its own plane: whatever returns there is
+absorbed, and a DC-containing drive (a Gaussian pulse) drains back out through
+it instead of stranding static charge the propagating-only CPML cannot absorb.
+That drain is local to each port — no far-end termination is assumed.
+**The conductors stop at the port plane.** The voxeliser deliberately does not
+carry them through the PML pad: the port is the line's load, and a line that
+continued past it into the absorber would put a second Z₀ in parallel with the
+port (Z₀‖Z₀, a measured Γ ≈ -1/3, ringing for many round trips). Ending the line
+at the port leaves the port terminating an open circuit — Z₀‖open = Z₀ — which
+is the match. The PML pad behind stays, absorbing what the modal port cannot:
+the backward lobe of a bidirectional (``'E'``-only) launch, a directional
+launch's residual lobe, higher-order modes and radiation off an open
+cross-section such as microstrip.
 With ``mode_only`` true the runner solves and saves the modes and skips the FDTD
 time-stepping entirely. The workbench's "Compute Mode" button uses this, sending a
 job that carries **only the one port** it wants previewed (it plots the modes and
@@ -178,8 +193,8 @@ of *that plane only*, auto-refined until the PEC component count stabilises. Its
 The runner (:func:`_mode_mesh_grid`) rebuilds them as a single-cell-thick fine
 grid, solves the mode there (conductor count now correct), and — for a launch —
 interpolates the mode back onto the coarse grid as a rebuilt coarse ``TEMMode``
-(:func:`_coarse_mode_from_fine`) that :meth:`TEMMode.to_source` (or a SPICE port)
-then launches. The FDTD grid is untouched. Absent ⇒ the coarse
+(:func:`_coarse_mode_from_fine`) that the matched port (or a SPICE port)
+then drives. The FDTD grid is untouched. Absent ⇒ the coarse
 slice is solved as before. ``mode_mesh`` and ``bounds`` are mutually exclusive
 per port: the fine grid already spans exactly the (bounded) box.
 
@@ -714,47 +729,129 @@ def _coarse_mode_from_fine(ws, np, mode, grid):
     )
 
 
-def _reverse_mode_h(mode):
-    """Return a shallow copy of *mode* with its H profiles negated.
+def _mirror_port_h_sheet(np, port, grid):
+    """Re-aim a directional port's H sheet from +normal to -normal.
 
-    Reverses the Poynting vector S = E × H so a directional ``to_source`` launch
-    flows toward -normal (a port on a high face fires *into* the domain). The E
-    profiles — which set the calibrated launch amplitude — and every per-unit
-    parameter are shared unchanged; only the H sheet's sign flips.
+    :meth:`TEMMode.build_port_kernel` hard-codes a **+normal** launch: the E
+    sheet sits on the mode plane ``k`` and the paired H sheet one cell *behind*
+    it at ``k-1``, and the pair adds on the +normal side while cancelling on the
+    -normal side. A port on a high face has to fire the other way.
+
+    The obvious trick — negating the mode's H profiles, which is what the old
+    soft launch did — swaps which side is live but leaves the sheets one cell
+    apart *the same way*, so the E plane at ``k`` ends up on the now-dead side.
+    A soft launch does not care: it is an ideal current source
+    and its amplitude does not depend on the plane's field. A port very much
+    does — its whole circuit law reads the plane voltage back — and measurement
+    on a driven coax shows that read-back collapsing from ≈ Z₀ to ≈ 1.4 Ω,
+    which both breaks the drive calibration (1.88× too much launched) and
+    leaves the port unable to absorb anything returning to it, losing exactly
+    the termination this port exists to provide.
+
+    The correct construction is the **mirror image about the mode plane**: keep
+    E at ``k``, put H at ``k+1``, and flip its sign (transverse H is a
+    pseudovector, so a mirrored wave with the same E carries the opposite H).
+    The launch then runs toward -normal with the E plane still on the live side.
+    Measured against the same port on a low face: read-back 61.3 Ω vs 64.1,
+    launched amplitude within 2%, backward rejection ≈ -62 dB.
+
+    This edits the compiled kernel in place because the solver exposes no
+    propagation direction — ``build_port_kernel`` should really take a
+    ``direction=±1`` and do this itself; until it does, the surgery lives here,
+    in one place, rather than being spread through the launch path.
     """
-    import copy
+    kernel = port._port
+    hedges = (kernel or {}).get('hedges')
+    if not hedges:
+        return port                     # bidirectional port: no sheet to re-aim
+    axis = {"x": 0, "y": 1, "z": 2}[port.mode.normal]
+    n_axis = (grid.Nx, grid.Ny, grid.Nz)[axis]
+    mirrored = {}
+    for comp, (ii, jj, kk, coef_h) in hedges.items():
+        idx = [ii, jj, kk]
+        moved = idx[axis] + 2           # k-1 -> k+1
+        if int(np.max(moved)) >= n_axis:
+            raise RuntimeError(
+                "A high-face TEM port needs one cell on the far side of its "
+                "plane for the mirrored H sheet, but the plane sits at the very "
+                "edge of the grid. Move the port at least one cell into the "
+                "domain.")
+        idx[axis] = moved
+        mirrored[comp] = (idx[0], idx[1], idx[2], -coef_h)
+    kernel['hedges'] = mirrored
+    return port
 
-    rev = copy.copy(mode)
-    rev.H = {comp: -arr for comp, arr in mode.H.items()}
-    return rev
+
+def _matched_tem_port(ws, np, mode, waveform, grid, directional, direction,
+                      name):
+    """Build the matched Thévenin :class:`wavesim.sources.TEMPort` for *mode*.
+
+    A TEM port is a **generator with a matched internal resistance**, not a soft
+    impressed source: it drives the mode through its own Z₀, so it is a genuine
+    resistor across the line and conducts at DC. That is what keeps a
+    DC-containing drive (a Gaussian pulse) from stranding static charge on the
+    structure — the CPML is propagating-only and absorbs no DC, and PEC
+    conductors have no relaxation path, so with a soft launch
+    (:meth:`TEMMode.to_source`, an ideal current source: open-circuit at DC) the
+    pulse's DC content has nowhere to go and stays put for the whole run. The
+    drain is **local to this port**: no far-end termination is assumed or needed.
+
+    No amplitude correction is applied here. ``TEMPort``'s ``voltage=`` is the
+    launched **forward-wave** voltage, not the raw Thévenin EMF: the port holds
+    its internal resistance at Z₀ and drives its generator at the exact
+    reciprocal of the divider it faces (2× directional, 3× bidirectional), so
+    the waveform's amplitude arrives on the line as written — the same contract
+    :meth:`TEMMode.to_source` had. (Both of those are κ-free constants, so they
+    do not drift with the cross-section.)
+
+    *direction* is the ±1 the job entry carries: -1 (a port on a high face,
+    firing along -normal) re-aims the directional H sheet, see
+    :func:`_mirror_port_h_sheet`.
+    """
+    port = ws.TEMPort(mode=mode, voltage=waveform, directional=directional)
+    try:
+        # Compile the port kernel now rather than on the first inject, so a
+        # plane the kernel cannot be built on (no transverse E energy on it, or
+        # a directional launch with no room for its H sheet) is reported against
+        # the port's name instead of failing part-way through the time-stepping.
+        port.self_coupling(grid)
+    except ValueError as exc:
+        raise RuntimeError(
+            "TEM port '{}' cannot be driven on this plane: {}".format(name, exc)
+        )
+    if directional and direction < 0:
+        _mirror_port_h_sheet(np, port, grid)
+    return port
 
 
-def _clamp_launch_into_interior(mode, grid, d_pml):
-    """Pull a boundary launch plane out of the PML onto the first interior cell.
+def _interior_position(normal, position, grid, d_pml):
+    """Pull a boundary port plane out of the PML onto the first interior cell.
 
-    A face port's plane sits on the domain boundary node. The Mode source injects
-    at ``grid.axis_index(normal, position)`` -- the *nearest node* used as a cell
+    A face port's plane sits on the domain boundary node. The cell it lands on is
+    ``grid.axis_index(normal, position)`` -- the *nearest node* used as a cell
     index -- which on a low face is cell ``d_pml`` (the first interior cell,
     correct) but on a high face is cell ``N-d_pml``: the boundary node is shared
     by the last interior cell and the first PML cell, and the nearest-node rule
-    rounds toward the PML. The forward wave would then be launched one cell inside
-    the absorber. Clamp the injection cell into ``[d_pml, N-1-d_pml]`` -- exactly
-    :class:`wavesim.sources.GaussianBeam`'s convention -- and move ``mode.position``
-    onto that cell's node so both the launch and any coarse-grid rebuild
-    (:func:`_coarse_mode_from_fine`, which reads ``mode.position``) follow.
+    rounds toward the PML. Clamp the cell into ``[d_pml, N-1-d_pml]`` -- exactly
+    :class:`wavesim.sources.GaussianBeam`'s convention -- and return that cell's
+    node coordinate.
+
+    This matters twice over. The launch must not fire its forward wave into the
+    absorber; and, since the voxeliser no longer extrudes the conductors through
+    the PML (the port terminates the line instead), the pad holds no geometry at
+    all, so a mode solved a cell too far out would find an empty cross-section.
+    Applying it to *position* up front puts the solve, the saved profiles and the
+    launch on one populated plane.
 
     A no-op for an interior port (its cell is already well inside the range). The
     near bound is the PML pad on the port's own face, which a TEM/SPICE-TEM face
     always has (the workbench forces it to PML); the far bound never binds.
     """
-    normal = mode.normal
     N = {"x": grid.Nx, "y": grid.Ny, "z": grid.Nz}[normal]
     coords = {"x": grid.x, "y": grid.y, "z": grid.z}[normal]
-    k = grid.axis_index(normal, mode.position)
+    k = grid.axis_index(normal, position)
     k_interior = min(max(k, d_pml), N - 1 - d_pml)
-    if k_interior != k:
-        mode.position = float(coords[k_interior])
-    return mode
+    return float(coords[k_interior]) if k_interior != k else position
 
 
 def _solve_all_modes(ws, np, grid, job, material_data=None):
@@ -762,8 +859,8 @@ def _solve_all_modes(ws, np, grid, job, material_data=None):
 
     Returns ``(plane_sources, spice_modes, mode_arrays, mode_meta)``:
 
-    * ``plane_sources`` — amplitude-calibrated modal launchers
-      (:meth:`TEMMode.to_source`) for the ``tem_sources`` (one per port, the
+    * ``plane_sources`` — matched Thévenin modal ports
+      (:func:`_matched_tem_port`) for the ``tem_sources`` (one per port, the
       chosen mode); empty when ``mode_only``.
     * ``spice_modes`` — ``{job_spice_index: TEMMode}`` giving the chosen mode for
       each ``kind:"tem"`` SPICE port, consumed by :func:`_build_spice_ports`;
@@ -780,7 +877,7 @@ def _solve_all_modes(ws, np, grid, job, material_data=None):
     """
     mode_only = bool(job.get("mode_only", False))
     # PML depth (cells) used to keep a face-port launch plane just inside the
-    # absorber; see _clamp_launch_into_interior.
+    # absorber; see _interior_position.
     d_pml = int((job.get("boundary") or {}).get("d_pml", 10))
 
     # Every plane needing a mode solve: TEM sources first, then SPICE TEM ports.
@@ -801,8 +898,18 @@ def _solve_all_modes(ws, np, grid, job, material_data=None):
     n_ports = len(planes)
     for si, (kind, t, spice_index) in enumerate(planes):
         normal = t.get("normal", "z")
-        position = float(t.get("position", 0.0))
         name = t.get("name", "TEM")
+        # Pull the plane onto the first interior cell *before* solving. A port
+        # sits on the domain face, whose node is shared by the last interior cell
+        # and the first PML cell, and the nearest-node snap rounds a high-face
+        # plane into the absorber -- where the conductors no longer reach, since
+        # the voxeliser stops the geometry at the port plane and lets the port
+        # terminate it. Solving there would find an empty cross-section and no
+        # mode at all. Clamping here (rather than only before the launch, as this
+        # used to) keeps the solve, the saved profiles and the launch all on the
+        # same populated plane.
+        position = _interior_position(
+            normal, float(t.get("position", 0.0)), grid, d_pml)
 
         # Characteristic frequency/amplitude/fields for the results tree. SPICE
         # ports have no waveform (the circuit drives them), so they carry none.
@@ -932,12 +1039,10 @@ def _solve_all_modes(ws, np, grid, job, material_data=None):
             continue
 
         chosen = _choose_mode(modes, int(t.get("conductor_id", 0)), name)
-        # A port on a domain face abuts the PML; keep its launch plane on the
-        # first interior cell so the forward wave isn't fired into the absorber
-        # (nearest-node snapping otherwise lands a high-face launch one cell
-        # inside the PML). Applies to both the TEM and SPICE-TEM launch paths,
-        # which each read the chosen mode's ``position``.
-        _clamp_launch_into_interior(chosen, grid, d_pml)
+        # ``position`` was already pulled onto the first interior cell before the
+        # solve (:func:`_interior_position`), so the mode this launches from is
+        # on the populated plane and needs no further nudging here -- both the
+        # TEM and SPICE-TEM launch paths read the chosen mode's ``position``.
         if kind == "spice":
             # Hand the chosen mode to _build_spice_ports; the circuit drives it.
             # A fine-mesh mode is rebuilt on the coarse grid first, since the
@@ -947,13 +1052,13 @@ def _solve_all_modes(ws, np, grid, job, material_data=None):
             )
             continue
 
-        # TEM source: launch the chosen mode as an amplitude-calibrated modal
-        # source. ``to_source`` impresses the modal current that a matched line
-        # turns into ``amplitude·waveform(t)`` volts forward, using the same
-        # ``build_port_kernel`` current machinery a port uses — so the launched
-        # voltage is correct on any grid or fill permittivity (the older additive
-        # field write came out √ε_r / S_c too large). The waveform already carries
-        # the excitation amplitude, so ``amplitude`` stays at unit scale.
+        # TEM source: drive the chosen mode from a matched Thévenin port — a
+        # generator behind the mode's own Z₀ (see :func:`_matched_tem_port`). It
+        # launches the amplitude-calibrated forward wave *and* terminates: the
+        # port is a real resistance across the line, so it both absorbs what
+        # comes back to the plane and gives a DC-containing drive (a Gaussian
+        # pulse) somewhere to drain, instead of stranding static charge that
+        # neither the propagating-only CPML nor a floating PEC can relax.
         #
         # A fine-mesh mode lives on the fine grid; rebuild it on the coarse launch
         # grid first (exactly as the SPICE path does), since the port kernel
@@ -962,17 +1067,16 @@ def _solve_all_modes(ws, np, grid, job, material_data=None):
         launch_mode = (
             _coarse_mode_from_fine(ws, np, chosen, grid) if use_mesh else chosen
         )
-        # ``to_source`` builds H = (n̂ × E)/η for a +normal launch, so the wave
-        # flows toward +normal. A port on a high face launches *into* the domain
-        # along -normal (direction < 0): negate the mode's H profiles to reverse
-        # the Poynting vector S = E × H (an E-only launch carries no H sheet and
-        # is bidirectional, so the sign is moot there). Any residual backward lobe
-        # is absorbed by the PML behind the launch face.
+        # The port kernel builds H = (n̂ × E)/η for a +normal launch. A port on a
+        # high face fires *into* the domain along -normal (direction < 0), which
+        # the port handles by mirroring its H sheet across the mode plane (see
+        # :func:`_mirror_port_h_sheet`). An E-only launch carries no H sheet and
+        # is bidirectional, so the direction is moot there; its backward lobe is
+        # absorbed by the PML behind the launch face.
         direction = float(t.get("direction", 1.0))
-        if direction < 0 and fields != "E":
-            launch_mode = _reverse_mode_h(launch_mode)
-        src = launch_mode.to_source(waveform, amplitude=1.0, fields=fields)
-        plane_sources.append(src)
+        plane_sources.append(_matched_tem_port(
+            ws, np, launch_mode, waveform, grid, fields != "E", direction,
+            name))
 
     return plane_sources, spice_modes, mode_arrays, mode_meta
 

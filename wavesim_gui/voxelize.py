@@ -35,10 +35,11 @@ then matplotlib's vectorised point-in-polygon over that layer's cell centres
 (matplotlib + numpy are both in FreeCAD's bundled Python). This replaces the
 original ``isInside``-per-cell sweep, which was O(N^3) BREP point queries.
 
-TEM ports need the guide to continue through the absorber, so after the sweep
-each port face's cross-section is extruded through its spacing + PML cells
-(:func:`_extrude_port_faces`); otherwise the conductors stop at the geometry and
-the mode re-reflects off the empty-vacuum PML behind the launch plane.
+The geometry is left to stop where the CAD stops -- in particular it is *not*
+carried through a TEM port's PML pad. The port terminates the line at Z0, so it
+needs the line to end at its plane: conductors continuing past it into the
+absorber would put a second Z0 in parallel with the port and reflect about a
+third of the wave back.
 """
 
 import math
@@ -306,56 +307,6 @@ def _layer_inside(body_shape, z_axis, z, pts, deflection):
         inside ^= Path(poly).contains_points(pts)
         any_wire = True
     return inside if any_wire else None
-
-
-def _extrude_port_faces(arrays, port_faces, bg_eps=1.0, bg_mu=1.0, bg_pec=False):
-    """Make the material arrays invariant along each TEM port's normal axis.
-
-    For every face in *port_faces* (solver names ``'x0'``..``'z1'``) the
-    boundary-most material cross-section is copied outward across the background
-    and PML cells, out to the grid edge. A waveguide mode is only guided where
-    its PEC cross-section is invariant along the propagation axis; without this
-    the conductors stop at the geometry and the PML behind a port plane is empty
-    vacuum, so the mode is unsupported there and partially re-reflects -- a port
-    that looks like a semi-open circuit. Only TEM-port faces are touched: their
-    cross-section is uniform by construction so the copy is exact, whereas doing
-    this on an arbitrary PML face could smear non-uniform geometry into the
-    absorber. Modifies *arrays* in place.
-
-    ``bg_eps``/``bg_mu``/``bg_pec`` describe the background medium so "has
-    geometry" is detected relative to it (a non-vacuum background otherwise marks
-    every cell as filled).
-    """
-    import numpy as np
-
-    axis_of = {"x": 0, "y": 1, "z": 2}
-    keys = ("eps_x", "eps_y", "eps_z", "mu_x", "mu_y", "mu_z", "pec_mask")
-    # A cell holds geometry if it differs from the background medium. Computed
-    # once from the original geometry so two ports on one axis both extrude the
-    # real cross-section rather than each other's fill.
-    present = arrays["pec_mask"] != bool(bg_pec)
-    for key in ("eps_x", "eps_y", "eps_z"):
-        present |= arrays[key] != bg_eps
-    for key in ("mu_x", "mu_y", "mu_z"):
-        present |= arrays[key] != bg_mu
-
-    for face in port_faces:
-        axis = axis_of.get(face[0])
-        if axis is None:
-            continue
-        is_high = face.endswith("1")
-        layers = present.any(axis=tuple(a for a in range(3) if a != axis))
-        filled = np.nonzero(layers)[0]
-        if filled.size == 0:
-            continue  # no geometry along this axis -- nothing to extrude
-        k = int(filled[-1] if is_high else filled[0])
-        sel = [slice(None)] * 3
-        sel[axis] = slice(k + 1, None) if is_high else slice(None, k)
-        src = [slice(None)] * 3
-        src[axis] = slice(k, k + 1)  # keep the axis (length 1) so it broadcasts
-        for key in keys:
-            arr = arrays[key]
-            arr[tuple(sel)] = arr[tuple(src)]
 
 
 # --------------------------------------------------------------------------- #
@@ -654,10 +605,11 @@ def _port_slice_pos_mm(materials, normal, face_is_high, normal_cell_mm):
     where the raw CAD does not reach -- slicing there misses the solid, or hits
     its exact end face (a floating-point-fragile degenerate slice that catches one
     end but not the other). Instead sample at the geometry's own boundary-most
-    cross-section nearest the face, nudged just inside off the end face, mirroring
-    how :func:`_extrude_port_faces` copies that cross-section out to the face for
-    the coarse solve. Uses the PEC bodies' extent (the conductors define the
-    guide), falling back to all bodies. ``None`` when there is no geometry.
+    cross-section nearest the face, nudged just inside off the end face -- the
+    same plane the coarse solve lands on once the runner clamps the port onto the
+    first interior cell (:func:`runner._interior_position`). Uses the PEC bodies'
+    extent (the conductors define the guide), falling back to all bodies.
+    ``None`` when there is no geometry.
     """
     bbox = _combined_bbox([e for e in _gather(materials) if e[3]]) \
         or _combined_bbox(_gather(materials))
@@ -787,7 +739,7 @@ def voxelize_materials(materials, cell_size_m,
                        spacing_lo_m=(0.0, 0.0, 0.0), spacing_hi_m=(0.0, 0.0, 0.0),
                        pad_lo=(8, 8, 8), pad_hi=(8, 8, 8),
                        extra_points_mm=(), extra_axis_offsets=(),
-                       port_faces=(), bg_eps=1.0, bg_mu=1.0, bg_pec=False,
+                       bg_eps=1.0, bg_mu=1.0, bg_pec=False,
                        nodes_m=None, subpixel=False, oversample=4,
                        max_total_cells=10_000_000, progress=None):
     """Voxelise *materials* onto a regular grid bounding all their bodies.
@@ -816,11 +768,6 @@ def voxelize_materials(materials, cell_size_m,
     extra_axis_offsets : iterable of (axis, value_mm)
         Single-axis constraints the grid must contain (snapshot slice offsets,
         which only bound their normal axis). Grows the box on that axis only.
-    port_faces : iterable of str
-        Solver face names (``'x0'``..``'z1'``) hosting a TEM port. Each port's
-        cross-section is extruded through the spacing + PML cells on that face
-        (see :func:`_extrude_port_faces`) so the guided mode exits the absorber
-        without re-reflecting. Empty for a run with no TEM ports.
     nodes_m : tuple of array, optional
         Explicit per-axis node coordinates ``(x, y, z)`` in **world metres**
         (strictly increasing, PML pad cells included) from the Domain's graded
@@ -1027,11 +974,6 @@ def voxelize_materials(materials, cell_size_m,
             if progress is not None and progress(done_layers, total_layers):
                 raise VoxelizationCancelled()
 
-    # Extend each TEM-port cross-section through its spacing + PML cells so a
-    # guided mode stays supported into the absorber (modifies arrays in place;
-    # done before the counts below so they reflect the extruded geometry).
-    _extrude_port_faces(arrays, port_faces, bg_eps=bg_eps, bg_mu=bg_mu,
-                        bg_pec=bg_pec)
     grid_dict = {
         "Nx": Nx, "Ny": Ny, "Nz": Nz,
         "dx": dx_mm / _MM_PER_M,
@@ -1269,14 +1211,14 @@ def build_job_from_document(doc, steps=None, fmax=30.0e9, progress=None):
     from wavesim_gui import tem_source as tem_mod
     from wavesim_gui import spice_port as spice_mod
 
-    # TEM (and SPICE-TEM) port faces launch a guided mode and must absorb it, so
-    # force them to PML regardless of the Domain's per-face setting -- a face left
-    # (or later set) to PEC would trap the launched mode. Their cross-section is
-    # also extruded through the spacing + PML cells so the mode exits the absorber
-    # without re-reflecting; a Gaussian beam has no conductor to extrude, so it is
-    # kept out of ``port_faces`` (extrusion) here.
-    port_faces = [str(t.Face) for t in tem_mod.find_tem_sources(sim)]
-    port_faces += [str(p.Face) for p in spice_mod.find_spice_tem_ports(sim)]
+    # Note the geometry is deliberately *not* carried through a port face's PML
+    # pad. The port is the line's load, and a line continuing past it into the
+    # absorber would hang a second Z0 in parallel with the port (Z0||Z0, a
+    # measured reflection of about -1/3 that rings for many round trips). Letting
+    # the conductors stop at the port plane leaves the port terminating an open
+    # circuit, which is the match; the pad behind still absorbs whatever the
+    # modal port cannot (a bidirectional launch's backward lobe, higher-order
+    # modes, radiation off an open cross-section).
 
     # Force every face-launching source (TEM, SPICE-TEM *and* Gaussian beam) to PML,
     # via the single source of truth. ``force_pml_faces`` makes the grid padding
@@ -1316,7 +1258,6 @@ def build_job_from_document(doc, steps=None, fmax=30.0e9, progress=None):
         pad_lo=pad_lo, pad_hi=pad_hi,
         extra_points_mm=source_points_mm(sim),
         extra_axis_offsets=snapshot_axis_offsets(sim),
-        port_faces=port_faces,
         bg_eps=bg_eps, bg_mu=bg_mu, bg_pec=bg_pec,
         nodes_m=nodes_m, subpixel=subpixel,
         progress=progress,

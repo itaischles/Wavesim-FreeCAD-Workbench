@@ -22,6 +22,24 @@ A TEM source is driven one of two ways, chosen in its task panel
 
 Both modes share the launch-plane geometry below; only the drive differs.
 
+Matched port (why a waveform port also absorbs)
+-----------------------------------------------
+A waveform-driven TEM source is a **generator behind a matched internal
+resistance** -- the mode's own characteristic impedance Z0 -- not a soft
+impressed field. It therefore *terminates* its own plane as well as driving it:
+whatever comes back is absorbed there, and, because a resistance conducts at DC,
+a DC-containing excitation (a Gaussian pulse is the usual one) drains back out
+through the port.
+
+That last point is the reason for the design. Nothing else in the solver
+conducts DC: the CPML absorbs propagating waves only, and a PEC conductor floats
+with no relaxation path -- so a soft launch leaves a Gaussian's DC content
+stranded as static charge on the structure for the rest of the run. The drain is
+**local to this port**; no matched load at the far end of the line is assumed or
+needed. Nothing is exposed for the user to configure, and the launched amplitude
+is unchanged -- the solver's port takes its drive as the forward-wave voltage --
+so the excitation's Amplitude still means exactly what it did before.
+
 Workflow
 --------
 * The user adds a TEM source, picks one of the six domain faces (the launch
@@ -863,7 +881,13 @@ if _GUI_AVAILABLE:
             info = QtWidgets.QLabel(
                 "The port launches the TEM mode of the PEC cross-section on the "
                 "chosen face (which is set to PML automatically). The face must "
-                "cut at least two conductors. Under 'Drive', pick a temporal "
+                "cut at least two conductors. A waveform port is a matched "
+                "generator: it drives the mode through the line's own Z₀, so it "
+                "also terminates its plane — reflections arriving back at the "
+                "port are absorbed, and a DC-carrying pulse (a Gaussian) drains "
+                "out through it instead of leaving static charge trapped on the "
+                "structure, which is what happens when a port cannot conduct DC. "
+                "Under 'Drive', pick a temporal "
                 "waveform (preview with the plot button) or couple the port to an "
                 "external ngspice netlist (SPICE co-simulation): the two nodes "
                 "must already exist in the netlist and have a DC path to ground "

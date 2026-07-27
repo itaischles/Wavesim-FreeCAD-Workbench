@@ -66,6 +66,13 @@ _FACE_PROPS = (
 
 _BC_CHOICES = ["PML", "PEC"]
 
+# Shown (read-only) in the Domain panel for a face that launches a TEM port or
+# Gaussian beam. Not a stored ``App::PropertyEnumeration`` value -- the job
+# builder forces such a face to PML through ``domain_grid_params
+# (force_pml_faces=)``, so the per-face property is simply not the user's to set
+# there, and an editable combo would only look like it applied.
+_PORT_BC_LABEL = "TEM port (absorbing)"
+
 # Per-face background-spacing property names, in face order (mirrors _FACE_PROPS).
 _SPACING_PROPS = (
     ("x0", "SpacingXMin", "Background gap added outside the low-x material bound"),
@@ -1160,11 +1167,28 @@ if _GUI_AVAILABLE:
             self._same_bc.setChecked(all_same)
             layout.addRow(self._same_bc)
 
+            # Faces hosting a face-launching source are not the user's to set:
+            # the job builder forces them to PML regardless (see
+            # ``tem_port_faces`` / ``domain_grid_params(force_pml_faces=)``), so
+            # show that state as its own locked entry rather than an editable
+            # combo that silently does not apply.
+            from wavesim_gui.commands import active_simulation
+            self._port_faces = set(tem_port_faces(active_simulation(obj.Document)))
             self._combos = {}
             for face, prop, _doc in _FACE_PROPS:
                 combo = QtWidgets.QComboBox()
                 combo.addItems(_BC_CHOICES)
-                combo.setCurrentText(str(getattr(obj, prop)))
+                if face in self._port_faces:
+                    combo.addItem(_PORT_BC_LABEL)
+                    combo.setCurrentText(_PORT_BC_LABEL)
+                    combo.setEnabled(False)
+                    combo.setToolTip(
+                        "A TEM port / Gaussian beam launches from this face, so "
+                        "it is always absorbing. Delete that source to set the "
+                        "boundary condition here."
+                    )
+                else:
+                    combo.setCurrentText(str(getattr(obj, prop)))
                 self._combos[prop] = combo
                 layout.addRow(_FACE_LABELS[face], combo)
 
@@ -1172,8 +1196,14 @@ if _GUI_AVAILABLE:
                 "The domain box auto-sizes to the assigned geometry plus the "
                 "per-face background spacing (filled with the background "
                 "material). PML faces absorb outgoing waves and enlarge the grid; "
-                "PEC faces are perfectly-conducting walls. The CFL time step is "
+                "PEC faces are perfectly-conducting walls. A face launching a TEM "
+                "port or Gaussian beam is locked to '{}': it absorbs whatever the "
+                "port itself does not (a bidirectional launch's backward lobe, "
+                "higher-order modes, radiation off an open cross-section). The "
+                "conductors are left to stop at the port plane so the port "
+                "terminates the line. The CFL time step is "
                 "computed by the solver and reported in the run summary."
+                .format(_PORT_BC_LABEL)
             )
             info.setWordWrap(True)
             layout.addRow(info)
@@ -1304,12 +1334,22 @@ if _GUI_AVAILABLE:
                 self._suspend = False
             self._live_apply()
 
+        def _is_port_combo(self, prop):
+            """True when *prop*'s face hosts a face-launching source (locked)."""
+            return self._combos[prop].currentText() == _PORT_BC_LABEL
+
         def _on_same_bc(self, checked):
-            """Grey out all but the first BC combo and drive them from it."""
+            """Grey out all but the first BC combo and drive them from it.
+
+            A port face stays locked either way -- "same on all faces" must not
+            re-enable it or overwrite its label.
+            """
             first = self._combos[self._bc_order[0]]
             self._suspend = True
             for prop in self._bc_order[1:]:
                 combo = self._combos[prop]
+                if self._is_port_combo(prop):
+                    continue
                 combo.setEnabled(not checked)
                 if checked:
                     combo.setCurrentText(first.currentText())
@@ -1321,7 +1361,8 @@ if _GUI_AVAILABLE:
             if self._same_bc.isChecked():
                 self._suspend = True
                 for prop in self._bc_order[1:]:
-                    self._combos[prop].setCurrentText(text)
+                    if not self._is_port_combo(prop):
+                        self._combos[prop].setCurrentText(text)
                 self._suspend = False
             self._live_apply()
 
@@ -1367,7 +1408,11 @@ if _GUI_AVAILABLE:
             obj.PMLThickness = int(self._dpml.value())
             obj.Background = self._selected_background()
             for prop, combo in self._combos.items():
-                setattr(obj, prop, combo.currentText())
+                # A locked port face shows a label that is not a valid BC value;
+                # leave the stored property alone (the job builder forces that
+                # face to PML anyway, via ``domain_grid_params(force_pml_faces=)``).
+                if combo.currentText() != _PORT_BC_LABEL:
+                    setattr(obj, prop, combo.currentText())
 
         def _selected_background(self):
             """The Material (or None = vacuum) chosen in the background combo."""

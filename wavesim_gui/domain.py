@@ -66,12 +66,23 @@ _FACE_PROPS = (
 
 _BC_CHOICES = ["PML", "PEC"]
 
-# Shown (read-only) in the Domain panel for a face that launches a TEM port or
-# Gaussian beam. Not a stored ``App::PropertyEnumeration`` value -- the job
-# builder forces such a face to PML through ``domain_grid_params
-# (force_pml_faces=)``, so the per-face property is simply not the user's to set
-# there, and an editable combo would only look like it applied.
-_PORT_BC_LABEL = "TEM port (absorbing)"
+# Shown (read-only) in the Domain panel for a face whose boundary is not the
+# user's to set. Neither is a stored ``App::PropertyEnumeration`` value -- the
+# job builder overrides such a face through ``domain_grid_params``, so an
+# editable combo would only look like it applied.
+#
+# ``_PML_PORT_BC_LABEL`` -- a Gaussian beam or a SPICE-TEM port launches from an
+# interior plane one PML-depth in, so its face must absorb: forced to PML.
+# ``_MODAL_BC_LABEL`` -- a Modal Port *is* the boundary. It sets the ghost
+# tangential H on the face itself, so the face carries no PML and no PEC (and no
+# background spacing, or the port plane would cut empty medium).
+_PML_PORT_BC_LABEL = "Port / beam (absorbing)"
+_MODAL_BC_LABEL = "Modal port"
+
+# Sentinel written into the per-face ``bc`` map by ``domain_grid_params`` for a
+# modal-port face: neither PML nor PEC, so it lands in neither face list and
+# contributes no absorber padding.
+_BC_MODAL = "MODAL"
 
 # Per-face background-spacing property names, in face order (mirrors _FACE_PROPS).
 _SPACING_PROPS = (
@@ -281,11 +292,15 @@ class DomainObject:
             obj.NodesX = obj.NodesY = obj.NodesZ = []
             return
 
-        # TEM-port launch faces are forced to PML here too (not just at run) so
-        # the drawn box and the node arrays include the absorber padding that the
-        # run's boundary assumes -- keeping the non-uniform grid consistent.
-        force_faces = tem_port_faces(sim)
-        params = domain_grid_params(obj, force_pml_faces=force_faces)
+        # Face-launching sources override the per-face setting here too (not just
+        # at run) so the drawn box and the node arrays carry the same padding and
+        # spacing the run's boundary assumes -- keeping the non-uniform grid
+        # consistent. Beams / SPICE-TEM ports force PML; modal ports remove the
+        # absorber and the background gap on their face entirely.
+        force_faces = pml_port_faces(sim)
+        modal_faces = modal_port_faces(sim)
+        params = domain_grid_params(
+            obj, force_pml_faces=force_faces, modal_faces=modal_faces)
         sp_lo = tuple(s * _MM_PER_M for s in params["spacing_lo"])
         sp_hi = tuple(s * _MM_PER_M for s in params["spacing_hi"])
         pad_lo, pad_hi = params["pad_lo"], params["pad_hi"]
@@ -317,7 +332,8 @@ class DomainObject:
             from wavesim_gui import gridbuild
             try:
                 nodes = gridbuild.build_domain_nodes(
-                    sim, obj, force_pml_faces=force_faces
+                    sim, obj, force_pml_faces=force_faces,
+                    modal_faces=modal_faces,
                 )
             except Exception as exc:  # never let meshing break the recompute
                 FreeCAD.Console.PrintWarning(
@@ -380,29 +396,57 @@ def background_material(domain):
     return getattr(domain, "Background", None)
 
 
-def tem_port_faces(sim):
-    """Domain faces (``'x0'``..``'z1'``) carrying a TEM/SPICE-TEM port or a plane
-    wave -- every source that launches from a face and must absorb its own launch.
+def modal_port_faces(sim):
+    """Domain faces (``'x0'``..``'z1'``) terminated by a **Modal Port**.
 
-    A waveguide port launches a guided mode and a Gaussian beam a directional sheet;
-    both must absorb the backward/reflected wave, so these faces are forced to PML
-    everywhere the grid is built (the drawn box, the node arrays, and the run)
-    regardless of the Domain's per-face setting -- otherwise a face left (or set)
-    to PEC would both trap the wave and, on a non-uniform grid, desync the node
-    arrays (no PML pad) from the forced boundary (crash). Lazy imports avoid a
-    circular import with the source modules; empty on failure.
+    A modal port is an impedance-sheet *boundary*: it writes the ghost tangential
+    H on the face each step, launching the mode inward and absorbing whatever
+    returns, with no reflection and -- unlike PML -- no DC error. So the face
+    needs **no PML pad and no PEC wall**; it also needs **no background spacing**,
+    because the port plane has to cut the real cross-section and a gap of
+    background medium would leave it nothing to solve. All three are applied by
+    :func:`domain_grid_params`, everywhere the grid is built (the drawn box, the
+    node arrays and the run), so the three stay in step.
+
+    Only *waveform*-driven ports qualify. A SPICE-driven one is still a lumped
+    ``SpicePort`` on an interior plane and belongs to :func:`pml_port_faces`.
+    Lazy imports avoid a circular import with the source modules; empty on failure.
+    """
+    if sim is None:
+        return []
+    try:
+        from wavesim_gui import modal_port as modal_mod
+        return [str(p.Face) for p in modal_mod.find_modal_ports(sim)
+                if modal_mod.excitation_mode(p) == modal_mod.MODE_WAVEFORM]
+    except Exception:
+        return []
+
+
+def pml_port_faces(sim):
+    """Domain faces launching a source that must absorb its own launch: forced PML.
+
+    A Gaussian beam and a SPICE-TEM port both drive an *interior* plane placed one
+    PML-depth inside the face, so that face has to be an absorber -- otherwise it
+    traps the backward/reflected wave and, on a non-uniform grid, desyncs the node
+    arrays (no PML pad) from the forced boundary (crash). Applied everywhere the
+    grid is built, regardless of the Domain's per-face setting.
+
+    A **modal port** face is *not* in this list: it terminates itself, see
+    :func:`modal_port_faces`. Lazy imports avoid a circular import; empty on
+    failure.
     """
     if sim is None:
         return []
     faces = []
     try:
-        from wavesim_gui import tem_source as tem_mod
-        faces += [str(t.Face) for t in tem_mod.find_tem_sources(sim)]
+        from wavesim_gui import spice_port as spice_mod
+        faces += [str(p.Face) for p in spice_mod.find_spice_tem_ports(sim)]
     except Exception:
         pass
     try:
-        from wavesim_gui import spice_port as spice_mod
-        faces += [str(p.Face) for p in spice_mod.find_spice_tem_ports(sim)]
+        from wavesim_gui import modal_port as modal_mod
+        faces += [str(p.Face) for p in modal_mod.find_modal_ports(sim)
+                  if modal_mod.excitation_mode(p) == modal_mod.MODE_SPICE]
     except Exception:
         pass
     try:
@@ -631,28 +675,41 @@ def spacings_m(domain):
     return out
 
 
-def domain_grid_params(domain, force_pml_faces=()):
+def domain_grid_params(domain, force_pml_faces=(), modal_faces=()):
     """Map a domain's per-face boundary settings to grid/solver parameters.
 
     Returns a dict with ``spacing_lo``/``spacing_hi`` (per-axis background gaps in
     metres, low/high side), ``pad_lo``/``pad_hi`` (per-axis PML cells),
-    ``pml_faces``, ``pec_faces`` and ``d_pml``. This is the one place the per-face
-    properties are interpreted, so the drawn boxes, the voxelised grid and the
-    runner all agree.
+    ``pml_faces``, ``pec_faces``, ``modal_faces`` and ``d_pml``. This is the one
+    place the per-face properties are interpreted, so the drawn boxes, the
+    voxelised grid and the runner all agree.
 
     *force_pml_faces* names faces (``'x0'``..``'z1'``) that must be PML no matter
-    what the per-face property says -- TEM waveguide ports pass their launch faces
-    so a face left (or set) to PEC still absorbs the launched mode, with its PML
-    padding and boundary condition kept consistent (both derived from ``bc`` here).
+    what the per-face property says -- Gaussian beams and SPICE-TEM ports pass
+    their launch faces (:func:`pml_port_faces`) so a face left (or set) to PEC
+    still absorbs the launched wave, with its PML padding and boundary condition
+    kept consistent (both derived from ``bc`` here).
+
+    *modal_faces* names faces terminated by a **Modal Port**
+    (:func:`modal_port_faces`). The port *is* the boundary, so such a face gets
+    **no PML padding, no PEC wall and no background spacing**: it appears in
+    neither ``pml_faces`` nor ``pec_faces``, contributes zero to ``pad_*``, and
+    its gap is zeroed so the domain face lands exactly on the geometry the port
+    plane must cut. *modal_faces* wins over *force_pml_faces* for a face named by
+    both (a port cannot both terminate a face and hide behind an absorber).
     """
     d_pml = int(getattr(domain, "PMLThickness", 8))
     bc = {face: getattr(domain, prop) for face, prop, _doc in _FACE_PROPS}
     for face in force_pml_faces or ():
         if face in bc:
             bc[face] = "PML"
+    for face in modal_faces or ():
+        if face in bc:
+            bc[face] = _BC_MODAL
 
     pml_faces = [f for f in _FACES if bc.get(f) == "PML"]
     pec_faces = [f for f in _FACES if bc.get(f) == "PEC"]
+    modal = [f for f in _FACES if bc.get(f) == _BC_MODAL]
 
     pad_lo = (
         d_pml if bc["x0"] == "PML" else 0,
@@ -664,7 +721,12 @@ def domain_grid_params(domain, force_pml_faces=()):
         d_pml if bc["y1"] == "PML" else 0,
         d_pml if bc["z1"] == "PML" else 0,
     )
+    # A modal-port face gets no background gap: the port plane sits on the domain
+    # face and must cut the real cross-section, so any spacing there would hand
+    # the mode solver a plane of empty background medium and no conductors.
     spacing = spacings_m(domain)
+    for face in modal:
+        spacing[face] = 0.0
     return {
         "spacing_lo": (spacing["x0"], spacing["y0"], spacing["z0"]),
         "spacing_hi": (spacing["x1"], spacing["y1"], spacing["z1"]),
@@ -672,6 +734,7 @@ def domain_grid_params(domain, force_pml_faces=()):
         "pad_hi": pad_hi,
         "pml_faces": pml_faces,
         "pec_faces": pec_faces,
+        "modal_faces": modal,
         "d_pml": d_pml,
     }
 
@@ -693,8 +756,11 @@ def face_is_high(face):
 def face_world_coord_mm(domain, face):
     """World-mm coordinate of the *face* plane along its normal axis.
 
-    Uses the inner domain box corners (``DomainMin``/``DomainMax``), so a TEM
-    port placed on a PML face sits at the absorbing region's inner edge.
+    Uses the inner domain box corners (``DomainMin``/``DomainMax``), which exclude
+    the PML padding: a beam / SPICE-TEM port on a forced-PML face therefore sits at
+    the absorbing region's inner edge, and a modal port -- whose face carries no
+    padding and no background gap (:func:`domain_grid_params`) -- sits exactly on
+    the grid boundary, where the geometry it must cut ends.
     """
     v = domain.DomainMax if face_is_high(face) else domain.DomainMin
     return {"x": v.x, "y": v.y, "z": v.z}[face_axis(face)]
@@ -1168,24 +1234,37 @@ if _GUI_AVAILABLE:
             layout.addRow(self._same_bc)
 
             # Faces hosting a face-launching source are not the user's to set:
-            # the job builder forces them to PML regardless (see
-            # ``tem_port_faces`` / ``domain_grid_params(force_pml_faces=)``), so
-            # show that state as its own locked entry rather than an editable
-            # combo that silently does not apply.
+            # the job builder overrides them regardless (see ``pml_port_faces`` /
+            # ``modal_port_faces`` and ``domain_grid_params``), so show that state
+            # as its own locked entry rather than an editable combo that silently
+            # does not apply.
             from wavesim_gui.commands import active_simulation
-            self._port_faces = set(tem_port_faces(active_simulation(obj.Document)))
+            _sim = active_simulation(obj.Document)
+            self._modal_faces = set(modal_port_faces(_sim))
+            self._port_faces = set(pml_port_faces(_sim)) - self._modal_faces
             self._combos = {}
             for face, prop, _doc in _FACE_PROPS:
                 combo = QtWidgets.QComboBox()
                 combo.addItems(_BC_CHOICES)
-                if face in self._port_faces:
-                    combo.addItem(_PORT_BC_LABEL)
-                    combo.setCurrentText(_PORT_BC_LABEL)
+                if face in self._modal_faces:
+                    combo.addItem(_MODAL_BC_LABEL)
+                    combo.setCurrentText(_MODAL_BC_LABEL)
                     combo.setEnabled(False)
                     combo.setToolTip(
-                        "A TEM port / Gaussian beam launches from this face, so "
-                        "it is always absorbing. Delete that source to set the "
-                        "boundary condition here."
+                        "A Modal Port terminates this face itself: it launches "
+                        "the mode inward and absorbs what returns, so the face "
+                        "carries no PML, no PEC wall and no background spacing. "
+                        "Delete that port to set the boundary condition here."
+                    )
+                elif face in self._port_faces:
+                    combo.addItem(_PML_PORT_BC_LABEL)
+                    combo.setCurrentText(_PML_PORT_BC_LABEL)
+                    combo.setEnabled(False)
+                    combo.setToolTip(
+                        "A Gaussian beam / SPICE-TEM port launches from an "
+                        "interior plane behind this face, so it is always "
+                        "absorbing. Delete that source to set the boundary "
+                        "condition here."
                     )
                 else:
                     combo.setCurrentText(str(getattr(obj, prop)))
@@ -1196,14 +1275,16 @@ if _GUI_AVAILABLE:
                 "The domain box auto-sizes to the assigned geometry plus the "
                 "per-face background spacing (filled with the background "
                 "material). PML faces absorb outgoing waves and enlarge the grid; "
-                "PEC faces are perfectly-conducting walls. A face launching a TEM "
-                "port or Gaussian beam is locked to '{}': it absorbs whatever the "
-                "port itself does not (a bidirectional launch's backward lobe, "
-                "higher-order modes, radiation off an open cross-section). The "
-                "conductors are left to stop at the port plane so the port "
-                "terminates the line. The CFL time step is "
-                "computed by the solver and reported in the run summary."
-                .format(_PORT_BC_LABEL)
+                "PEC faces are perfectly-conducting walls. A face carrying a "
+                "Modal Port reads '{}': the port is the boundary — it launches "
+                "the mode and absorbs what comes back, exactly and at DC too, so "
+                "that face gets no absorber, no wall and no background gap (the "
+                "port plane has to cut the real cross-section). A face launching "
+                "a Gaussian beam or a SPICE-TEM port reads '{}' instead, since "
+                "those drive an interior plane and need the absorber behind it. "
+                "The CFL time step is computed by the solver and reported in the "
+                "run summary."
+                .format(_MODAL_BC_LABEL, _PML_PORT_BC_LABEL)
             )
             info.setWordWrap(True)
             layout.addRow(info)
@@ -1336,7 +1417,8 @@ if _GUI_AVAILABLE:
 
         def _is_port_combo(self, prop):
             """True when *prop*'s face hosts a face-launching source (locked)."""
-            return self._combos[prop].currentText() == _PORT_BC_LABEL
+            return self._combos[prop].currentText() in (
+                _PML_PORT_BC_LABEL, _MODAL_BC_LABEL)
 
         def _on_same_bc(self, checked):
             """Grey out all but the first BC combo and drive them from it.
@@ -1409,9 +1491,9 @@ if _GUI_AVAILABLE:
             obj.Background = self._selected_background()
             for prop, combo in self._combos.items():
                 # A locked port face shows a label that is not a valid BC value;
-                # leave the stored property alone (the job builder forces that
-                # face to PML anyway, via ``domain_grid_params(force_pml_faces=)``).
-                if combo.currentText() != _PORT_BC_LABEL:
+                # leave the stored property alone (the job builder overrides that
+                # face anyway, via ``domain_grid_params``).
+                if not self._is_port_combo(prop):
                     setattr(obj, prop, combo.currentText())
 
         def _selected_background(self):

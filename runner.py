@@ -49,28 +49,21 @@ job.json schema (Session 2)
                  # (a Gaussian pulse); see _build_waveform for the param set.
                  # "sinusoid" is the ramped CW drive (raised-cosine turn-on over
                  # "ramp_cycles" periods), built from the solver's Sinusoid.
-      "tem_sources": [{"name":.., "normal":"z", "position":..,
-                       "direction": 1.0|-1.0,   # +/-normal launch (into domain)
+      "modal_ports": [{"name":.., "normal":"z", "position":..,
+                       "face": "z0".."z1",      # the domain face this port
+                                                # terminates; ModalPort derives its
+                                                # ghost-H plane and sign from it
                        "conductor_id": 0,       # which solved mode to launch:
                                                 # a conductor label (see summary
                                                 # "modes"), 0/absent = dominant
                        "bounds": [a0,a1,b0,b1], # optional in-plane subset (solver
                                                 # metres, transverse slice order);
                                                 # absent = the whole face
-                       "mode_mesh": {           # optional connectivity-preserving
-                         "key":"modemesh_0",    # fine transverse re-voxelisation
-                         "normal":"z","position":.., # of this plane; arrays live in
-                         "a_nodes":[..],"b_nodes":[..]}, # materials.npz (see below).
-                                                # Absent = solve on the coarse slice.
-                                                # A *convergence* mode mesh instead
-                                                # carries "levels":[{"a_nodes","b_nodes"},
-                                                # ...] (finest last) + "convergence":
-                                                # {"max_iter","rel_tol"}: the runner
-                                                # walks the ladder, re-solving Z0 until
-                                                # it settles (arrays <key>_lvl<j>_*)
-                       "excitation": {"type":.., ...}, "fields":"EH"|"E"}, ...],
-                       # legacy entries may carry flat "fmax"/"amplitude" keys
-                       # and omit "direction" (defaults to +normal / low face)
+                       "excitation": {"type":.., ...}}, ...],
+                       # A modal port face carries NO PML and NO PEC: the port is
+                       # the boundary (see "Modal ports" below). Legacy jobs name
+                       # this list "tem_sources" and may carry "direction"/"fields"
+                       # and a "mode_mesh" block; all three are ignored now.
       "gaussian_beams": [{"face":"x0".."z1", "angle_deg":.., "waist":<metres>,
                        "directional":true,
                        "excitation": {"type":.., ...}}, ...],
@@ -92,8 +85,10 @@ job.json schema (Session 2)
          "p0":[x,y,z], "p1":[x,y,z], "sign":1.0, "uic":false},
         {"kind":"tem",  "name":.., "netlist":"<path>", "nodes":["port1p","0"],
          "normal":"z", "position":.., "direction":1.0|-1.0, "conductor_id":0,
-         "bounds":[a0,a1,b0,b1],  # optional; as in tem_sources (whole face if absent)
+         "bounds":[a0,a1,b0,b1],  # optional; as in modal_ports (whole face if absent)
          "directional":true, "sign":1.0, "uic":false}, ...],
+                      # A SPICE TEM port is still a *lumped* launch on an interior
+                      # plane, so unlike a modal port its face IS forced to PML.
       "mode_only": false,                     # solve TEM modes only; no FDTD run
       "monitors": {
         "energy": {"full": false, "interior": true},
@@ -137,38 +132,48 @@ coordinate arrays (``mode_<si>_<mi>_ca`` / ``_cb``), so the workbench draws them
 on the real grid (uniform or non-uniform) instead of assuming a constant cell
 size.
 
-TEM ports (Session 9)
----------------------
-Each ``tem_sources`` entry names a grid plane (the ``normal`` axis and the
-``position`` of the plane along it, in the solver frame). The runner calls
-:func:`wavesim.mode_solver.solve_tem_modes` on that plane to find the TEM mode of
-the PEC cross-section, drives it during the FDTD run from a **matched Thévenin
-port** (:class:`wavesim.sources.TEMPort` behind the mode's own Z₀, built by
-:func:`_matched_tem_port`) whose drive is scaled so the launched forward wave is
-the requested voltage on any grid or fill, and saves each solved mode's 2D
-field profiles into ``results.npz`` (keys ``mode_<si>_<mi>_phi`` / ``_pec`` /
-``_E_<comp>``) with its per-unit-length parameters under ``summary["modes"]``.
-A port sits on a domain face, which abuts the PML, so the runner clamps the
-plane onto the **first interior cell** (:func:`_interior_position`,
-mirroring :class:`wavesim.sources.GaussianBeam`'s ``d_pml`` / ``N-1-d_pml``): the
-plane's boundary node is shared by the last interior cell and the first PML cell,
-and the nearest-node snap rounds a high-face plane into the
-absorber otherwise — firing the forward wave into the PML, and (since the pad
-holds no geometry) solving the mode on an empty cross-section.
-Because the port carries a real resistance rather than an ideal impressed
-current, it also **terminates** its own plane: whatever returns there is
-absorbed, and a DC-containing drive (a Gaussian pulse) drains back out through
-it instead of stranding static charge the propagating-only CPML cannot absorb.
-That drain is local to each port — no far-end termination is assumed.
-**The conductors stop at the port plane.** The voxeliser deliberately does not
-carry them through the PML pad: the port is the line's load, and a line that
-continued past it into the absorber would put a second Z₀ in parallel with the
-port (Z₀‖Z₀, a measured Γ ≈ -1/3, ringing for many round trips). Ending the line
-at the port leaves the port terminating an open circuit — Z₀‖open = Z₀ — which
-is the match. The PML pad behind stays, absorbing what the modal port cannot:
-the backward lobe of a bidirectional (``'E'``-only) launch, a directional
-launch's residual lobe, higher-order modes and radiation off an open
-cross-section such as microstrip.
+Modal ports
+-----------
+Each ``modal_ports`` entry names a grid plane (the ``normal`` axis and the
+``position`` of the plane along it, in the solver frame) plus the ``face`` it
+terminates. The runner calls :func:`wavesim.mode_solver.solve_tem_modes` on that
+plane to find the TEM mode of the PEC cross-section, hands it to a
+:class:`wavesim.sources.ModalPort` registered with
+``Simulation.add_boundary`` (:func:`_build_modal_port`), and saves each solved
+mode's 2D field profiles into ``results.npz`` (keys ``mode_<si>_<mi>_phi`` /
+``_pec`` / ``_E_<comp>``) with its per-unit-length parameters under
+``summary["modes"]``.
+
+A ``ModalPort`` is an **impedance sheet on the face**, not a source on an
+interior plane: each step it writes the ghost tangential H just outside the face
+to ``±s·(V̄ − 2a)·(n̂ × ê)``, which in one expression radiates a forward wave of
+``a`` volts inward *and* absorbs whatever returns. Three consequences here:
+
+* **The face carries no PML and no PEC.** The sheet terminates the mode with no
+  reflection and — unlike the propagating-only CPML — no DC error, so a
+  DC-containing drive (a Gaussian pulse) drains straight back out through it
+  instead of stranding static charge. The workbench strips both the absorber pad
+  and the PEC wall from a modal-port face (``domain.modal_port_faces``); the
+  termination is local to each port, no far-end load is assumed. The one thing
+  the sheet does *not* absorb is field its modal pattern does not describe —
+  higher-order modes, or radiation off an open cross-section such as microstrip —
+  which now reflects instead of being eaten by a pad. Closed cross-sections
+  (coax, stripline) are what this is validated on.
+* **The conductors must reach the face.** With no pad and no background gap the
+  domain face lands on the geometry's own end, which is exactly what the mode
+  solve needs. The runner still nudges the plane one cell inside
+  (:func:`_interior_position`): ``grid.axis_index`` returns node ``N`` for a
+  top-face plane (out of range for an ``N``-cell axis), and a low-face
+  ``ModalPort`` writes its ghost H at ``k-1``, so it needs ``k >= 1``.
+* **The mode is solved on the run's own grid.** No mode-mesh refinement, by
+  design. The sheet's ``ê`` is a forward difference of φ landed on the Yee edges,
+  which is an exact null vector of *this* grid's transverse divergence (the
+  property that keeps the launch from depositing charge), and its admittance
+  scale ``s = 1/(Z₀·G)`` relies on Z₀ and the discrete modal conductance G
+  sharing that same discretisation. Solving on a finer mesh and interpolating
+  back destroys both — and the Z₀ so found is not the Z₀ the FDTD grid presents,
+  which showed up as artefacts. Refine the simulation grid instead.
+
 With ``mode_only`` true the runner solves and saves the modes and skips the FDTD
 time-stepping entirely. The workbench's "Compute Mode" button uses this, sending a
 job that carries **only the one port** it wants previewed (it plots the modes and
@@ -178,44 +183,21 @@ optional ``bounds`` ``[a0,a1,b0,b1]`` (solver metres, transverse slice order)
 confines the mode solve to a sub-rectangle of the face — e.g. one connector's
 cross-section on a plane that cuts several — and is forwarded straight to
 ``solve_tem_modes(bounds=...)``; absent it solves on the whole face. The solver
-embeds a bounded mode back into the full transverse plane (the modal launch needs
-that shape), so the runner crops the *saved* ``mode_*`` profiles and
+embeds a bounded mode back into the full transverse plane (the port needs that
+shape), so the runner crops the *saved* ``mode_*`` profiles and
 their ``_ca``/``_cb`` coords back to the solved sub-rect (:func:`_bounds_window`)
 — the results plot then shows the bounded region, not a face of zeros around it.
-The launched mode itself keeps its full shape.
-
-At the FDTD cell size the voxeliser can shred a continuous PEC on the plane into
-disconnected cells, so ``ndimage.label`` miscounts conductors. When that happens
-the FreeCAD side ships a ``mode_mesh`` block: a finer transverse re-voxelisation
-of *that plane only*, auto-refined until the PEC component count stabilises. Its
-2D arrays travel in ``materials.npz`` as ``<key>_pec`` (uint8), ``<key>_eps`` and
-``<key>_mu`` (float64), shape ``(Na, Nb)`` in ``(a, b)`` transverse slice order.
-The runner (:func:`_mode_mesh_grid`) rebuilds them as a single-cell-thick fine
-grid, solves the mode there (conductor count now correct), and — for a launch —
-interpolates the mode back onto the coarse grid as a rebuilt coarse ``TEMMode``
-(:func:`_coarse_mode_from_fine`) that the matched port (or a SPICE port)
-then drives. The FDTD grid is untouched. Absent ⇒ the coarse
-slice is solved as before. ``mode_mesh`` and ``bounds`` are mutually exclusive
-per port: the fine grid already spans exactly the (bounded) box.
-
-When the workbench's **characteristic-impedance convergence study** is on, the
-``mode_mesh`` carries a ``levels`` ladder (progressively finer transverse
-re-voxelisations of the plane, finest last; each level's 2D arrays in
-``materials.npz`` as ``<key>_lvl<j>_{pec,eps,mu}``) plus a ``convergence``
-``{max_iter, rel_tol}`` criterion. :func:`_solve_mode_convergence` solves the mode
-on each level in turn and stops once the chosen conductor's impedance changes by
-less than ``rel_tol`` between levels (or ``max_iter`` levels are used). The finest
-solved level is then used exactly like a single mode mesh (saved, launched,
-interpolated back onto the coarse grid). The per-iteration Z0 history rides along
-in ``summary["modes"][*]["convergence"]`` for the results plot.
+The port's own mode keeps its full shape.
 
 SPICE co-simulation ports
 -------------------------
 Each ``spice_ports`` entry couples one FDTD lumped port to a user ngspice netlist
 in lockstep (:class:`wavesim.sources.SpicePort`). A ``kind:"line"`` port is a
 straight ``p0 -> p1`` line; a ``kind:"tem"`` port drives a solved TEM mode of the
-named plane (solved alongside the ``tem_sources`` modes, so it is saved/plotted
-like one and honours ``mode_only``). The ngspice shared library is taken from
+named plane (solved alongside the ``modal_ports`` modes, so it is saved/plotted
+like one and honours ``mode_only``). It is a *lumped* drive on an interior plane,
+so — unlike a modal port — its face is forced to PML and the plane is clamped one
+PML depth in. The ngspice shared library is taken from
 ``ngspice_dll`` (falling back to a per-port ``library_path`` / PySpice's own
 search). Each port records its port V(t)/I(t) into ``results.npz`` (keys
 ``spice_<idx>_times`` / ``_voltages`` / ``_currents``) with names under
@@ -531,337 +513,84 @@ def _choose_mode(modes, wanted, name):
     return chosen
 
 
-# In-array slice-to-3D reshaping for a mode mesh: a 2D ``(Na, Nb)`` transverse
-# plane becomes a singleton-thick 3D block along the normal axis, matching how
-# ``mode_solver._slice`` extracts the plane (z→[:,:,k], y→[:,k,:], x→[k,:,:]).
-_MODEMESH_SHAPE = {"z": lambda Na, Nb: (Na, Nb, 1),
-                   "y": lambda Na, Nb: (Na, 1, Nb),
-                   "x": lambda Na, Nb: (1, Na, Nb)}
+def _build_modal_port(ws, mode, waveform, grid, face, name):
+    """Build the :class:`wavesim.sources.ModalPort` boundary for *mode*.
 
+    A modal port is an **impedance sheet on the domain face**, registered with
+    ``Simulation.add_boundary`` so it runs between the H and E updates (it writes
+    the ghost tangential H the very next E update consumes; a source hook, which
+    runs after the E update, would be clobbered by the following H update). The
+    same sheet launches the mode inward and terminates the plane -- with no
+    reflection and no DC error, which is why the face needs no PML behind it.
 
-def _thin_mode_grid(ws, np, normal, position, a_nodes, b_nodes,
-                    pec2d, eps2d, mu2d):
-    """Build a single-cell-thick fine grid from one plane's 2D material arrays.
+    *face* (``'x0'``..``'z1'``) is passed straight through: ``ModalPort`` derives
+    the ghost-H plane index and its sign from it, so nothing here has to encode a
+    propagation direction (the old TEM port needed H-sheet surgery for a high
+    face; this does not).
 
-    Turns the ``(Na, Nb)`` transverse ``pec``/``eps``/``mu`` arrays (``(a, b)``
-    slice order) into a grid one cell thick along *normal*, centred on *position*,
-    so :func:`wavesim.solve_tem_modes` runs on that fine cross-section. Shared by
-    the single mode mesh and each level of a convergence ladder.
+    **No amplitude correction.** ``_build_waveform`` already folds the
+    excitation's amplitude into ``f(t)``, and ``ModalPort``'s ``amplitude`` is the
+    launched *forward-wave* voltage, calibrated by the solver to land one forward
+    volt per unit on any grid or fill. So ``amplitude=1.0`` with the amplitude-
+    carrying waveform is exactly the contract the workbench documents; scaling
+    here would double-count.
+
+    The port is compiled eagerly rather than on the first step, so a plane it
+    cannot be built on -- no transverse E energy, a mode solved without ``Z₀``
+    (its admittance scale is derived from Z₀ and has no fallback), or a low-face
+    port whose ghost-H plane would fall off the grid -- is reported against the
+    port's name before time-stepping starts.
     """
-    a_nodes = np.asarray(a_nodes, dtype=np.float64)
-    b_nodes = np.asarray(b_nodes, dtype=np.float64)
-    pec2d = np.ascontiguousarray(pec2d).astype(bool)
-    eps2d = np.ascontiguousarray(eps2d, dtype=np.float64)
-    mu2d = np.ascontiguousarray(mu2d, dtype=np.float64)
-    Na, Nb = pec2d.shape
-
-    # One thin cell along the normal, centred on the plane; its thickness is
-    # immaterial to the purely transverse (2D) mode solve, so use a representative
-    # transverse spacing.
-    h = float(min(np.diff(a_nodes).min(), np.diff(b_nodes).min()))
-    norm_nodes = np.array([position - 0.5 * h, position + 0.5 * h], dtype=np.float64)
-    axes = {"z": (a_nodes, b_nodes, norm_nodes),
-            "y": (a_nodes, norm_nodes, b_nodes),
-            "x": (norm_nodes, a_nodes, b_nodes)}[normal]
-    grid_f = ws.set_vacuum(ws.create_grid_rectilinear(*axes))
-
-    shape3 = _MODEMESH_SHAPE[normal](Na, Nb)
-    eps3, mu3, pec3 = eps2d.reshape(shape3), mu2d.reshape(shape3), pec2d.reshape(shape3)
-    grid_f = ws.set_material_arrays(grid_f, eps3, eps3, eps3, mu3, mu3, mu3,
-                                    pec_mask=pec3)
-    return grid_f
-
-
-def _mode_mesh_grid(ws, np, mm, material_data):
-    """Build a thin fine rectilinear grid carrying a mode mesh's cross-section.
-
-    A single-level ``mode_mesh`` block (see the job schema) re-voxelises one port
-    plane on a connectivity-preserving fine transverse grid. This turns its 2D
-    ``(Na, Nb)`` ``pec``/``eps``/``mu`` arrays (shipped in ``materials.npz`` under
-    ``<key>_pec``/``_eps``/``_mu``) into a single-cell-thick 3D grid normal to the
-    port, so :func:`wavesim.solve_tem_modes` runs on the fine cross-section where
-    the conductor count is correct. Returns the ``FDTDGrid``.
-    """
-    key = mm["key"]
-    return _thin_mode_grid(
-        ws, np, mm["normal"], float(mm["position"]),
-        mm["a_nodes"], mm["b_nodes"],
-        material_data[key + "_pec"], material_data[key + "_eps"],
-        material_data[key + "_mu"],
-    )
-
-
-def _solve_mode_convergence(ws, np, mm, material_data, wanted_conductor,
-                            name, prefix):
-    """Walk a mode-mesh refinement ladder until the characteristic impedance settles.
-
-    A convergence ``mode_mesh`` block carries ``levels`` (a list of
-    ``{a_nodes, b_nodes}``, finest last) whose per-level 2D arrays live in
-    ``materials.npz`` as ``<key>_lvl<j>_{pec,eps,mu}``, plus a ``convergence``
-    ``{max_iter, rel_tol}`` criterion. Each level is solved on its own thin fine
-    grid (:func:`_thin_mode_grid`); after each, the chosen conductor's impedance is
-    compared with the previous level's and the walk stops once the relative change
-    is within ``rel_tol`` (or ``max_iter`` levels are used). Coarse levels that
-    fail to resolve the wanted conductor are skipped for the comparison but still
-    advance the mesh.
-
-    Returns ``(modes, solve_grid, history)`` for the finest level actually solved:
-    *modes* are handed on exactly like a single mode mesh's (saved, launched,
-    interpolated back onto the coarse grid), and *history* is a per-iteration list
-    ``[{iteration, Na, Nb, impedance, delta_rel, converged}, ...]`` for the
-    summary / results plot.
-    """
-    key = mm["key"]
-    normal = mm["normal"]
-    position = float(mm["position"])
-    levels = mm.get("levels") or []
-    conv = mm.get("convergence") or {}
-    rel_tol = float(conv.get("rel_tol", 0.01))
-    max_iter = int(conv.get("max_iter", len(levels)))
-
-    modes = []
-    solve_grid = None
-    history = []
-    prev_z = None
-    for li, lvl in enumerate(levels[:max_iter]):
-        lkey = "{}_lvl{}".format(key, li)
-        pec2d = material_data[lkey + "_pec"]
-        solve_grid = _thin_mode_grid(
-            ws, np, normal, position, lvl["a_nodes"], lvl["b_nodes"],
-            pec2d, material_data[lkey + "_eps"], material_data[lkey + "_mu"],
-        )
-        modes = ws.solve_tem_modes(
-            solve_grid, normal=normal, position=position, compute_params=True,
-        )
-        Na, Nb = int(pec2d.shape[0]), int(pec2d.shape[1])
-        chosen = _choose_mode(modes, wanted_conductor, name) if modes else None
-        z = float(chosen.impedance) if (
-            chosen is not None and chosen.impedance is not None) else None
-        delta = None
-        converged = False
-        if z is not None and prev_z is not None and abs(prev_z) > 0.0:
-            delta = abs(z - prev_z) / abs(prev_z)
-            converged = delta <= rel_tol
-        history.append({
-            "iteration": li + 1, "Na": Na, "Nb": Nb,
-            "impedance": _f(z), "delta_rel": _f(delta), "converged": converged,
-        })
-        _emit_status(
-            "{}mode convergence iteration {}/{} on a {}x{} mesh: Z0 = {}{}".format(
-                prefix, li + 1, min(len(levels), max_iter), Na, Nb,
-                "{:.4g} ohm".format(z) if z is not None else "n/a",
-                "" if delta is None else " (change {:.3g}%)".format(100.0 * delta),
-            )
-        )
-        if z is not None:
-            if converged:
-                break
-            prev_z = z
-    return modes, solve_grid, history
-
-
-def _interp_coarse_profiles(np, mode, grid, fields):
-    """Resample a fine-grid mode's E/H profiles onto the coarse grid's plane.
-
-    A mode solved on the fine mode mesh must be launched on the coarse FDTD grid.
-    Each requested transverse field component is interpolated from the fine cell
-    centres onto the coarse grid's plane cell centres with a
-    :class:`RegularGridInterpolator` (zero outside the fine span), yielding a
-    ``{component: 2D-array}`` shaped like the coarse ``mode.normal``-slice — the
-    form a rebuilt coarse :class:`~wavesim.mode_solver.TEMMode`
-    (:func:`_coarse_mode_from_fine`) expects.
-    """
-    from scipy.interpolate import RegularGridInterpolator
-
-    ta = mode.transverse_axes
-    a_nodes = np.asarray(mode.a_nodes, dtype=np.float64)
-    b_nodes = np.asarray(mode.b_nodes, dtype=np.float64)
-    a_c = 0.5 * (a_nodes[:-1] + a_nodes[1:])
-    b_c = 0.5 * (b_nodes[:-1] + b_nodes[1:])
-    a_coarse = _axis_centers(grid, ta[0])
-    b_coarse = _axis_centers(grid, ta[1])
-    CA, CB = np.meshgrid(a_coarse, b_coarse, indexing="ij")
-    query = np.stack([CA.ravel(), CB.ravel()], axis=-1)
-    out_shape = (a_coarse.size, b_coarse.size)
-
-    def _one(arr2d):
-        f = RegularGridInterpolator(
-            (a_c, b_c), np.asarray(arr2d, dtype=np.float64),
-            bounds_error=False, fill_value=0.0,
-        )
-        return f(query).reshape(out_shape)
-
-    profiles = {}
-    if "E" in fields:
-        for comp, arr in mode.E.items():
-            profiles[comp] = _one(arr)
-    if "H" in fields:
-        for comp, arr in mode.H.items():
-            profiles[comp] = _one(arr)
-    return profiles
-
-
-def _coarse_mode_from_fine(ws, np, mode, grid):
-    """Rebuild a fine mode mesh's mode as a coarse-grid :class:`TEMMode`.
-
-    A :class:`SpicePort` compiles its mode into a lumped-port kernel against the
-    *coarse* FDTD grid (:meth:`TEMMode.build_port_kernel`), so a fine-grid mode
-    cannot be handed to it directly — its cell indices reference the fine grid.
-    This produces an equivalent coarse-grid mode: the transverse E/H profiles are
-    resampled onto the coarse plane and the per-unit-length parameters carried
-    over unchanged (``phi``/``pec`` are unused by the port kernel, so left zero).
-    """
-    profs = _interp_coarse_profiles(np, mode, grid, "EH")
-    E = {c: a for c, a in profs.items() if c.startswith("E")}
-    H = {c: a for c, a in profs.items() if c.startswith("H")}
-    ta = mode.transverse_axes
-    slice_shape = (_axis_centers(grid, ta[0]).size, _axis_centers(grid, ta[1]).size)
-    return ws.TEMMode(
-        normal=mode.normal, position=mode.position,
-        slice_index=grid.axis_index(mode.normal, mode.position),
-        transverse_axes=ta, da=mode.da, db=mode.db,
-        phi=np.zeros(slice_shape, dtype=np.float64), E=E, H=H,
-        pec=np.zeros(slice_shape, dtype=bool), conductor_id=mode.conductor_id,
-        a_nodes=np.asarray(_axis_nodes(grid, ta[0]), dtype=np.float64),
-        b_nodes=np.asarray(_axis_nodes(grid, ta[1]), dtype=np.float64),
-        capacitance=mode.capacitance, inductance=mode.inductance,
-        impedance=mode.impedance, v_phase=mode.v_phase, eps_eff=mode.eps_eff,
-    )
-
-
-def _mirror_port_h_sheet(np, port, grid):
-    """Re-aim a directional port's H sheet from +normal to -normal.
-
-    :meth:`TEMMode.build_port_kernel` hard-codes a **+normal** launch: the E
-    sheet sits on the mode plane ``k`` and the paired H sheet one cell *behind*
-    it at ``k-1``, and the pair adds on the +normal side while cancelling on the
-    -normal side. A port on a high face has to fire the other way.
-
-    The obvious trick — negating the mode's H profiles, which is what the old
-    soft launch did — swaps which side is live but leaves the sheets one cell
-    apart *the same way*, so the E plane at ``k`` ends up on the now-dead side.
-    A soft launch does not care: it is an ideal current source
-    and its amplitude does not depend on the plane's field. A port very much
-    does — its whole circuit law reads the plane voltage back — and measurement
-    on a driven coax shows that read-back collapsing from ≈ Z₀ to ≈ 1.4 Ω,
-    which both breaks the drive calibration (1.88× too much launched) and
-    leaves the port unable to absorb anything returning to it, losing exactly
-    the termination this port exists to provide.
-
-    The correct construction is the **mirror image about the mode plane**: keep
-    E at ``k``, put H at ``k+1``, and flip its sign (transverse H is a
-    pseudovector, so a mirrored wave with the same E carries the opposite H).
-    The launch then runs toward -normal with the E plane still on the live side.
-    Measured against the same port on a low face: read-back 61.3 Ω vs 64.1,
-    launched amplitude within 2%, backward rejection ≈ -62 dB.
-
-    This edits the compiled kernel in place because the solver exposes no
-    propagation direction — ``build_port_kernel`` should really take a
-    ``direction=±1`` and do this itself; until it does, the surgery lives here,
-    in one place, rather than being spread through the launch path.
-    """
-    kernel = port._port
-    hedges = (kernel or {}).get('hedges')
-    if not hedges:
-        return port                     # bidirectional port: no sheet to re-aim
-    axis = {"x": 0, "y": 1, "z": 2}[port.mode.normal]
-    n_axis = (grid.Nx, grid.Ny, grid.Nz)[axis]
-    mirrored = {}
-    for comp, (ii, jj, kk, coef_h) in hedges.items():
-        idx = [ii, jj, kk]
-        moved = idx[axis] + 2           # k-1 -> k+1
-        if int(np.max(moved)) >= n_axis:
-            raise RuntimeError(
-                "A high-face TEM port needs one cell on the far side of its "
-                "plane for the mirrored H sheet, but the plane sits at the very "
-                "edge of the grid. Move the port at least one cell into the "
-                "domain.")
-        idx[axis] = moved
-        mirrored[comp] = (idx[0], idx[1], idx[2], -coef_h)
-    kernel['hedges'] = mirrored
-    return port
-
-
-def _matched_tem_port(ws, np, mode, waveform, grid, directional, direction,
-                      name):
-    """Build the matched Thévenin :class:`wavesim.sources.TEMPort` for *mode*.
-
-    A TEM port is a **generator with a matched internal resistance**, not a soft
-    impressed source: it drives the mode through its own Z₀, so it is a genuine
-    resistor across the line and conducts at DC. That is what keeps a
-    DC-containing drive (a Gaussian pulse) from stranding static charge on the
-    structure — the CPML is propagating-only and absorbs no DC, and PEC
-    conductors have no relaxation path, so with a soft launch
-    (:meth:`TEMMode.to_source`, an ideal current source: open-circuit at DC) the
-    pulse's DC content has nowhere to go and stays put for the whole run. The
-    drain is **local to this port**: no far-end termination is assumed or needed.
-
-    No amplitude correction is applied here. ``TEMPort``'s ``voltage=`` is the
-    launched **forward-wave** voltage, not the raw Thévenin EMF: the port holds
-    its internal resistance at Z₀ and drives its generator at the exact
-    reciprocal of the divider it faces (2× directional, 3× bidirectional), so
-    the waveform's amplitude arrives on the line as written — the same contract
-    :meth:`TEMMode.to_source` had. (Both of those are κ-free constants, so they
-    do not drift with the cross-section.)
-
-    *direction* is the ±1 the job entry carries: -1 (a port on a high face,
-    firing along -normal) re-aims the directional H sheet, see
-    :func:`_mirror_port_h_sheet`.
-    """
-    port = ws.TEMPort(mode=mode, voltage=waveform, directional=directional)
+    port = ws.ModalPort(mode, amplitude=1.0, waveform=waveform, face=face)
     try:
-        # Compile the port kernel now rather than on the first inject, so a
-        # plane the kernel cannot be built on (no transverse E energy on it, or
-        # a directional launch with no room for its H sheet) is reported against
-        # the port's name instead of failing part-way through the time-stepping.
-        port.self_coupling(grid)
+        port._setup(grid)
     except ValueError as exc:
         raise RuntimeError(
-            "TEM port '{}' cannot be driven on this plane: {}".format(name, exc)
+            "Modal port '{}' cannot be built on this plane: {}".format(name, exc)
         )
-    if directional and direction < 0:
-        _mirror_port_h_sheet(np, port, grid)
     return port
 
 
 def _interior_position(normal, position, grid, d_pml):
-    """Pull a boundary port plane out of the PML onto the first interior cell.
+    """Nudge a face port's plane onto a cell the solver can actually use.
 
-    A face port's plane sits on the domain boundary node. The cell it lands on is
-    ``grid.axis_index(normal, position)`` -- the *nearest node* used as a cell
-    index -- which on a low face is cell ``d_pml`` (the first interior cell,
-    correct) but on a high face is cell ``N-d_pml``: the boundary node is shared
-    by the last interior cell and the first PML cell, and the nearest-node rule
-    rounds toward the PML. Clamp the cell into ``[d_pml, N-1-d_pml]`` -- exactly
-    :class:`wavesim.sources.GaussianBeam`'s convention -- and return that cell's
-    node coordinate.
+    A face port's plane sits on the domain boundary node, and the cell it lands
+    on is ``grid.axis_index(normal, position)`` -- the *nearest node* used as a
+    cell index. That needs clamping at both ends:
 
-    This matters twice over. The launch must not fire its forward wave into the
-    absorber; and, since the voxeliser no longer extrudes the conductors through
-    the PML (the port terminates the line instead), the pad holds no geometry at
-    all, so a mode solved a cell too far out would find an empty cross-section.
-    Applying it to *position* up front puts the solve, the saved profiles and the
-    launch on one populated plane.
+    * On a **high** face it returns node ``N``, one past the last cell of an
+      ``N``-cell axis, which the mode solver's plane slice cannot index.
+    * A low-face :class:`wavesim.sources.ModalPort` writes its ghost H at
+      ``k-1``, so its plane must sit at least one cell in.
 
-    A no-op for an interior port (its cell is already well inside the range). The
-    near bound is the PML pad on the port's own face, which a TEM/SPICE-TEM face
-    always has (the workbench forces it to PML); the far bound never binds.
+    *d_pml* is the absorber depth **on this port's own face**, i.e. ``0`` for a
+    modal port (its face carries no PML) and the run's ``d_pml`` for a SPICE-TEM
+    port, whose lumped launch must not fire into the absorber and whose plane
+    must land where the geometry actually is. The clamp is therefore
+    ``[max(d_pml, 1), N-1-d_pml]``; for a SPICE port that reproduces
+    :class:`wavesim.sources.GaussianBeam`'s ``d_pml`` / ``N-1-d_pml`` convention
+    exactly. Returns the clamped cell's node coordinate (or *position* unchanged
+    when nothing moved).
+
+    Applying it to *position* up front keeps the solve, the saved profiles and
+    the port itself on one populated plane. A no-op for a genuinely interior
+    port, whose cell is already well inside the range.
     """
     N = {"x": grid.Nx, "y": grid.Ny, "z": grid.Nz}[normal]
     coords = {"x": grid.x, "y": grid.y, "z": grid.z}[normal]
     k = grid.axis_index(normal, position)
-    k_interior = min(max(k, d_pml), N - 1 - d_pml)
+    k_interior = min(max(k, max(d_pml, 1)), N - 1 - d_pml)
     return float(coords[k_interior]) if k_interior != k else position
 
 
-def _solve_all_modes(ws, np, grid, job, material_data=None):
-    """Solve the TEM modes of every TEM-source and SPICE-TEM-port plane.
+def _solve_all_modes(ws, np, grid, job):
+    """Solve the TEM modes of every modal-port and SPICE-TEM-port plane.
 
-    Returns ``(plane_sources, spice_modes, mode_arrays, mode_meta)``:
+    Returns ``(modal_ports, spice_modes, mode_arrays, mode_meta)``:
 
-    * ``plane_sources`` — matched Thévenin modal ports
-      (:func:`_matched_tem_port`) for the ``tem_sources`` (one per port, the
-      chosen mode); empty when ``mode_only``.
+    * ``modal_ports`` — one :class:`wavesim.sources.ModalPort` boundary per
+      ``modal_ports`` entry (:func:`_build_modal_port`, driving the chosen mode);
+      empty when ``mode_only``.
     * ``spice_modes`` — ``{job_spice_index: TEMMode}`` giving the chosen mode for
       each ``kind:"tem"`` SPICE port, consumed by :func:`_build_spice_ports`;
       empty when ``mode_only`` (no FDTD to drive).
@@ -869,28 +598,30 @@ def _solve_all_modes(ws, np, grid, job, material_data=None):
       (``mode_<si>_<mi>_phi`` / ``_pec`` / ``_E_<comp>``).
     * ``mode_meta`` — per-mode metadata for ``summary["modes"]``.
 
-    When an entry carries a ``mode_mesh`` block (and *material_data*, the loaded
-    ``materials.npz``, holds its arrays) the mode is solved on a thin fine grid
-    built from that connectivity-preserving re-voxelisation instead of the coarse
-    slice, then interpolated back onto *grid* to launch; otherwise the historical
-    coarse-slice solve (honouring any ``bounds``) runs.
+    Every mode is solved on *grid* itself -- the run's own FDTD grid, honouring
+    any ``bounds``. There is deliberately no finer mode mesh: a ``ModalPort``'s
+    profile must be a discrete null vector of *this* grid, and a Z₀ measured on a
+    different mesh is not the Z₀ the run presents (see the module docstring).
     """
     mode_only = bool(job.get("mode_only", False))
-    # PML depth (cells) used to keep a face-port launch plane just inside the
-    # absorber; see _interior_position.
+    # PML depth (cells) of the run. Only a SPICE-TEM port's plane is held that far
+    # in: a modal port's own face carries no absorber, so it passes 0 (see
+    # _interior_position).
     d_pml = int((job.get("boundary") or {}).get("d_pml", 10))
 
-    # Every plane needing a mode solve: TEM sources first, then SPICE TEM ports.
-    # ``spice_index`` is the entry's index in job["spice_ports"] (None for TEM
-    # sources) so the chosen mode can be handed back to _build_spice_ports.
+    # Every plane needing a mode solve: modal ports first, then SPICE TEM ports.
+    # ``spice_index`` is the entry's index in job["spice_ports"] (None for modal
+    # ports) so the chosen mode can be handed back to _build_spice_ports.
+    # ``tem_sources`` is the pre-rename name of ``modal_ports``, still read so an
+    # older job.json on disk runs.
     planes = []  # (kind, cfg, spice_index)
-    for t in job.get("tem_sources") or []:
-        planes.append(("tem_source", t, None))
+    for t in (job.get("modal_ports") or job.get("tem_sources") or []):
+        planes.append(("modal", t, None))
     for idx, p in enumerate(job.get("spice_ports") or []):
         if p.get("kind") == "tem":
             planes.append(("spice", p, idx))
 
-    plane_sources = []
+    modal_ports = []
     spice_modes = {}
     mode_arrays = {}
     mode_meta = []
@@ -898,21 +629,20 @@ def _solve_all_modes(ws, np, grid, job, material_data=None):
     n_ports = len(planes)
     for si, (kind, t, spice_index) in enumerate(planes):
         normal = t.get("normal", "z")
-        name = t.get("name", "TEM")
-        # Pull the plane onto the first interior cell *before* solving. A port
-        # sits on the domain face, whose node is shared by the last interior cell
-        # and the first PML cell, and the nearest-node snap rounds a high-face
-        # plane into the absorber -- where the conductors no longer reach, since
-        # the voxeliser stops the geometry at the port plane and lets the port
-        # terminate it. Solving there would find an empty cross-section and no
-        # mode at all. Clamping here (rather than only before the launch, as this
-        # used to) keeps the solve, the saved profiles and the launch all on the
-        # same populated plane.
+        name = t.get("name", "port")
+        # Nudge the plane onto a usable cell *before* solving, so the solve, the
+        # saved profiles and the port all sit on the same populated plane. A modal
+        # port's face has no absorber, so this only moves it off the very edge
+        # (nearest-node lands a high-face plane on node N, past the last cell, and
+        # a low-face ModalPort needs a cell at k-1); a SPICE-TEM port is held one
+        # full PML depth in, where its lumped launch will not fire into the pad.
         position = _interior_position(
-            normal, float(t.get("position", 0.0)), grid, d_pml)
+            normal, float(t.get("position", 0.0)), grid,
+            d_pml if kind == "spice" else 0)
 
-        # Characteristic frequency/amplitude/fields for the results tree. SPICE
-        # ports have no waveform (the circuit drives them), so they carry none.
+        # Characteristic frequency/amplitude for the results tree. SPICE ports
+        # have no waveform (the circuit drives them), so they carry none, and only
+        # they still choose which fields to inject.
         if kind == "spice":
             fmax, amplitude = 0.0, 1.0
             fields = "EH" if t.get("directional", True) else "E"
@@ -924,57 +654,25 @@ def _solve_all_modes(ws, np, grid, job, material_data=None):
                 fmax = float(exc_spec.get("frequency", 0.0))
             else:  # gaussian (or legacy) uses fmax; rectangular has none
                 fmax = float(exc_spec.get("fmax", t.get("fmax", 0.0)))
-            fields = t.get("fields", "EH")
+            fields = ""     # a modal impedance sheet is one-way by construction
 
-        # A connectivity-preserving mode mesh re-voxelises this plane on a fine
-        # transverse grid so the conductor count is right (the coarse cell size
-        # can shred one PEC into several cells). Solve there when present; the
-        # solved mode is interpolated back onto the coarse grid to launch.
-        mm = t.get("mode_mesh")
-        use_mesh = mm is not None and material_data is not None
-        # A convergence mode mesh carries a refinement ``levels`` ladder the runner
-        # walks until Z0 settles; a plain one carries a single ``a_nodes``/
-        # ``b_nodes`` grid.
-        use_convergence = use_mesh and bool(mm.get("levels"))
         # Optional in-plane bounds (solver-frame metres, transverse slice order).
-        # Mutually exclusive with a mode mesh, whose fine grid already spans
-        # exactly the (bounded) box.
-        bounds = None if use_mesh else t.get("bounds")
-        conv_history = None
+        bounds = t.get("bounds")
 
         prefix = "Port {}/{}: ".format(si + 1, n_ports) if n_ports > 1 else ""
         _emit_status(
             "{}solving TEM mode on the {}-plane of '{}'\n"
-            "({}factorising the cross-section; this scales with grid "
-            "size)...".format(
-                prefix, normal, name,
-                "impedance-convergence fine meshes; " if use_convergence else
-                "connectivity-preserving fine mesh; " if use_mesh else "",
-            )
+            "(factorising the cross-section; this scales with grid "
+            "size)...".format(prefix, normal, name)
         )
-        if use_convergence:
-            # Walk the refinement ladder until the chosen conductor's Z0 settles.
-            # The finest solved level is used exactly like a single mode mesh.
-            modes, solve_grid, conv_history = _solve_mode_convergence(
-                ws, np, mm, material_data, int(t.get("conductor_id", 0)),
-                name, prefix,
-            )
-        elif use_mesh:
-            # The fine grid already spans exactly the (bounded) box, so no
-            # ``bounds`` is passed — the whole fine plane is the solve region.
-            solve_grid = _mode_mesh_grid(ws, np, mm, material_data)
-            modes = ws.solve_tem_modes(
-                solve_grid, normal=normal, position=position, compute_params=True,
-            )
-        else:
-            # Confine the mode solve to a sub-rectangle of the face when the port
-            # carries ``bounds``. Absent => whole face, the historical behaviour.
-            solve_grid = grid
-            modes = ws.solve_tem_modes(
-                grid, normal=normal, position=position,
-                bounds=tuple(bounds) if bounds else None,
-                compute_params=True,
-            )
+        # Confine the mode solve to a sub-rectangle of the face when the port
+        # carries ``bounds``. Absent => the whole face.
+        solve_grid = grid
+        modes = ws.solve_tem_modes(
+            grid, normal=normal, position=position,
+            bounds=tuple(bounds) if bounds else None,
+            compute_params=True,
+        )
         _emit_status(
             "{}found {} TEM mode(s); building field profiles...".format(
                 prefix, len(modes)
@@ -982,11 +680,11 @@ def _solve_all_modes(ws, np, grid, job, material_data=None):
         )
 
         # ``solve_tem_modes`` embeds a bounded solve back into the *full* plane
-        # (the modal launch needs the full transverse shape), padding it with
-        # zeros. Crop the **saved** profiles back to the cells actually solved, so
-        # the results plot draws the bounded region the user selected instead of a
-        # face of zeros around it. The in-memory ``mode`` handed to ``to_source``
-        # / ``SpicePort`` below keeps its full shape and is untouched.
+        # (the port needs the full transverse shape), padding it with zeros. Crop
+        # the **saved** profiles back to the cells actually solved, so the results
+        # plot draws the bounded region the user selected instead of a face of
+        # zeros around it. The in-memory ``mode`` handed to ``ModalPort`` /
+        # ``SpicePort`` below keeps its full shape and is untouched.
         win = _bounds_window(grid, modes[0], bounds) if (bounds and modes) else None
 
         for mi, mode in enumerate(modes):
@@ -1006,9 +704,8 @@ def _solve_all_modes(ws, np, grid, job, material_data=None):
             # axes rather than assuming a constant da/db spacing.
             t_axes = list(getattr(mode, "transverse_axes", []))
             if len(t_axes) == 2:
-                # From the grid the mode was solved on (the fine mesh when used),
-                # so the results plot shows the true mode resolution; sliced to
-                # the same window as the profiles above.
+                # From the grid the mode was solved on -- the run's own grid --
+                # sliced to the same window as the profiles above.
                 ca = _axis_centers(solve_grid, t_axes[0])
                 cb = _axis_centers(solve_grid, t_axes[1])
                 if win is not None:
@@ -1029,56 +726,33 @@ def _solve_all_modes(ws, np, grid, job, material_data=None):
                 "fmax": fmax, "amplitude": amplitude, "fields": fields,
                 "spice": kind == "spice",
             }
-            # Attach the port's impedance-convergence history (same for every mode
-            # on this plane) so the results plot can show Z0 settling with mesh.
-            if conv_history is not None:
-                meta["convergence"] = conv_history
             mode_meta.append(meta)
 
         if not modes or mode_only:
             continue
 
         chosen = _choose_mode(modes, int(t.get("conductor_id", 0)), name)
-        # ``position`` was already pulled onto the first interior cell before the
-        # solve (:func:`_interior_position`), so the mode this launches from is
-        # on the populated plane and needs no further nudging here -- both the
-        # TEM and SPICE-TEM launch paths read the chosen mode's ``position``.
+        # ``position`` was already nudged onto a usable cell before the solve
+        # (:func:`_interior_position`), and both launch paths read the chosen
+        # mode's own ``position``, so nothing needs moving here.
         if kind == "spice":
             # Hand the chosen mode to _build_spice_ports; the circuit drives it.
-            # A fine-mesh mode is rebuilt on the coarse grid first, since the
-            # SpicePort compiles its kernel against the coarse FDTD grid.
-            spice_modes[spice_index] = (
-                _coarse_mode_from_fine(ws, np, chosen, grid) if use_mesh else chosen
-            )
+            spice_modes[spice_index] = chosen
             continue
 
-        # TEM source: drive the chosen mode from a matched Thévenin port — a
-        # generator behind the mode's own Z₀ (see :func:`_matched_tem_port`). It
-        # launches the amplitude-calibrated forward wave *and* terminates: the
-        # port is a real resistance across the line, so it both absorbs what
-        # comes back to the plane and gives a DC-containing drive (a Gaussian
-        # pulse) somewhere to drain, instead of stranding static charge that
-        # neither the propagating-only CPML nor a floating PEC can relax.
-        #
-        # A fine-mesh mode lives on the fine grid; rebuild it on the coarse launch
-        # grid first (exactly as the SPICE path does), since the port kernel
-        # indexes the coarse cells.
+        # Modal port: an impedance sheet on the face that launches the chosen
+        # mode inward and terminates the plane at the same time (no reflection,
+        # exact at DC), which is why that face carries no PML. Registered as a
+        # boundary, not a source -- see :func:`_build_modal_port`.
         waveform = _build_waveform(ws, t)
-        launch_mode = (
-            _coarse_mode_from_fine(ws, np, chosen, grid) if use_mesh else chosen
-        )
-        # The port kernel builds H = (n̂ × E)/η for a +normal launch. A port on a
-        # high face fires *into* the domain along -normal (direction < 0), which
-        # the port handles by mirroring its H sheet across the mode plane (see
-        # :func:`_mirror_port_h_sheet`). An E-only launch carries no H sheet and
-        # is bidirectional, so the direction is moot there; its backward lobe is
-        # absorbed by the PML behind the launch face.
-        direction = float(t.get("direction", 1.0))
-        plane_sources.append(_matched_tem_port(
-            ws, np, launch_mode, waveform, grid, fields != "E", direction,
-            name))
+        # Legacy jobs carry ``direction`` instead of ``face``; derive the face
+        # name from the normal and that sign so an old job.json still runs.
+        face = t.get("face") or "{}{}".format(
+            normal, "0" if float(t.get("direction", 1.0)) >= 0 else "1")
+        modal_ports.append(
+            _build_modal_port(ws, chosen, waveform, grid, str(face), name))
 
-    return plane_sources, spice_modes, mode_arrays, mode_meta
+    return modal_ports, spice_modes, mode_arrays, mode_meta
 
 
 # --------------------------------------------------------------------------- #
@@ -1229,14 +903,10 @@ def run_job(workdir):
     grid = ws.set_vacuum(grid)
 
     # Optional voxelised materials (Session 3+). Absent in the Session 2 slice.
-    # ``material_data`` is kept for the mode solve: a port's ``mode_mesh`` block
-    # loads its fine ``modemesh_*`` arrays from here.
     materials_path = os.path.join(workdir, "materials.npz")
     voxel_summary = {}
-    material_data = None
     if os.path.isfile(materials_path):
         data = np.load(materials_path)
-        material_data = data
         pec_mask = data["pec_mask"] if "pec_mask" in data.files else None
         # Cast to the grid's dtype so the field and material arrays stay
         # matched — the CUDA backend keys its per-cell arithmetic and scalar
@@ -1257,11 +927,12 @@ def run_job(workdir):
             voxel_summary["pec_cells"] = int(np.count_nonzero(pec_mask))
         voxel_summary["dielectric_cells"] = int(np.count_nonzero(data["eps_x"] != 1.0))
 
-    # TEM ports: solve each port plane's transverse mode. Done before the FDTD
-    # setup so the solved modes can be launched as directional plane sources
-    # (and so a mode-only request can return without building the time loop).
-    plane_sources, spice_modes, mode_arrays, mode_meta = _solve_all_modes(
-        ws, np, grid, job, material_data
+    # Ports: solve each port plane's transverse mode. Done after the materials are
+    # loaded (the mode solve reads the grid's own eps/mu/PEC) and before the FDTD
+    # setup, so the modal-port boundaries exist for the Simulation below and a
+    # mode-only request can return without building the time loop.
+    modal_boundaries, spice_modes, mode_arrays, mode_meta = _solve_all_modes(
+        ws, np, grid, job
     )
 
     if job.get("mode_only", False):
@@ -1283,7 +954,9 @@ def run_job(workdir):
 
     # Boundary: absorbing CPML on the PML faces, PEC walls on the PEC faces.
     # An explicit empty PML face list means a closed (PEC-cavity) domain, so
-    # only fall back to all-six when the key is absent entirely.
+    # only fall back to all-six when the key is absent entirely. A modal-port
+    # face appears in neither list -- the port terminates it itself, so the
+    # workbench strips it from both (see domain.domain_grid_params).
     cpml = None
     boundary = job.get("boundary") or {}
     pml_faces = boundary.get("faces", list(ws.ALL_FACES))
@@ -1293,8 +966,9 @@ def run_job(workdir):
         )
     pec_faces = tuple(boundary.get("pec_faces") or ())
 
-    # Sources: an optional soft point excitation plus any TEM port launchers.
-    # ``source`` may be null when the excitation comes entirely from TEM ports.
+    # Sources: an optional soft point excitation. ``source`` may be null when the
+    # excitation comes entirely from the ports. Modal ports are *not* sources --
+    # they go in ``boundaries=`` below, so they run between the H and E updates.
     sources = []
     s = job.get("source")
     if s:
@@ -1302,7 +976,6 @@ def run_job(workdir):
         sources.append(ws.PointSource(
             s["component"], float(s["x"]), float(s["y"]), float(s["z"]), waveform
         ))
-    sources.extend(plane_sources)
 
     # Boundary Gaussian beams: a one-way beam launched from a boundary face, one
     # PML-depth inside it. The E sheet is placed at cell ``d_pml`` (low face) or
@@ -1395,10 +1068,14 @@ def run_job(workdir):
     all_monitors.extend(m for _name, m in voltages)
     all_monitors.extend(m for _name, m in currents)
 
+    # ``boundaries`` run between the H and E updates, unlike sources (after E).
+    # A modal port sets the ghost tangential H that the very next E update
+    # consumes, so a source hook would be clobbered before it was ever read.
     sim = ws.Simulation(
         grid,
         cpml=cpml,
         sources=sources,
+        boundaries=modal_boundaries,
         monitors=all_monitors,
         pec_faces=pec_faces,
         backend=backend,

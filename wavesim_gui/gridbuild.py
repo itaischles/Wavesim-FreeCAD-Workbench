@@ -322,15 +322,17 @@ def build_axis_nodes(snaps, lo, hi, coarse, ratio, pad_lo, pad_hi, min_cell=0.0,
 # Domain-level entry point
 # --------------------------------------------------------------------------- #
 
-def build_domain_nodes(sim, domain, force_pml_faces=()):
+def build_domain_nodes(sim, domain, force_pml_faces=(), modal_faces=()):
     """Snapped, graded ``(NodesX, NodesY, NodesZ)`` (world mm) for *domain*.
 
     Uses the material geometry bounds (grown for sources/monitors, via
     ``combined_bbox_mm``) as the inner region, the Domain's ``Dx/Dy/Dz`` as the
     coarse (background) interior target, its ``MaxGradingRatio`` as the grading
-    bound and the per-face PML padding from ``domain_grid_params``. *force_pml_faces*
-    (the TEM-port launch faces) is forwarded so their PML pad is present in the
-    node arrays even if the face is set to PEC, matching the run's boundary. Each material
+    bound and the per-face PML padding from ``domain_grid_params``.
+    *force_pml_faces* (beam / SPICE-TEM launch faces) and *modal_faces* (Modal
+    Port faces, which get no pad and no background gap) are forwarded so the node
+    arrays carry exactly the padding and spacing the run's boundary assumes, even
+    when the face's stored property says otherwise. Each material
     body additionally refines its own band down to its per-medium resolution (see
     :func:`collect_material_caps`), so higher-index regions are meshed finer than
     the void. Returns ``None`` when there is no geometry to bound (the caller
@@ -348,7 +350,8 @@ def build_domain_nodes(sim, domain, force_pml_faces=()):
     if bbox is None:
         return None
 
-    params = domain_mod.domain_grid_params(domain, force_pml_faces=force_pml_faces)
+    params = domain_mod.domain_grid_params(
+        domain, force_pml_faces=force_pml_faces, modal_faces=modal_faces)
     sp_lo_mm = tuple(s * _MM_PER_M for s in params["spacing_lo"])
     sp_hi_mm = tuple(s * _MM_PER_M for s in params["spacing_hi"])
     pad_lo, pad_hi = params["pad_lo"], params["pad_hi"]

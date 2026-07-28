@@ -130,13 +130,6 @@ class SimulationContainer:
             )
             obj.SubpixelSmoothing = True
 
-        # TEM mode-solver convergence study. When on, each TEM/SPICE-TEM port's
-        # transverse mode mesh is refined over several iterations (each finer than
-        # the last) and its characteristic impedance re-solved until the relative
-        # change falls below the tolerance or the iteration cap is reached. Applies
-        # to both "Compute Mode" and a full Run (see tem_source / voxelize / runner).
-        _ensure_mode_convergence_props(obj)
-
     def onDocumentRestored(self, obj):
         # Re-assert the back-reference after a reload.
         obj.Proxy = self
@@ -147,9 +140,9 @@ class SimulationContainer:
             obj.setEditorMode("MaxTime", 1)
         if hasattr(obj, "MaxFrequency"):
             obj.setEditorMode("MaxFrequency", 1)
-        # Back-fill the mode-convergence properties on documents saved before they
-        # existed (defaults leave the study off, i.e. the old behaviour).
-        _ensure_mode_convergence_props(obj)
+        # Drop the retired mode-convergence properties from documents that carry
+        # them (see :func:`_drop_mode_convergence_props`).
+        _drop_mode_convergence_props(obj)
         # Documents created before the Domain was ordered first still have it
         # after the child groups; hoist it so it sits directly under Simulation.
         _ensure_domain_first(obj)
@@ -220,74 +213,30 @@ def max_frequency_hz(sim):
     return float(getattr(sim, "MaxFrequency", 1.0e9))
 
 
-# Defaults for the TEM mode-solver convergence study (see the SimulationContainer
-# properties). A modest iteration cap and a 1% tolerance suit most ports.
-_MODE_CONV_DEFAULT_ITERS = 5
-_MODE_CONV_DEFAULT_TOL_PCT = 1.0
-# Hard cap on transverse (face) cells for the finest mode-mesh level. Counts the
-# 2D port-plane cells only -- the mode solve runs on that plane -- so it bounds
-# mode-solver cost, not the 3D FDTD grid.
-_MODE_CONV_DEFAULT_MAX_CELLS = 300_000
+# Properties of the retired mode-mesh impedance-convergence study. It refined
+# each port's transverse mode mesh until Z0 settled -- but the Z0 so found is not
+# the Z0 the FDTD grid actually presents, and the modal port's profile has to be
+# built on the simulation grid to stay divergence-free, so the whole ladder was
+# removed. Listed here only to be stripped off documents that still carry them.
+_RETIRED_MODE_CONV_PROPS = (
+    "ConvergeModeImpedance", "MaxModeIterations", "ModeImpedanceTolPct",
+    "MaxModeFaceCells",
+)
 
 
-def _ensure_mode_convergence_props(obj):
-    """Add the TEM mode-convergence properties to *obj* idempotently.
+def _drop_mode_convergence_props(obj):
+    """Remove the retired mode-convergence properties from *obj*, if present.
 
-    Called from ``__init__`` and ``onDocumentRestored`` so both new and reloaded
-    (pre-feature) documents gain them with the study left off by default.
+    A document saved while the study existed would otherwise keep four dead
+    entries in its property editor for good. Guarded: a FreeCAD build that
+    refuses ``removeProperty`` must not break restore.
     """
-    if not hasattr(obj, "ConvergeModeImpedance"):
-        obj.addProperty(
-            "App::PropertyBool", "ConvergeModeImpedance", "Mode convergence",
-            "Refine each TEM port's transverse mode mesh over several iterations "
-            "(finer each time) until the characteristic impedance converges. "
-            "Off keeps the single connectivity-preserving mesh.",
-        )
-        obj.ConvergeModeImpedance = False
-    if not hasattr(obj, "MaxModeIterations"):
-        obj.addProperty(
-            "App::PropertyInteger", "MaxModeIterations", "Mode convergence",
-            "Maximum number of mode-mesh refinement iterations when converging "
-            "the characteristic impedance.",
-        )
-        obj.MaxModeIterations = _MODE_CONV_DEFAULT_ITERS
-    if not hasattr(obj, "ModeImpedanceTolPct"):
-        obj.addProperty(
-            "App::PropertyFloat", "ModeImpedanceTolPct", "Mode convergence",
-            "Convergence criterion: stop refining once the characteristic "
-            "impedance changes by less than this percentage between iterations.",
-        )
-        obj.ModeImpedanceTolPct = _MODE_CONV_DEFAULT_TOL_PCT
-    if not hasattr(obj, "MaxModeFaceCells"):
-        obj.addProperty(
-            "App::PropertyInteger", "MaxModeFaceCells", "Mode convergence",
-            "Hard cap on the number of transverse (face) cells at the finest "
-            "mode-mesh refinement level. Counts the 2D port-plane cells only, so "
-            "it bounds mode-solver cost; refinement stops once the next level "
-            "would exceed it, even below the maximum iteration count.",
-        )
-        obj.MaxModeFaceCells = _MODE_CONV_DEFAULT_MAX_CELLS
-
-
-def mode_convergence_settings(sim):
-    """Return the TEM mode-convergence settings for *sim*, or ``None`` if off.
-
-    ``{"max_iter": int, "rel_tol": float}`` (``rel_tol`` a fraction, not percent)
-    when the study is enabled and the parameters are sane; ``None`` otherwise, so
-    the voxeliser falls back to the single connectivity-preserving mode mesh.
-    """
-    if sim is None or not bool(getattr(sim, "ConvergeModeImpedance", False)):
-        return None
-    max_iter = int(getattr(sim, "MaxModeIterations", _MODE_CONV_DEFAULT_ITERS))
-    tol_pct = float(getattr(sim, "ModeImpedanceTolPct", _MODE_CONV_DEFAULT_TOL_PCT))
-    max_cells = int(getattr(sim, "MaxModeFaceCells", _MODE_CONV_DEFAULT_MAX_CELLS))
-    if max_iter < 1:
-        return None
-    return {
-        "max_iter": max_iter,
-        "rel_tol": max(tol_pct, 0.0) / 100.0,
-        "max_cells": max(max_cells, 4),
-    }
+    for prop in _RETIRED_MODE_CONV_PROPS:
+        if hasattr(obj, prop):
+            try:
+                obj.removeProperty(prop)
+            except Exception:
+                pass
 
 
 # --------------------------------------------------------------------------- #
@@ -421,71 +370,12 @@ if _GUI_AVAILABLE:
                 "conductors are unaffected."
             )
 
-            # TEM mode-solver impedance convergence. When enabled, each TEM port's
-            # transverse mode mesh is refined until Z0 converges (or the iteration
-            # cap is hit); the spin boxes are only meaningful while it is on.
-            _ensure_mode_convergence_props(obj)
-            self._converge = QtWidgets.QCheckBox(
-                "Converge TEM mode characteristic impedance"
-            )
-            self._converge.setChecked(
-                bool(getattr(obj, "ConvergeModeImpedance", False))
-            )
-            self._converge.setToolTip(
-                "Refine each TEM/SPICE-TEM port's transverse mode mesh over "
-                "successive iterations (finer each time) and re-solve its "
-                "characteristic impedance until the relative change drops below "
-                "the tolerance or the maximum iteration count is reached. Applies "
-                "to both 'Compute Mode' and a full Run."
-            )
-            self._max_iters = QtWidgets.QSpinBox()
-            self._max_iters.setRange(1, 20)
-            self._max_iters.setValue(
-                int(getattr(obj, "MaxModeIterations", _MODE_CONV_DEFAULT_ITERS))
-            )
-            self._tol_pct = QtWidgets.QDoubleSpinBox()
-            self._tol_pct.setRange(0.0, 100.0)
-            self._tol_pct.setDecimals(3)
-            self._tol_pct.setSuffix(" %")
-            self._tol_pct.setSingleStep(0.5)
-            self._tol_pct.setValue(
-                float(getattr(obj, "ModeImpedanceTolPct",
-                              _MODE_CONV_DEFAULT_TOL_PCT))
-            )
-            self._max_cells = QtWidgets.QSpinBox()
-            self._max_cells.setRange(4, 100_000_000)
-            self._max_cells.setSingleStep(50_000)
-            self._max_cells.setGroupSeparatorShown(True)
-            self._max_cells.setToolTip(
-                "Hard cap on transverse (face) cells at the finest mode-mesh "
-                "level. Counts the 2D port-plane cells only; refinement stops "
-                "once the next level would exceed this, even below the maximum "
-                "iteration count."
-            )
-            self._max_cells.setValue(
-                int(getattr(obj, "MaxModeFaceCells",
-                            _MODE_CONV_DEFAULT_MAX_CELLS))
-            )
-
             layout.addRow("Time unit:", self._time)
             layout.addRow("Frequency unit:", self._freq)
             layout.addRow("Max simulation time:", self._max_time)
             layout.addRow("Max frequency:", self._max_freq)
             layout.addRow("Time steps:", self._steps)
             layout.addRow(self._subpixel)
-            layout.addRow(self._converge)
-            layout.addRow("Max mode iterations:", self._max_iters)
-            layout.addRow("Impedance tolerance:", self._tol_pct)
-            layout.addRow("Max mode face cells:", self._max_cells)
-
-            def _sync_converge(*_):
-                on = self._converge.isChecked()
-                self._max_iters.setEnabled(on)
-                self._tol_pct.setEnabled(on)
-                self._max_cells.setEnabled(on)
-
-            self._converge.toggled.connect(_sync_converge)
-            _sync_converge()
 
             info = QtWidgets.QLabel(
                 "The simulation runs until the maximum time is reached. The "
@@ -550,11 +440,7 @@ if _GUI_AVAILABLE:
                     "unaffected.",
                 )
             self.obj.SubpixelSmoothing = self._subpixel.isChecked()
-            _ensure_mode_convergence_props(self.obj)
-            self.obj.ConvergeModeImpedance = self._converge.isChecked()
-            self.obj.MaxModeIterations = int(self._max_iters.value())
-            self.obj.ModeImpedanceTolPct = float(self._tol_pct.value())
-            self.obj.MaxModeFaceCells = int(self._max_cells.value())
+            _drop_mode_convergence_props(self.obj)
             new_max_freq = units.freq_to_si(self._max_freq.value(), self._freq_unit)
             self.obj.MaxFrequency = new_max_freq
             # The max frequency drives the default cell size, so when it changes
@@ -781,7 +667,7 @@ if _GUI_AVAILABLE:
     from wavesim_gui import materials  # noqa: F401  (registers Wavesim_AssignMaterial)
     from wavesim_gui import domain  # noqa: F401  (registers the Domain object/VP)
     from wavesim_gui import source  # noqa: F401  (registers Wavesim_AddSource)
-    from wavesim_gui import tem_source  # noqa: F401  (registers Wavesim_AddTEMSource)
+    from wavesim_gui import modal_port  # noqa: F401  (registers Wavesim_AddModalPort)
     from wavesim_gui import gaussian_beam  # noqa: F401  (registers Wavesim_AddGaussianBeam)
     from wavesim_gui import spice_port  # noqa: F401  (registers the SPICE port commands)
     from wavesim_gui import monitors  # noqa: F401  (registers the monitor commands)

@@ -359,7 +359,7 @@ def build_results(doc, sim, workdir, summary):
                 _store_edges(leaf, "XEdges", npz[e0k])
                 _store_edges(leaf, "YEdges", npz[e1k])
 
-        # TEM modes (one leaf per solved port mode). Each opens a figure of the
+        # Port modes (one leaf per solved port mode). Each opens a figure of the
         # mode shape plus the port's per-unit-length parameters.
         for meta in summary.get("modes", []):
             key = "mode_{}_{}".format(
@@ -369,7 +369,7 @@ def build_results(doc, sim, workdir, summary):
                 continue
             cond = meta.get("conductor_id", "?")
             name = "{} mode (conductor {})".format(
-                meta.get("name", "TEM"), cond
+                meta.get("name", "port"), cond
             )
             leaf = _new_leaf(name, _KIND_MODE, key, "")
             _store_mode_meta(leaf, meta)
@@ -1220,7 +1220,7 @@ if _GUI_AVAILABLE:
         _register_window(dialog)
 
     # ------------------------------------------------------------------ #
-    # TEM mode plotter
+    # Port mode plotter
     # ------------------------------------------------------------------ #
 
     _NAN = float("nan")
@@ -1299,7 +1299,7 @@ if _GUI_AVAILABLE:
             return _NAN if value is None else float(value)
 
         axes = meta.get("transverse_axes", ["a", "b"])
-        name = meta.get("name", "TEM")
+        name = meta.get("name", "port")
         return {
             "label": "{} — energized conductor {}".format(
                 name, meta.get("conductor_id", "?")
@@ -1321,7 +1321,6 @@ if _GUI_AVAILABLE:
             "v_phase": _num(meta.get("v_phase")),
             "fmax": float(meta.get("fmax", 0.0)),
             "fields": str(meta.get("fields", "")),
-            "convergence": meta.get("convergence"),
         }
 
     def _draw_mode(figure, data):
@@ -1403,27 +1402,6 @@ if _GUI_AVAILABLE:
         ax.text(0.02, 0.98, "\n".join(lines), transform=ax.transAxes,
                 va="top", ha="left", fontsize=8,
                 bbox=dict(boxstyle="round", facecolor="white", alpha=0.75))
-
-        # Impedance-convergence history (when the study ran): Z0 per mesh
-        # refinement, so the user can see it settle. Drawn as a small inset table
-        # in the lower-right so it never overlaps the parameter box above.
-        history = data.get("convergence")
-        if history:
-            clines = ["Z₀ convergence (iter: N×N  Z₀  Δ)"]
-            for h in history:
-                z = h.get("impedance")
-                d = h.get("delta_rel")
-                zs = "{:.2f}Ω".format(z) if isinstance(z, (int, float)) \
-                    and math.isfinite(z) else "n/a"
-                ds = "" if not (isinstance(d, (int, float)) and math.isfinite(d)) \
-                    else "  Δ{:.2g}%".format(100.0 * d)
-                mark = " ✓" if h.get("converged") else ""
-                clines.append("{}: {}×{}  {}{}{}".format(
-                    h.get("iteration", "?"), h.get("Na", "?"), h.get("Nb", "?"),
-                    zs, ds, mark))
-            ax.text(0.98, 0.02, "\n".join(clines), transform=ax.transAxes,
-                    va="bottom", ha="right", fontsize=7, family="monospace",
-                    bbox=dict(boxstyle="round", facecolor="#f5f5dc", alpha=0.8))
 
     def _plot_mode(obj):
         """Open the figure of a mode leaf saved by a run (double-click in the tree)."""

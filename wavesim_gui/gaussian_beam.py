@@ -212,7 +212,7 @@ class GaussianBeamObject:
 
     def execute(self, obj):
         """Size/orient the drawn launch plane to the domain bounds and face."""
-        from wavesim_gui import tem_source as tem_mod
+        from wavesim_gui import modal_port as modal_mod
 
         sim = active_simulation(obj.Document)
         dom = domain_mod.find_domain(sim) if sim else None
@@ -224,7 +224,7 @@ class GaussianBeamObject:
             mn = FreeCAD.Vector(-half, -half, -half)
             mx = FreeCAD.Vector(half, half, half)
         obj.Corners = [FreeCAD.Vector(*p)
-                       for p in tem_mod._face_corners(mn, mx, str(obj.Face))]
+                       for p in modal_mod._face_corners(mn, mx, str(obj.Face))]
 
     def dumps(self):
         return {"Type": getattr(self, "Type", _BEAM_TYPE)}
@@ -382,7 +382,7 @@ if _GUI_AVAILABLE:
     # Reuse the point source's excitation widgets/plot mixin and the TEM source's
     # plane/arrow coin geometry (identical launch-plane visual, different colour).
     from wavesim_gui import source as source_mod
-    from wavesim_gui import tem_source as tem_mod
+    from wavesim_gui import modal_port as modal_mod
 
     class GaussianBeamViewProvider:
         """Coin view provider drawing the beam's launch plane, translucent.
@@ -447,7 +447,7 @@ if _GUI_AVAILABLE:
             arrow.addChild(self._arrow_scale)
             self._arrow_rot = coin.SoRotation()
             arrow.addChild(self._arrow_rot)
-            arrow.addChild(tem_mod._build_arrow_geometry())
+            arrow.addChild(modal_mod._build_arrow_geometry())
             self._arrow_on = False
             root.addChild(arrow)
 
@@ -471,7 +471,7 @@ if _GUI_AVAILABLE:
             if height_px <= 0.0:
                 return
             world = mm.multVecMatrix(coin.SbVec3f(0.0, 0.0, 0.0))
-            size = vv.getWorldToScreenScale(world, tem_mod._ARROW_PIXELS / height_px)
+            size = vv.getWorldToScreenScale(world, modal_mod._ARROW_PIXELS / height_px)
             last = getattr(self, "_arrow_last_size", 0.0)
             if size > 0.0 and abs(size - last) > 1e-6 * max(size, last):
                 self._arrow_last_size = size
@@ -515,7 +515,7 @@ if _GUI_AVAILABLE:
                 self._border_lines.coordIndex.deleteValues(len(edges))
 
             self._arrow_pos.translation.setValue(*pts[0])
-            d = tem_mod._flow_direction(str(obj.Face))
+            d = modal_mod._flow_direction(str(obj.Face))
             self._arrow_rot.rotation.setValue(
                 coin.SbRotation(coin.SbVec3f(0.0, 1.0, 0.0), coin.SbVec3f(*d))
             )

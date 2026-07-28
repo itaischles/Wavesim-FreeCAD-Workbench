@@ -40,7 +40,7 @@ import FreeCAD
 
 from wavesim_gui.commands import active_simulation
 from wavesim_gui import domain as domain_mod
-from wavesim_gui import tem_source as tem_mod
+from wavesim_gui import modal_port as modal_mod
 
 
 # --------------------------------------------------------------------------- #
@@ -72,12 +72,12 @@ _LINE_COLOR = (0.85, 0.10, 0.85)
 _PLUS_COLOR = (0.10, 0.80, 0.10)
 _MINUS_COLOR = (0.90, 0.20, 0.20)
 
-# Reuse the TEM source's face catalogue + field tokens so the two stay in step.
-_FACES = tem_mod._FACES
-_FACE_LABELS = tem_mod._FACE_LABELS
-_FIELDS_LABELS = tem_mod._FIELDS_LABELS
-_FIELDS_TOKEN = tem_mod._FIELDS_TOKEN
-_FIELDS_FROM_TOKEN = tem_mod._FIELDS_FROM_TOKEN
+# Reuse the modal port's face catalogue + field tokens so the two stay in step.
+_FACES = modal_mod._FACES
+_FACE_LABELS = modal_mod._FACE_LABELS
+_FIELDS_LABELS = modal_mod._FIELDS_LABELS
+_FIELDS_TOKEN = modal_mod._FIELDS_TOKEN
+_FIELDS_FROM_TOKEN = modal_mod._FIELDS_FROM_TOKEN
 
 
 # --------------------------------------------------------------------------- #
@@ -332,10 +332,10 @@ class SpiceTEMPortObject:
             half = 5.0
             mn = FreeCAD.Vector(-half, -half, -half)
             mx = FreeCAD.Vector(half, half, half)
-        rect = tem_mod._bounds_rect_mm(dom, str(obj.Face),
+        rect = modal_mod._bounds_rect_mm(dom, str(obj.Face),
                                        getattr(obj, "BoundsSel", None))
         obj.Corners = [FreeCAD.Vector(*p)
-                       for p in tem_mod._face_corners(mn, mx, str(obj.Face), rect)]
+                       for p in modal_mod._face_corners(mn, mx, str(obj.Face), rect)]
 
     def dumps(self):
         return {"Type": getattr(self, "Type", _TEM_TYPE)}
@@ -419,7 +419,7 @@ def spice_line_port_spec(obj, origin_m):
 def spice_tem_port_spec(obj, origin_m):
     """Return the ``job.json`` ``spice_ports`` dict for a TEM port.
 
-    Mirrors :func:`wavesim_gui.tem_source.tem_source_spec` for the plane geometry
+    Mirrors :func:`wavesim_gui.modal_port.modal_port_spec` for the plane geometry
     (normal/position/direction/conductor), plus the netlist coupling; the ``EH``/
     ``E`` field choice maps to SpicePort's ``directional`` flag.
     """
@@ -438,7 +438,7 @@ def spice_tem_port_spec(obj, origin_m):
         "conductor_id": int(getattr(obj, "Conductor", 0)),
         "directional": str(getattr(obj, "Fields", "EH")) == "EH",
     }
-    tem_mod._add_bounds_spec(spec, dom, face, axis,
+    modal_mod._add_bounds_spec(spec, dom, face, axis,
                              getattr(obj, "BoundsSel", None), origin_m)
     spec.update(_spice_common_spec(obj))
     return spec
@@ -627,7 +627,7 @@ if _GUI_AVAILABLE:
         __getstate__ = dumps
         __setstate__ = loads
 
-    class SpiceTEMPortViewProvider(tem_mod.TEMSourceViewProvider):
+    class SpiceTEMPortViewProvider(modal_mod.ModalPortViewProvider):
         """Teal launch plane (reused from the TEM source), editing this port."""
 
         def getIcon(self):
@@ -800,7 +800,7 @@ if _GUI_AVAILABLE:
             layout.addRow("Energize conductor:", self._conductor)
 
             # Optional in-plane bounds (mirrors the TEM source panel).
-            self._bounds_label = QtWidgets.QLabel(tem_mod._bounds_desc(obj))
+            self._bounds_label = QtWidgets.QLabel(modal_mod._bounds_desc(obj))
             self._bounds_label.setWordWrap(True)
             pick = QtWidgets.QPushButton("Select bounding edge/face")
             clear = QtWidgets.QPushButton("Clear")
@@ -849,7 +849,7 @@ if _GUI_AVAILABLE:
                          if n.startswith("Edge") or n.startswith("Face")]
                 if picks:
                     self.obj.BoundsSel = (s.Object, [picks[0]])
-                    self._bounds_label.setText(tem_mod._bounds_desc(self.obj))
+                    self._bounds_label.setText(modal_mod._bounds_desc(self.obj))
                     self.obj.Document.recompute()
                     return
             QtWidgets.QMessageBox.information(
@@ -860,7 +860,7 @@ if _GUI_AVAILABLE:
 
         def _clear_bounds(self, *_):
             self.obj.BoundsSel = None
-            self._bounds_label.setText(tem_mod._bounds_desc(self.obj))
+            self._bounds_label.setText(modal_mod._bounds_desc(self.obj))
             self.obj.Document.recompute()
 
         def _commit(self, title):
@@ -889,7 +889,7 @@ if _GUI_AVAILABLE:
 
         def _on_compute(self, *_):
             self._commit("Wavesim: Edit SPICE TEM Port")
-            tem_mod.run_mode_solve(self.obj.Document, self.obj)
+            modal_mod.run_mode_solve(self.obj.Document, self.obj)
 
         def accept(self):
             self._commit("Wavesim: Edit SPICE TEM Port")

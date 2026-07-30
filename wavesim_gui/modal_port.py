@@ -15,9 +15,11 @@ matched continuation of the mode would carry,
 
     ``H_ghost = ±s · Y0 · (V̄ − 2a) · (n̂ × ê)``
 
-with ``V̄`` the time-centred modal voltage read back off the plane and ``a`` the
-drive. The ``−2a`` term makes one expression both radiate a forward wave of ``a``
-volts inward *and* absorb whatever returns.
+with ``V̄`` the modal voltage read back off the plane -- sampled at ``n + h_tau``,
+the same E<->H space-time offset ``dt/2 - dn/(2*v)`` the launch applies to its H
+sheet, not the naive time-centred ``½(Vⁿ+Vⁿ⁻¹)`` -- and ``a`` the drive. The
+``−2a`` term makes one expression both radiate a forward wave of ``a`` volts
+inward *and* absorb whatever returns.
 
 Two consequences shape this module:
 

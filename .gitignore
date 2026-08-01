@@ -14,6 +14,9 @@ wavesim/
 # Solver run output
 wavesim_results/
 
+# Report written by tools/check_conformal_fractions.py
+tools/conformal_fractions.txt
+
 # Unused image assets
 Resources/Gemini_Generated_Image_.png
 Resources/excitation.png

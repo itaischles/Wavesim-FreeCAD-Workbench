@@ -6,7 +6,9 @@ Session 3 replaces the hardcoded Session-2 material box with real CAD geometry.
 (one planar ``Shape.slice`` per Z-layer, then a vectorised point-in-polygon test
 of that cross-section over the layer's cell centres) to fill the per-cell
 ``eps``/``mu`` arrays and ``pec_mask`` the solver consumes via
-``set_material_arrays``.
+``set_material_arrays``. With ``conformal=True`` a PEC body additionally
+contributes the six Dey-Mittra open-fraction arrays (:data:`CONFORMAL_KEYS`), so
+the solver can integrate the cut geometry instead of a staircase.
 :func:`build_job_from_document` derives a grid that bounds all material bodies,
 voxelises into it, and returns a job spec plus the arrays to write as
 ``materials.npz``. Each future array-input concern (e.g. deferred array sources)
@@ -422,12 +424,247 @@ def _smooth_dielectric_body(arrays, body_shape, eps_r, mu_r,
         sub[covered] = False
 
 
+# --------------------------------------------------------------------------- #
+# Conformal (Dey-Mittra / PBA) PEC open fractions
+#
+# A staircased conductor is only first-order accurate and, on a coax modal port,
+# reads Z0 14% high and leaves a parasitic TE11 mode rattling between the ports
+# forever (see CONFORMAL_PEC_PLAN.md). The cure is to let the solver's Faraday
+# contour integrate the *cut* geometry, which needs six dimensionless arrays: the
+# fraction of each Yee E edge, and of each Yee H face, that is NOT inside metal.
+#
+# The geometric conventions are the solver's (``wavesim.grid.FDTDGrid``), and
+# there is exactly one definition of them across the process boundary:
+#
+#   pec_edge_open_x[i,j,k]  the Ex edge, node (i,j,k) -> (i+1,j,k)
+#   pec_face_open_z[i,j,k]  the Hz face, nodes (i..i+1, j..j+1) at z-node k
+#
+# Fractions, not metres: the solver multiplies by its own spacing arrays, so the
+# contract survives a graded grid.
+# --------------------------------------------------------------------------- #
+
+# The six ``materials.npz`` keys, in the order ``set_material_arrays`` takes them.
+CONFORMAL_KEYS = (
+    "pec_edge_open_x", "pec_edge_open_y", "pec_edge_open_z",
+    "pec_face_open_x", "pec_face_open_y", "pec_face_open_z",
+)
+
+# Sub-samples per coarse cell per axis when measuring the open fractions. Higher
+# than the subpixel smoother's 4 because an *edge* fraction is a mean of exactly
+# this many samples, so it is quantised to 1/oversample -- the quantity the whole
+# effort exists to resolve. The cost is not the cube of it (see
+# :func:`_conformal_pec_body`: only the node planes carry a full 2D sub-block).
+CONFORMAL_OVERSAMPLE = 8
+
+# Chord tolerance for the conformal sampler's section polygons, as a fraction of
+# the finest sub-cell width. Much tighter than the coarse sweep's 0.25*cell,
+# which turns a 3 mm conductor into a ~10-gon (inscribed radius 2.853 mm) -- an
+# error that would sit straight on top of the fractions and cap the accuracy
+# conformal PEC buys. Deliberately *not* applied to the coarse sweep: that would
+# move the binary pec_mask and break the "conformal off is bit-identical"
+# guarantee. A polygon's radius error is its deflection, so this is ~0.6% of a
+# coarse cell; tightening further costs polygon vertices, and matplotlib's
+# point-in-polygon is linear in them.
+_CONFORMAL_CHORD_FRACTION = 0.05
+
+
+def _interleaved_block(nodes_mm, os_, a, b):
+    """Sample coordinates for cells ``[a, b)``: ``(n, os_+1)``, node first.
+
+    Column 0 of row ``c`` is the coordinate of node ``a + c`` (the cell's low
+    edge); columns ``1..os_`` are the centres of its ``os_`` equal sub-intervals.
+
+    The two kinds of point are carried on one lattice because the six reductions
+    need both and need them *consistent*: an edge fraction is sub-centres along
+    the edge's own axis but exactly **on** nodes across it. That is why
+    :func:`wavesim_gui.subpixel.fine_axis` cannot serve here -- it places every
+    sample at a sub-centre, and no sub-centre is ever a node.
+    """
+    import numpy as np
+
+    nodes = np.asarray(nodes_mm, dtype=np.float64)
+    left = nodes[a:b]
+    width = nodes[a + 1:b + 1] - left
+    frac = np.concatenate([[0.0], (np.arange(os_) + 0.5) / os_])
+    return left[:, None] + frac[None, :] * width[:, None]
+
+
+def _dilate_band(mask):
+    """*mask* OR-ed with itself shifted +-1 cell along each axis (clamped)."""
+    import numpy as np
+
+    out = mask.copy()
+    for ax in range(3):
+        if mask.shape[ax] < 2:
+            continue
+        lo = [slice(None)] * 3
+        hi = [slice(None)] * 3
+        lo[ax] = slice(0, -1)
+        hi[ax] = slice(1, None)
+        out[tuple(lo)] |= mask[tuple(hi)]
+        out[tuple(hi)] |= mask[tuple(lo)]
+    return out
+
+
+def _conformal_pec_body(covered, body_shape, nodes_mm, span, os_, on_layer=None):
+    """Accumulate one PEC body's **covered** fractions into the six arrays.
+
+    *covered* holds the six ``(Nx, Ny, Nz)`` float arrays of covered (not open)
+    fraction; this body is merged in with a per-element ``maximum``. That is
+    exact for conductors that do not overlap -- the normal case, and the only one
+    with a well-posed answer -- and under-covers an edge shared by two
+    *overlapping* PEC solids, since a maximum is not a union. Fusing the solids
+    first would be exact and is a BREP boolean of unbounded cost, so it is not
+    done; a model that needs it should fuse in CAD.
+
+    *span* is ``((ia, ib), (ja, jb), (ka, kb))`` from :func:`_cell_span` with no
+    margin -- the half-open coarse block covering the body's bounding box.
+
+    Two passes:
+
+    1. **Node lattice** (``nk+1`` sections). A coarse cell whose eight corner
+       nodes agree is settled with no further work: all-inside contributes 1 to
+       all six fractions, all-outside contributes 0. Only *mixed* cells --
+       dilated one cell, so a surface passing between two corner samples is still
+       caught -- reach the fine pass. This is what keeps a PEC-heavy model
+       affordable; without it every conductor cell would be fine-sampled.
+       A feature thinner than a cell can slip the band entirely, which is the
+       sub-cell conductor the formulation cannot represent anyway.
+
+    2. **Fine lattice**, band cells only. Deliberately *not* the full
+       ``(os+1)^3`` block: which samples a plane needs depends on whether its z
+       coordinate is a node or a sub-centre.
+
+       - a **z-node** plane carries the three quantities with no z sub-sampling
+         (``edge_x``, ``edge_y``, ``face_z``) and needs the whole ``(os+1)^2``
+         xy block;
+       - a **z-sub** plane carries the other three (``edge_z``, ``face_x``,
+         ``face_y``), every one of which is at a node in x or in y, so it needs
+         only the ``2*os+1`` point *cross* through the cell's low corner.
+
+       That is ``~3*os^2`` samples per cell rather than ``os^3``.
+
+    ``on_layer()`` is called once per OCC section (progress + cancellation); a
+    truthy return raises :class:`VoxelizationCancelled`.
+    """
+    import numpy as np
+
+    nx_mm, ny_mm, nz_mm = nodes_mm
+    (ia, ib), (ja, jb), (ka, kb) = span
+    ni, nj, nk = ib - ia, jb - ja, kb - ka
+    if ni <= 0 or nj <= 0 or nk <= 0:
+        return
+
+    xb = _interleaved_block(nx_mm, os_, ia, ib)          # (ni, os_+1)
+    yb = _interleaved_block(ny_mm, os_, ja, jb)
+    zb = _interleaved_block(nz_mm, os_, ka, kb)
+
+    # Chord tolerance from the finest in-plane sub-cell in this block (see
+    # _CONFORMAL_CHORD_FRACTION).
+    def _min_sub(nodes, a, b):
+        w = np.diff(nodes[a:b + 1])
+        return (float(w.min()) / os_) if w.size else 1.0
+
+    df = min(_min_sub(nx_mm, ia, ib), _min_sub(ny_mm, ja, jb))
+    deflection = max(_CONFORMAL_CHORD_FRACTION * df, df * 1.0e-6)
+
+    Z_AXIS = FreeCAD.Vector(0.0, 0.0, 1.0)
+
+    def _tick():
+        if on_layer is not None and on_layer():
+            raise VoxelizationCancelled()
+
+    # ---------------- pass 1: node lattice -> the surface band -------------- #
+    xn, yn, zn = nx_mm[ia:ib + 1], ny_mm[ja:jb + 1], nz_mm[ka:kb + 1]
+    gx, gy = np.meshgrid(xn, yn, indexing="ij")
+    node_pts = np.column_stack([gx.ravel(), gy.ravel()])
+    node_in = np.zeros((ni + 1, nj + 1, nk + 1), dtype=bool)
+    for kk in range(nk + 1):
+        layer = _layer_inside(body_shape, Z_AXIS, float(zn[kk]),
+                              node_pts, deflection)
+        if layer is not None and layer.any():
+            node_in[:, :, kk] = layer.reshape(ni + 1, nj + 1)
+        _tick()
+
+    c = node_in
+    corners = (c[:-1, :-1, :-1], c[1:, :-1, :-1], c[:-1, 1:, :-1], c[1:, 1:, :-1],
+               c[:-1, :-1, 1:], c[1:, :-1, 1:], c[:-1, 1:, 1:], c[1:, 1:, 1:])
+    all_in = corners[0].copy()
+    any_in = corners[0].copy()
+    for arr in corners[1:]:
+        all_in &= arr
+        any_in |= arr
+    band = _dilate_band(any_in & ~all_in)
+
+    # A settled cell is fully covered exactly when all eight corners are inside;
+    # band cells are overwritten below.
+    local = {key: all_in.astype(np.float64) for key in CONFORMAL_KEYS}
+
+    # ---------------- pass 2: fine lattice over the band ------------------- #
+    bi, bj, bk = np.nonzero(band)
+    if bi.size:
+        for k in np.unique(bk):
+            sel = bk == k
+            ii, jj = bi[sel], bj[sel]
+            xs, ys = xb[ii], yb[jj]                      # (n, os_+1) each
+
+            # z-node plane: the full (os_+1)^2 xy sub-block per cell.
+            px = np.repeat(xs, os_ + 1, axis=1)
+            py = np.tile(ys, (1, os_ + 1))
+            pts = np.column_stack([px.ravel(), py.ravel()])
+            layer = _layer_inside(body_shape, Z_AXIS, float(zb[k, 0]),
+                                  pts, deflection)
+            _tick()
+            blk = (np.zeros((ii.size, os_ + 1, os_ + 1), dtype=bool)
+                   if layer is None else
+                   layer.reshape(ii.size, os_ + 1, os_ + 1))
+            local["pec_edge_open_x"][ii, jj, k] = blk[:, 1:, 0].mean(axis=1)
+            local["pec_edge_open_y"][ii, jj, k] = blk[:, 0, 1:].mean(axis=1)
+            local["pec_face_open_z"][ii, jj, k] = blk[:, 1:, 1:].mean(axis=(1, 2))
+
+            # z-sub planes: the 2*os_+1 point cross through the low corner --
+            # [0] node/node, [1:1+os_] x-node/y-sub, [1+os_:] x-sub/y-node.
+            px = np.concatenate([xs[:, :1], np.repeat(xs[:, :1], os_, axis=1),
+                                 xs[:, 1:]], axis=1)
+            py = np.concatenate([ys[:, :1], ys[:, 1:],
+                                 np.repeat(ys[:, :1], os_, axis=1)], axis=1)
+            pts = np.column_stack([px.ravel(), py.ravel()])
+            cross = np.zeros((ii.size, os_, 1 + 2 * os_), dtype=bool)
+            for m in range(os_):
+                layer = _layer_inside(body_shape, Z_AXIS, float(zb[k, m + 1]),
+                                      pts, deflection)
+                _tick()
+                if layer is not None and layer.any():
+                    cross[:, m, :] = layer.reshape(ii.size, 1 + 2 * os_)
+            local["pec_edge_open_z"][ii, jj, k] = cross[:, :, 0].mean(axis=1)
+            local["pec_face_open_x"][ii, jj, k] = (
+                cross[:, :, 1:1 + os_].mean(axis=(1, 2)))
+            local["pec_face_open_y"][ii, jj, k] = (
+                cross[:, :, 1 + os_:].mean(axis=(1, 2)))
+
+    for key in CONFORMAL_KEYS:
+        target = covered[key][ia:ib, ja:jb, ka:kb]
+        np.maximum(target, local[key], out=target)
+
+
+def conformal_layer_estimate(nk, os_):
+    """Upper bound on the OCC sections :func:`_conformal_pec_body` will cut.
+
+    ``nk + 1`` node planes always, plus ``1 + os_`` per cell layer that turns out
+    to hold a band cell. The band is unknown until the first pass has run, so
+    this over-counts for a body whose surface does not reach every layer -- a
+    progress bar that finishes early rather than one that overruns.
+    """
+    return (nk + 1) + nk * (1 + os_)
+
+
 def voxelize_materials(materials, cell_size_m,
                        spacing_lo_m=(0.0, 0.0, 0.0), spacing_hi_m=(0.0, 0.0, 0.0),
                        pad_lo=(8, 8, 8), pad_hi=(8, 8, 8),
                        extra_points_mm=(), extra_axis_offsets=(),
                        bg_eps=1.0, bg_mu=1.0, bg_pec=False,
                        nodes_m=None, subpixel=False, oversample=4,
+                       conformal=False, conformal_oversample=None,
                        max_total_cells=10_000_000, progress=None):
     """Voxelise *materials* onto a regular grid bounding all their bodies.
 
@@ -476,6 +713,21 @@ def voxelize_materials(materials, cell_size_m,
         Sub-samples per cell per axis used when ``subpixel=True`` (default 4).
         Higher is more accurate but costs ``O(oversample^3)`` setup memory/time
         per body's bounding box.
+    conformal : bool
+        When True, each **PEC** body additionally contributes to the six
+        conformal open-fraction arrays (:data:`CONFORMAL_KEYS`), which let the
+        solver's Faraday contour integrate the cut geometry instead of a
+        staircase. The arrays are returned only if some face is genuinely *cut*
+        (a fraction strictly between 0 and 1); an axis-aligned model that lands
+        on cell edges emits nothing and runs the untouched staircase path. A PEC
+        **background** material disables it outright -- a solid-metal domain has
+        no cut geometry, and the "a dielectric clears a PEC background where it
+        majority-covers a cell" rule has no conformal analogue. ``pec_mask`` is
+        produced exactly as before either way.
+    conformal_oversample : int, optional
+        Sub-samples per coarse cell per axis for the conformal fractions
+        (default :data:`CONFORMAL_OVERSAMPLE`). An edge fraction is the mean of
+        this many samples, so it is quantised to ``1/conformal_oversample``.
     bg_eps, bg_mu, bg_pec : float / float / bool
         The background medium filling every "empty" voxel -- the eps/mu/PEC of
         the Domain's chosen background Material (vacuum: ``1.0, 1.0, False``).
@@ -491,10 +743,17 @@ def voxelize_materials(materials, cell_size_m,
     Returns
     -------
     dict
-        ``arrays``  : the six ``eps``/``mu`` arrays + ``pec_mask`` (numpy).
+        ``arrays``  : the six ``eps``/``mu`` arrays + ``pec_mask`` (numpy), plus
+                      the six :data:`CONFORMAL_KEYS` arrays when *conformal* is
+                      on and the geometry actually cuts a face.
         ``grid``    : ``{Nx, Ny, Nz, dx, dy, dz}`` with spacings in metres.
         ``origin_m``: domain min corner in FreeCAD world metres.
-        ``counts``  : ``{dielectric_cells, pec_cells}`` for a quick sanity check.
+        ``counts``  : ``{dielectric_cells, pec_cells}`` for a quick sanity check,
+                      plus ``{cut_faces, min_open_face}`` for a conformal run.
+                      ``min_open_face`` is worth watching: the solver's
+                      small-cut stability threshold clamps every face below it,
+                      and a run whose smallest open face is far under the
+                      threshold is the case that has been measured to diverge.
     """
     import numpy as np
 
@@ -569,6 +828,17 @@ def voxelize_materials(materials, cell_size_m,
     else:
         ovr = (1, 1, 1)
 
+    # Conformal PEC: a solid-metal background has no cut geometry to measure, and
+    # the dielectric-clears-PEC composition rule the coarse sweep uses has no
+    # conformal counterpart -- so fall back to the staircase path rather than
+    # emit fractions that disagree with the mask.
+    conformal = bool(conformal) and not bool(bg_pec)
+    c_ovr = int(conformal_oversample or CONFORMAL_OVERSAMPLE)
+    covered = None
+    if conformal:
+        covered = {key: np.zeros(shape, dtype=np.float64)
+                   for key in CONFORMAL_KEYS}
+
     Z_AXIS = FreeCAD.Vector(0.0, 0.0, 1.0)
     tol = min(dx_mm, dy_mm, dz_mm) * 1.0e-6
     # Chord tolerance for turning curved section edges into polygons: a quarter
@@ -612,22 +882,41 @@ def voxelize_materials(materials, cell_size_m,
             n_layers = ovr[2] * (kb - ka)
         else:
             n_layers = len(k_idx)
-        plans.append((body_shape, eps, mu, pec, i_idx, j_idx, k_idx, smooth, span))
+        # A conformal PEC body pays for its binary sweep *and* the open-fraction
+        # sampler, which is a second, finer pass over its own (margin-free) span.
+        c_span = None
+        if conformal and pec:
+            c_span = (
+                _cell_span(nx_mm, bb.XMin, bb.XMax, margin=0),
+                _cell_span(ny_mm, bb.YMin, bb.YMax, margin=0),
+                _cell_span(nz_mm, bb.ZMin, bb.ZMax, margin=0),
+            )
+            n_layers += conformal_layer_estimate(c_span[2][1] - c_span[2][0],
+                                                 c_ovr)
+        plans.append((body_shape, eps, mu, pec, i_idx, j_idx, k_idx, smooth,
+                      span, c_span))
         total_layers += n_layers
 
     done_layers = 0
     if progress is not None:
         progress(0, total_layers)
-    for body_shape, eps, mu, pec, i_idx, j_idx, k_idx, smooth, span in plans:
+    def _on_layer():
+        nonlocal done_layers
+        done_layers += 1
+        return bool(progress is not None
+                    and progress(done_layers, total_layers))
+
+    for (body_shape, eps, mu, pec, i_idx, j_idx, k_idx, smooth,
+         span, c_span) in plans:
+        # Conformal open fractions for a PEC body, alongside (not instead of) the
+        # binary mask below: pec_mask stays in the contract as the fully-covered
+        # test and as the staircase path's own geometry.
+        if c_span is not None:
+            _conformal_pec_body(covered, body_shape, nodes_mm, c_span, c_ovr,
+                                on_layer=_on_layer)
         if smooth:
             # Subpixel dielectric: fine-sample the body over its bbox sub-block
             # and reduce to an anisotropic effective permittivity (in place).
-            def _on_layer():
-                nonlocal done_layers
-                done_layers += 1
-                return bool(progress is not None
-                            and progress(done_layers, total_layers))
-
             _smooth_dielectric_body(
                 arrays, body_shape, eps, mu, nodes_mm, span, ovr,
                 on_layer=_on_layer,
@@ -661,6 +950,28 @@ def voxelize_materials(materials, cell_size_m,
             if progress is not None and progress(done_layers, total_layers):
                 raise VoxelizationCancelled()
 
+    # Covered -> open, and only if the geometry genuinely cuts something. A model
+    # whose conductors land on cell edges produces 0/1 fractions everywhere: the
+    # conformal path would then reduce to the staircase one anyway, so emitting
+    # nothing keeps that run on the untouched (and faster) kernel.
+    counts = {
+        "dielectric_cells": int(np.count_nonzero(eps_x != float(bg_eps))),
+        "pec_cells": int(np.count_nonzero(pec_mask)),
+    }
+    if covered is not None:
+        faces = [np.clip(1.0 - covered[key], 0.0, 1.0)
+                 for key in CONFORMAL_KEYS[3:]]
+        cut = sum(int(np.count_nonzero((f > 0.0) & (f < 1.0))) for f in faces)
+        if cut:
+            for key in CONFORMAL_KEYS:
+                arrays[key] = np.clip(1.0 - covered[key], 0.0, 1.0)
+            open_faces = [f[f > 0.0] for f in faces]
+            open_faces = [f for f in open_faces if f.size]
+            counts["cut_faces"] = cut
+            counts["min_open_face"] = (
+                float(min(f.min() for f in open_faces)) if open_faces else 1.0
+            )
+
     grid_dict = {
         "Nx": Nx, "Ny": Ny, "Nz": Nz,
         "dx": dx_mm / _MM_PER_M,
@@ -683,11 +994,43 @@ def voxelize_materials(materials, cell_size_m,
         "arrays": arrays,
         "grid": grid_dict,
         "origin_m": (ox / _MM_PER_M, oy / _MM_PER_M, oz / _MM_PER_M),
-        "counts": {
-            "dielectric_cells": int(np.count_nonzero(eps_x != float(bg_eps))),
-            "pec_cells": int(np.count_nonzero(pec_mask)),
-        },
+        "counts": counts,
     }
+
+
+def _report_conformal(active, counts, threshold):
+    """Console report after a voxelisation that asked for conformal PEC.
+
+    Says whether it took effect and, when it did, prints the two numbers that
+    predict trouble. ``min_open_face`` is the important one: the solver clamps
+    every face below *threshold* to keep ``dt`` untouched, and a run whose
+    smallest cut is far under it is the case measured to diverge -- with the
+    nasty property that stability is **not** monotone in resolution, so a finer
+    mesh is no guarantee. Warning here costs nothing and is the only notice the
+    user gets before a run that ends in NaN.
+    """
+    if not active:
+        FreeCAD.Console.PrintWarning(
+            "Wavesim: conformal PEC was requested but is not in effect "
+            "(no conductor cuts a cell, or the background material is PEC). "
+            "Running staircased.\n"
+        )
+        return
+    cut = counts.get("cut_faces", 0)
+    smallest = counts.get("min_open_face", 1.0)
+    FreeCAD.Console.PrintMessage(
+        "Wavesim: conformal PEC on -- {:,} cut faces, smallest open fraction "
+        "{:.4f} (clamp threshold {:.2f}).\n".format(cut, smallest, threshold)
+    )
+    if smallest < 0.1 * threshold:
+        FreeCAD.Console.PrintWarning(
+            "Wavesim: the smallest cut cell is far below the clamp threshold "
+            "({:.4f} vs {:.2f}). Conformal runs have been seen to diverge in "
+            "this regime; if this one does, raise the Simulation's "
+            "ConformalAreaThreshold (towards 0.5) rather than refining the "
+            "mesh -- stability is not monotone in resolution.\n".format(
+                smallest, threshold)
+        )
 
 
 def write_materials(workdir, arrays):
@@ -787,6 +1130,11 @@ def build_job_from_document(doc, steps=None, fmax=30.0e9, progress=None):
     # container's checkbox is cleared (default True, and True for legacy
     # documents that predate the property).
     subpixel = bool(getattr(sim, "SubpixelSmoothing", True))
+    # Conformal (Dey-Mittra) PEC: off unless the Simulation asks for it, and off
+    # for legacy documents that predate the property.
+    from wavesim_gui.commands import conformal_pec
+
+    want_conformal, area_threshold = conformal_pec(sim)
     # Grow the grid to include every source position and snapshot slice, so an
     # input outside the material bounds (or in the PML) still lands inside it.
     vox = voxelize_materials(
@@ -796,9 +1144,18 @@ def build_job_from_document(doc, steps=None, fmax=30.0e9, progress=None):
         extra_points_mm=source_points_mm(sim),
         extra_axis_offsets=snapshot_axis_offsets(sim),
         bg_eps=bg_eps, bg_mu=bg_mu, bg_pec=bg_pec,
-        nodes_m=nodes_m, subpixel=subpixel,
+        nodes_m=nodes_m, subpixel=subpixel, conformal=want_conformal,
         progress=progress,
     )
+    # What actually ran, not what was asked for: the fractions are absent when
+    # the geometry cuts nothing (an axis-aligned model), when the background is
+    # itself PEC, or when there are no conductors at all -- and in every one of
+    # those cases the run is the ordinary staircase one. The runner echoes this
+    # into summary.json and keys its backend choice off it, so it has to be the
+    # truth rather than the request.
+    conformal = all(key in vox["arrays"] for key in CONFORMAL_KEYS)
+    if want_conformal:
+        _report_conformal(conformal, vox["counts"], area_threshold)
     grid = vox["grid"]
     Nx, Ny, Nz = grid["Nx"], grid["Ny"], grid["Nz"]
     dx, dy, dz = grid["dx"], grid["dy"], grid["dz"]
@@ -891,9 +1248,12 @@ def build_job_from_document(doc, steps=None, fmax=30.0e9, progress=None):
         "grid": grid,
         # Run provenance, echoed into summary.json by the runner alongside
         # backend/pml_faces: whether this run's dielectric boundaries were
-        # smoothed. Records what actually ran, which the Simulation container
-        # cannot answer later once the user flips the checkbox.
+        # smoothed, and whether its conductors were cut cells. Records what
+        # actually ran, which the Simulation container cannot answer later once
+        # the user flips a checkbox.
         "subpixel": subpixel,
+        "conformal_pec": conformal,
+        "conformal_area_threshold": area_threshold,
         "boundary": {
             "d_pml": int(d_pml),
             "faces": pml_faces,

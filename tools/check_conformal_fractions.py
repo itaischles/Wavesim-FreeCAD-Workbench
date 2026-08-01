@@ -1,0 +1,284 @@
+# -*- coding: utf-8 -*-
+"""Phase-5 gate: the voxeliser's conformal PEC fractions vs the analytic coax.
+
+Run under **FreeCAD's bundled Python** (it needs ``Part``), not the solver conda
+Python::
+
+    "%LOCALAPPDATA%\\Programs\\FreeCAD 1.1\\bin\\freecadcmd.exe" \\
+        tools/check_conformal_fractions.py
+
+Builds the reference coax of ``CONFORMAL_PEC_PLAN.md`` section 7 (a = 3 mm,
+b = 9 mm, cell 0.5 mm) out of ``Part`` solids, voxelises it with
+``conformal=True``, and compares all six open-fraction arrays against a
+closed-form answer written here **independently of the voxeliser**. The maths
+mirrors the solver's ``tests/conformal_shapes.py`` but is driven by node arrays
+rather than an ``FDTDGrid``, so this side needs no ``import wavesim``.
+
+It reports three things, in descending order of importance:
+
+1. **Killed faces.** A face whose open fraction rounds to exactly 0 tells the
+   solver "no contour" (``inv_A = 0``), which is the small-cut remedy S4
+   measured as harmful (+5.77% against +0.21% for clamping). It is only safe
+   when all four of its contour edges are covered too, so the tally that matters
+   is faces killed while a contour edge is still live.
+2. **Per-array error** against the closed form, next to the staircase each
+   fraction would otherwise have been.
+3. **V2 at the voxeliser** — conformal off emits no extra keys and leaves the
+   binary arrays bit-identical.
+
+``freecadcmd`` swallows ``stdout``, so the report is also written to
+``tools/conformal_fractions.txt``. Note that it does **not** read ``sys.argv``:
+``freecadcmd`` puts the script's own path in ``argv[1]``, so a naive
+"output file" argument overwrites this source file with its own report.
+Set ``CONFORMAL_REPORT`` to redirect it, ``CONFORMAL_OVERSAMPLE`` to change the
+sampling density.
+"""
+
+import os
+import sys
+import time
+
+import numpy as np
+import FreeCAD
+import Part
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+from wavesim_gui import voxelize as vox                        # noqa: E402
+
+A_MM, B_MM, OUT_MM = 3.0, 9.0, 15.0
+D_MM = 0.5
+N = 36                      # transverse cells -> 18 mm across, coax on node 18
+NZ = 3                      # z-invariant, so a few layers prove the whole line
+CX = CY = 9.0
+
+_report = []
+
+
+def emit(line=""):
+    _report.append(line)
+    FreeCAD.Console.PrintMessage(line + "\n")
+
+
+# --------------------------------------------------------------------------- #
+# Analytic reference — closed form, independent of the voxeliser
+# --------------------------------------------------------------------------- #
+
+def _ann_len(u0, u1, v, r0, r1):
+    """Length of ``[u0, u1]`` at offset *v* lying in the annulus ``r0<=r<=r1``.
+
+    ``r >= r0`` iff ``|u| >= sqrt(r0^2 - v^2)`` and ``r <= r1`` iff
+    ``|u| <= sqrt(r1^2 - v^2)``, so the set is the interval pair ``+-[s, t]``.
+    """
+    v2 = v * v
+    if v2 > r1 * r1:
+        return 0.0
+    t = np.sqrt(max(r1 * r1 - v2, 0.0))
+    s = np.sqrt(max(r0 * r0 - v2, 0.0))
+
+    def ov(lo, hi):
+        return max(0.0, min(u1, hi) - max(u0, lo))
+
+    return ov(s, t) + ov(-t, -s)
+
+
+def _covered_len(u0, u1, v):
+    """Metal is the inner conductor ``r < a`` plus the shield ``b < r < OUT``."""
+    return _ann_len(u0, u1, v, 0.0, A_MM) + _ann_len(u0, u1, v, B_MM, OUT_MM)
+
+
+def _covered_pt(x, y):
+    r = np.hypot(x, y)
+    return (r < A_MM) | ((r > B_MM) & (r < OUT_MM))
+
+
+def analytic(nodes_mm, nsub=256):
+    """The six open-fraction arrays for the coax, in closed form where possible.
+
+    z-invariance buys an exactness a general sampler could not: the Hx face
+    spans (y, z) at x-node i and the geometry does not vary in z, so its open
+    *area* fraction equals the open *length* fraction of the Ey edge at the same
+    (i, j). Likewise Hy and Ex. Only the Hz face genuinely needs two dimensions.
+    """
+    nx, ny, nz = nodes_mm
+    Nx, Ny, Nz = nx.size - 1, ny.size - 1, nz.size - 1
+    x, y = nx - CX, ny - CY
+    shape = (Nx, Ny, Nz)
+
+    fx = np.zeros(shape)
+    fy = np.zeros(shape)
+    for i in range(Nx):
+        dxi = nx[i + 1] - nx[i]
+        for j in range(Ny):
+            dyj = ny[j + 1] - ny[j]
+            fx[i, j, :] = 1.0 - _covered_len(x[i], x[i + 1], y[j]) / dxi
+            fy[i, j, :] = 1.0 - _covered_len(y[j], y[j + 1], x[i]) / dyj
+
+    # Ez runs along z at fixed (x, y), so r is constant on it: all in or all out.
+    # The solids overhang the grid in z, so there is no end effect.
+    fz = np.broadcast_to(
+        (~_covered_pt(x[:Nx, None], y[None, :Ny]))[:, :, None], shape
+    ).astype(float)
+
+    faz = np.zeros(shape)
+    q = (np.arange(nsub) + 0.5) / nsub
+    for i in range(Nx):
+        xs = x[i] + q * (nx[i + 1] - nx[i])
+        for j in range(Ny):
+            ys = y[j] + q * (ny[j + 1] - ny[j])
+            faz[i, j, :] = np.mean(~_covered_pt(xs[:, None], ys[None, :]))
+
+    return {
+        "pec_edge_open_x": np.clip(fx, 0, 1),
+        "pec_edge_open_y": np.clip(fy, 0, 1),
+        "pec_edge_open_z": fz,
+        "pec_face_open_x": np.clip(fy, 0, 1),
+        "pec_face_open_y": np.clip(fx, 0, 1),
+        "pec_face_open_z": faz,
+    }
+
+
+# --------------------------------------------------------------------------- #
+# Geometry — duck-typed stand-ins for the Material / body document objects
+# --------------------------------------------------------------------------- #
+
+class _Body(object):
+    def __init__(self, shape):
+        self.Shape = shape
+
+
+class _Mat(object):
+    def __init__(self, bodies, pec):
+        self.Bodies = bodies
+        self.Pec = pec
+        self.Eps = 1.0
+        self.Mu = 1.0
+
+
+def build():
+    """Inner conductor + shield, both overhanging the grid in z."""
+    base = FreeCAD.Vector(CX, CY, -1.0)
+    inner = Part.makeCylinder(A_MM, 6.0, base)
+    shield = Part.makeCylinder(OUT_MM, 6.0, base).cut(
+        Part.makeCylinder(B_MM, 8.0, FreeCAD.Vector(CX, CY, -2.0)))
+    return _Mat([_Body(inner), _Body(shield)], True)
+
+
+# --------------------------------------------------------------------------- #
+
+def main(out_path):
+    nodes_mm = (np.arange(N + 1) * D_MM,
+                np.arange(N + 1) * D_MM,
+                np.arange(NZ + 1) * D_MM)
+    nodes_m = tuple(a / 1000.0 for a in nodes_mm)
+    cell = (D_MM / 1000.0,) * 3
+    ovr = int(os.environ.get("CONFORMAL_OVERSAMPLE", vox.CONFORMAL_OVERSAMPLE))
+
+    t0 = time.time()
+    on = vox.voxelize_materials([build()], cell, nodes_m=nodes_m,
+                                subpixel=False, conformal=True,
+                                conformal_oversample=ovr)
+    elapsed = time.time() - t0
+    got = on["arrays"]
+
+    emit("reference coax  a=%.0f b=%.0f mm, cell %.3f mm, %dx%dx%d"
+         % (A_MM, B_MM, D_MM, N, N, NZ))
+    emit("oversample %d, voxelised in %.2f s" % (ovr, elapsed))
+    emit("counts: %s" % (on["counts"],))
+    emit()
+
+    missing = [k for k in vox.CONFORMAL_KEYS if k not in got]
+    if missing:
+        emit("FAIL: fraction arrays not emitted: %s" % missing)
+        return 1
+
+    # -- V2 at the voxeliser -------------------------------------------------
+    off = vox.voxelize_materials([build()], cell, nodes_m=nodes_m,
+                                 subpixel=False)
+    extra = [k for k in vox.CONFORMAL_KEYS if k in off["arrays"]]
+    staircase_same = all(
+        np.array_equal(off["arrays"][k], got[k])
+        for k in ("eps_x", "eps_y", "eps_z", "mu_x", "mu_y", "mu_z", "pec_mask")
+    )
+    emit("V2  conformal off emits no fraction keys : %s" % (not extra))
+    emit("V2  binary arrays identical either way   : %s" % staircase_same)
+    ok = (not extra) and staircase_same
+
+    # -- killed faces --------------------------------------------------------
+    ref = analytic(nodes_mm)
+    ex, ey, ez = (got["pec_edge_open_x"], got["pec_edge_open_y"],
+                  got["pec_edge_open_z"])
+
+    def live4(a, b, c, d):
+        return (a > 0) | (b > 0) | (c > 0) | (d > 0)
+
+    o = (slice(0, -1),) * 3
+    contour = {
+        # Hx: Ey[i,j,k], Ey[i,j,k+1], Ez[i,j,k], Ez[i,j+1,k]
+        "pec_face_open_x": live4(ey[o], ey[:-1, :-1, 1:],
+                                 ez[o], ez[:-1, 1:, :-1]),
+        # Hy: Ez[i,j,k], Ez[i+1,j,k], Ex[i,j,k], Ex[i,j,k+1]
+        "pec_face_open_y": live4(ez[o], ez[1:, :-1, :-1],
+                                 ex[o], ex[:-1, :-1, 1:]),
+        # Hz: Ex[i,j,k], Ex[i,j+1,k], Ey[i,j,k], Ey[i+1,j,k]
+        "pec_face_open_z": live4(ex[o], ex[:-1, 1:, :-1],
+                                 ey[o], ey[1:, :-1, :-1]),
+    }
+    emit()
+    for key, live in contour.items():
+        killed = (got[key][o] == 0.0) & live
+        worst = float(ref[key][o][killed].max()) if killed.any() else 0.0
+        emit("%-18s killed with a live contour edge: %5d "
+             "(true open fraction up to %.4f)"
+             % (key, int(np.count_nonzero(killed)), worst))
+        # A tally is fine as long as those faces really have no open area; a
+        # genuinely cut face killed this way is the S4 failure mode.
+        ok = ok and worst < 1.0e-9
+
+    # -- accuracy ------------------------------------------------------------
+    emit()
+    emit("%-20s %10s %10s %10s" % ("array", "max err", "rms err", "cut cells"))
+    for key in vox.CONFORMAL_KEYS:
+        d = np.abs(got[key] - ref[key])
+        emit("%-20s %10.4f %10.5f %10d"
+             % (key, d.max(), np.sqrt((d ** 2).mean()),
+                int(np.count_nonzero((ref[key] > 0) & (ref[key] < 1)))))
+
+    ref_all = np.concatenate([ref[k].ravel() for k in vox.CONFORMAL_KEYS])
+    got_all = np.concatenate([got[k].ravel() for k in vox.CONFORMAL_KEYS])
+    emit()
+    emit("rms vs analytic : voxeliser %.5f   staircase %.5f"
+         % (np.sqrt(((got_all - ref_all) ** 2).mean()),
+            np.sqrt(((np.round(ref_all) - ref_all) ** 2).mean())))
+    emit("min open face   : voxeliser %.5f   analytic %.5f"
+         % (min(got[k][got[k] > 0].min() for k in vox.CONFORMAL_KEYS[3:]),
+            min(ref[k][ref[k] > 0].min() for k in vox.CONFORMAL_KEYS[3:])))
+
+    # -- remaining whole-element disagreements -------------------------------
+    # Expected: the nodes sitting *exactly* on the shield wall (r = b). Whether
+    # a surface-tangent Ez edge counts as covered is a measure-zero tie; the
+    # voxeliser zeroes it, which is right on its own terms (that Ez is
+    # tangential to the conductor, so it must vanish there anyway).
+    emit()
+    emit("whole-element disagreements (index, r/mm, got, ref):")
+    for key in vox.CONFORMAL_KEYS:
+        bad = np.argwhere(np.abs(got[key] - ref[key]) > 0.5)
+        for (i, j, k) in bad[:8]:
+            emit("  %-18s (%2d,%2d,%d) r=%7.4f got=%.3f ref=%.3f"
+                 % (key, i, j, k,
+                    np.hypot(nodes_mm[0][i] - CX, nodes_mm[1][j] - CY),
+                    got[key][i, j, k], ref[key][i, j, k]))
+        if len(bad) > 8:
+            emit("  %-18s ... %d more" % (key, len(bad) - 8))
+
+    emit()
+    emit("RESULT: %s" % ("PASS" if ok else "FAIL"))
+    with open(out_path, "w", encoding="utf-8") as fh:
+        fh.write("\n".join(_report) + "\n")
+    return 0 if ok else 1
+
+
+sys.exit(main(os.environ.get(
+    "CONFORMAL_REPORT",
+    os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                 "conformal_fractions.txt"))))

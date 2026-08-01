@@ -29,7 +29,22 @@ job.json schema (Session 2)
                                               # is present, else 'numba' (see
                                               # _resolve_backend). The GPU path
                                               # allocates the grid as float32.
+                                              # 'auto' never picks CUDA for a
+                                              # conformal job: that backend
+                                              # refuses cut-cell geometry.
       "steps": 1000,
+      "conformal_pec": false,       # did this job's voxelisation produce the six
+                                    # pec_*_open_* arrays in materials.npz? What
+                                    # actually ran, not what the user asked for
+                                    # (the workbench falls back to staircase when
+                                    # nothing is cut or the background is PEC).
+                                    # Read *before* materials.npz is opened,
+                                    # because it steers the backend and so the
+                                    # grid dtype.
+      "conformal_area_threshold": 0.4,  # optional; smallest open area fraction an
+                                    # H face may have before it is clamped, which
+                                    # is what keeps a sliver cut cell stable at
+                                    # fixed dt. Ignored without the arrays.
       "grid":   {"Nx":.., "Ny":.., "Nz":.., "dx":.., "dy":.., "dz":..,
                  "x":[..], "y":[..], "z":[..]},  # optional node-coordinate
                  # arrays (metres, solver frame, strictly increasing, N+1 nodes
@@ -107,11 +122,23 @@ job.json schema (Session 2)
       }
     }
 
+materials.npz holds ``eps_x/y/z``, ``mu_x/y/z`` and an optional ``pec_mask``,
+plus — for a conformal PEC run — the six ``pec_edge_open_x/y/z`` and
+``pec_face_open_x/y/z`` arrays: the dimensionless fraction of each Yee E edge /
+H face **not** inside a conductor. Fractions rather than metres, so the solver
+multiplies by its own spacing arrays and the geometry keeps a single owner. All
+six or none (a partial set is refused): with them the solver integrates the cut
+contour, without them it staircases exactly as before. ``pec_mask`` stays in
+either case, but is only *read* on the staircase path.
+
 results.npz holds the recorded monitor series (e.g. ``energy_times`` /
 ``energy_values`` for the whole grid, ``energy_interior_*`` for the PML-free
 interior); summary.json holds scalar run metadata (dt, steps, wall time, grid
 dims, voxel counts, and ``<key>_final``/``<key>_max`` per recorded energy
-region). A snapshot stores one frame stack per recorded component (``snapshot_<idx>_<comp>_data``, e.g. ``snapshot_0_Ex_data``)
+region). It also echoes ``conformal_pec`` — read off the *grid*, so it records
+what the conductors actually were rather than what the job asked for — and, for
+a conformal run, ``cut_cells``, ``clamped_faces`` and the
+``conformal_area_threshold`` in force. A snapshot stores one frame stack per recorded component (``snapshot_<idx>_<comp>_data``, e.g. ``snapshot_0_Ex_data``)
 plus the ``snapshot_<idx>_times`` and the two in-plane node/edge coordinate arrays
 (``snapshot_<idx>_edges0`` / ``_edges1``, metres, solver frame) they share; its
 summary entry lists the ``field`` and the ``components`` actually saved. The
@@ -264,6 +291,15 @@ def _emit_status(message):
 # Backend selection — pick the fastest available update-kernel backend
 # --------------------------------------------------------------------------- #
 
+# The conformal (Dey-Mittra) PEC open-fraction arrays in materials.npz, in the
+# order wavesim.set_material_arrays takes them. Written by the FreeCAD-side
+# voxeliser; all six or none.
+_CONFORMAL_KEYS = (
+    "pec_edge_open_x", "pec_edge_open_y", "pec_edge_open_z",
+    "pec_face_open_x", "pec_face_open_y", "pec_face_open_z",
+)
+
+
 def _cuda_available():
     """Return ``True`` when a CUDA GPU usable by the solver is present.
 
@@ -282,7 +318,7 @@ def _cuda_available():
         return False
 
 
-def _resolve_backend(requested):
+def _resolve_backend(requested, conformal=False):
     """Resolve a job's requested backend string to a concrete backend name.
 
     ``'auto'`` (the workbench default) becomes ``'cuda'`` when a CUDA GPU is
@@ -292,10 +328,21 @@ def _resolve_backend(requested):
     it is missing. FreeCAD's Python cannot make this choice (it cannot import
     numba), which is why the ``'auto'`` sentinel is resolved here on the solver
     side rather than when the job is written.
+
+    **Conformal PEC is not implemented on CUDA and the backend refuses it**
+    rather than silently staircasing (its H update would integrate the full face
+    area while E is masked by the cut geometry — a wrong answer that looks like a
+    working run). Since the workbench ships ``'auto'``, every conformal run on a
+    GPU box would otherwise die at the first H update, so ``'auto'`` resolves to
+    ``'numba'`` for a conformal job. An explicit ``'cuda'`` is left alone: the
+    user named the GPU, and the solver's own ``NotImplementedError`` says far
+    more than a silent downgrade would.
     """
     requested = (requested or "auto").lower()
     if requested != "auto":
         return requested
+    if conformal:
+        return "numba"
     return "cuda" if _cuda_available() else "numba"
 
 
@@ -871,8 +918,14 @@ def run_job(workdir):
     # cards, so the choice drives the grid dtype. Mode-only jobs never run the
     # FDTD loop (the backend is unused) and their mode solve is more accurate in
     # double precision, so they stay float64 / numba regardless.
+    # The conformal flag has to come from the job, not from materials.npz: this
+    # runs before the arrays are opened, because the backend choice is what sets
+    # the grid dtype. The workbench writes it as what actually got voxelised, not
+    # as what the checkbox said, so it is safe to key on.
     mode_only = bool(job.get("mode_only", False))
-    backend = "numba" if mode_only else _resolve_backend(job.get("backend", "auto"))
+    conformal = bool(job.get("conformal_pec", False))
+    backend = ("numba" if mode_only
+               else _resolve_backend(job.get("backend", "auto"), conformal))
     field_dtype = np.float32 if backend == "cuda" else np.float64
 
     # Importing the solver pulls in numba/scipy and, on a cold interpreter, can
@@ -908,6 +961,20 @@ def run_job(workdir):
     if os.path.isfile(materials_path):
         data = np.load(materials_path)
         pec_mask = data["pec_mask"] if "pec_mask" in data.files else None
+        # Conformal (Dey-Mittra) PEC open fractions: all six or none, which the
+        # solver enforces (a partial set would mix conformal edges with staircase
+        # faces, and E and H would see different conductors). Absent -> every
+        # existing path is untouched and bit-identical. Left in float64 whatever
+        # the field dtype is: they are geometry, not field data, and the solver
+        # multiplies them by its own float64 spacing arrays.
+        conformal_arrays = {}
+        if all(key in data.files for key in _CONFORMAL_KEYS):
+            conformal_arrays = {key: data[key] for key in _CONFORMAL_KEYS}
+        elif any(key in data.files for key in _CONFORMAL_KEYS):
+            raise ValueError(
+                "materials.npz carries an incomplete set of conformal PEC "
+                "arrays: {}. All six or none.".format(
+                    sorted(set(_CONFORMAL_KEYS) & set(data.files))))
         # Cast to the grid's dtype so the field and material arrays stay
         # matched — the CUDA backend keys its per-cell arithmetic and scalar
         # coefficients off the field dtype, so a float32 grid needs float32
@@ -922,10 +989,44 @@ def run_job(workdir):
             data["mu_y"].astype(field_dtype, copy=False),
             data["mu_z"].astype(field_dtype, copy=False),
             pec_mask=pec_mask,
+            conformal_area_threshold=(
+                float(job["conformal_area_threshold"])
+                if conformal_arrays and "conformal_area_threshold" in job
+                else None),
+            **conformal_arrays
         )
         if pec_mask is not None:
             voxel_summary["pec_cells"] = int(np.count_nonzero(pec_mask))
         voxel_summary["dielectric_cells"] = int(np.count_nonzero(data["eps_x"] != 1.0))
+        if grid.is_conformal and backend == "cuda":
+            # The solver's own guard (backend_cuda._refuse_conformal) sits in the
+            # per-call update_H wrapper, but Simulation.run('cuda') dispatches to
+            # the resident-memory path (CudaResident) and never reaches it — so a
+            # cut-cell grid runs on the GPU staircased, with H integrating the
+            # full face area while E is masked by the cut geometry. That is a
+            # silently wrong answer, which is the one outcome the guard exists to
+            # prevent, so refuse here too rather than trust it. 'auto' never gets
+            # this far (see _resolve_backend); reaching it means the backend was
+            # asked for by name.
+            raise NotImplementedError(
+                "backend='cuda' cannot run conformal (Dey-Mittra) PEC: the GPU "
+                "kernels only implement the staircase H update, so the run "
+                "would be silently wrong rather than merely slow. Use "
+                "backend='numba' (or 'numpy'), or turn off the Simulation's "
+                "ConformalPEC to run staircased.")
+        if grid.is_conformal:
+            voxel_summary["cut_cells"] = int(ws.count_cut_cells(grid))
+            voxel_summary["conformal_area_threshold"] = float(
+                grid.conformal_area_threshold)
+            # Every clamped face is a cut the run only partly resolved, and a
+            # large share of them is the signature of the small-cut instability.
+            voxel_summary["clamped_faces"] = int(
+                ws.conformal_geometry(grid).n_clamped)
+            _emit_status(
+                "Conformal PEC: {:,} cut cells, {:,} clamped faces "
+                "(threshold {:.2f})".format(
+                    voxel_summary["cut_cells"], voxel_summary["clamped_faces"],
+                    grid.conformal_area_threshold))
 
     # Ports: solve each port plane's transverse mode. Done after the materials are
     # loaded (the mode solve reads the grid's own eps/mu/PEC) and before the FDTD
@@ -1228,6 +1329,11 @@ def run_job(workdir):
         "pml_faces": list(pml_faces),
         "pec_faces": list(pec_faces),
         "subpixel": bool(job.get("subpixel", False)),
+        # Read off the grid, not the job: this is what the run's conductors
+        # actually were. The job's request can go unhonoured (an incomplete or
+        # absent array set falls back to staircase), and a stored result that
+        # claims conformal when it staircased is worse than no field at all.
+        "conformal_pec": bool(grid.is_conformal),
     }
     summary.update(voxel_summary)
     # Per recorded region: <key>_final / <key>_max, so a run recording both the

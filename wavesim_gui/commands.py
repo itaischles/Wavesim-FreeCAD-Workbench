@@ -130,6 +130,8 @@ class SimulationContainer:
             )
             obj.SubpixelSmoothing = True
 
+        _ensure_conformal_props(obj)
+
     def onDocumentRestored(self, obj):
         # Re-assert the back-reference after a reload.
         obj.Proxy = self
@@ -143,6 +145,7 @@ class SimulationContainer:
         # Drop the retired mode-convergence properties from documents that carry
         # them (see :func:`_drop_mode_convergence_props`).
         _drop_mode_convergence_props(obj)
+        _ensure_conformal_props(obj)
         # Documents created before the Domain was ordered first still have it
         # after the child groups; hoist it so it sits directly under Simulation.
         _ensure_domain_first(obj)
@@ -237,6 +240,67 @@ def _drop_mode_convergence_props(obj):
                 obj.removeProperty(prop)
             except Exception:
                 pass
+
+
+# Small-cut area threshold handed to the solver with conformal PEC. Matches
+# ``wavesim.grid.FDTDGrid.conformal_area_threshold``; see below for why it is
+# not a panel control.
+CONFORMAL_AREA_THRESHOLD = 0.4
+
+
+def _ensure_conformal_props(obj):
+    """Add the conformal-PEC properties to *obj* if it does not carry them.
+
+    Idempotent, and called from ``__init__``, ``onDocumentRestored`` and the task
+    panel, so a document saved before the feature existed picks them up without
+    the caller having to know which.
+
+    ``ConformalPEC`` is **off by default**, unlike ``SubpixelSmoothing``. The
+    solver's small-cut stability threshold is not yet safe on arbitrary geometry
+    -- the reference coax diverges at one cell size and not at the next finer one
+    -- so this stays opt-in until that closes (S7 in CONFORMAL_PEC_PLAN.md).
+
+    ``ConformalAreaThreshold`` deliberately gets **no panel row**. It is the
+    lever for that same unresolved problem, and a spin box in the main panel
+    would ask every user to have an opinion about cut-cell stability; leaving it
+    in the property editor puts it where someone chasing a divergence will find
+    it and nowhere else.
+    """
+    if not hasattr(obj, "ConformalPEC"):
+        obj.addProperty(
+            "App::PropertyBool", "ConformalPEC", "Run",
+            "Treat PEC conductors as conformal (Dey-Mittra) cut cells instead "
+            "of staircased whole cells: the solver integrates each partly "
+            "covered Yee face over its open area. Fixes the O(h) impedance "
+            "error and the parasitic higher-order mode a staircased conductor "
+            "launches at a modal port. Dielectrics are unaffected.",
+        )
+        obj.ConformalPEC = False
+    if not hasattr(obj, "ConformalAreaThreshold"):
+        obj.addProperty(
+            "App::PropertyFloat", "ConformalAreaThreshold", "Run",
+            "Conformal PEC only: the smallest open area fraction an H face may "
+            "have before it is clamped, which is what keeps a sliver cut cell "
+            "from destabilising the run at fixed dt. Raise it (towards 0.5) if "
+            "a conformal run diverges; lowering it costs stability, not just "
+            "accuracy.",
+        )
+        obj.ConformalAreaThreshold = CONFORMAL_AREA_THRESHOLD
+
+
+def conformal_pec(sim):
+    """``(enabled, area_threshold)`` for *sim* -- the conformal PEC settings.
+
+    Legacy documents that predate the properties read as off, which is also the
+    default, so nothing changes for them.
+    """
+    if sim is None:
+        return False, CONFORMAL_AREA_THRESHOLD
+    threshold = float(getattr(sim, "ConformalAreaThreshold",
+                              CONFORMAL_AREA_THRESHOLD))
+    if not 0.0 <= threshold < 1.0:
+        threshold = CONFORMAL_AREA_THRESHOLD
+    return bool(getattr(sim, "ConformalPEC", False)), threshold
 
 
 # --------------------------------------------------------------------------- #
@@ -370,12 +434,30 @@ if _GUI_AVAILABLE:
                 "conductors are unaffected."
             )
 
+            # Conformal (cut-cell) PEC. Off by default -- see
+            # _ensure_conformal_props for why this one is opt-in.
+            self._conformal = QtWidgets.QCheckBox(
+                "Conformal (cut-cell) PEC conductors"
+            )
+            self._conformal.setChecked(bool(getattr(obj, "ConformalPEC", False)))
+            self._conformal.setToolTip(
+                "Let the solver integrate each partly covered Yee face over its "
+                "open area instead of staircasing conductors to whole cells. "
+                "Fixes the first-order impedance error and the parasitic "
+                "higher-order mode a staircased conductor launches at a modal "
+                "port; a modal port's Z0 is then the conformal one.\n\n"
+                "Costs voxelisation time (conductor surfaces are fine-sampled) "
+                "and is not yet safe on every geometry -- if a run diverges, "
+                "raise ConformalAreaThreshold in the property editor."
+            )
+
             layout.addRow("Time unit:", self._time)
             layout.addRow("Frequency unit:", self._freq)
             layout.addRow("Max simulation time:", self._max_time)
             layout.addRow("Max frequency:", self._max_freq)
             layout.addRow("Time steps:", self._steps)
             layout.addRow(self._subpixel)
+            layout.addRow(self._conformal)
 
             info = QtWidgets.QLabel(
                 "The simulation runs until the maximum time is reached. The "
@@ -440,6 +522,8 @@ if _GUI_AVAILABLE:
                     "unaffected.",
                 )
             self.obj.SubpixelSmoothing = self._subpixel.isChecked()
+            _ensure_conformal_props(self.obj)
+            self.obj.ConformalPEC = self._conformal.isChecked()
             _drop_mode_convergence_props(self.obj)
             new_max_freq = units.freq_to_si(self._max_freq.value(), self._freq_unit)
             self.obj.MaxFrequency = new_max_freq

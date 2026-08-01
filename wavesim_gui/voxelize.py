@@ -277,19 +277,16 @@ def derive_grid_dims(sim, cell_size_m, padding_cells=8):
     }
 
 
-def _layer_inside(body_shape, z_axis, z, pts, deflection):
-    """Boolean mask of which *pts* (XY, mm) lie inside *body_shape* at height *z*.
+def _section_polygons(body_shape, z_axis, z, deflection):
+    """Cross-section of *body_shape* at height *z* as a list of XY polygons.
 
     Cuts the body with the horizontal plane at *z* -- one OCC section per layer
-    instead of one ``isInside`` per cell -- turns each cross-section wire into a
-    polygon (curved edges discretised to chord tolerance *deflection*), and tests
-    every point at once with matplotlib. XOR-ing the wires applies the even-odd
-    rule, which carves holes and handles solids nested inside holes. Returns
-    ``None`` when the plane misses the solid (no section wires), so the caller can
-    leave that whole layer empty.
+    instead of one ``isInside`` per cell -- and turns each resulting wire into a
+    polygon (curved edges discretised to chord tolerance *deflection*). Returns
+    ``None`` when the plane misses the solid (no section wires, or none that
+    close), so the caller can leave that whole layer empty.
     """
     import numpy as np
-    from matplotlib.path import Path
 
     try:
         wires = body_shape.slice(z_axis, z)
@@ -297,8 +294,7 @@ def _layer_inside(body_shape, z_axis, z, pts, deflection):
         return None
     if not wires:
         return None
-    inside = np.zeros(len(pts), dtype=bool)
-    any_wire = False
+    polys = []
     for w in wires:
         try:
             verts = w.discretize(Deflection=deflection)
@@ -306,10 +302,53 @@ def _layer_inside(body_shape, z_axis, z, pts, deflection):
             continue
         if len(verts) < 3:
             continue
-        poly = np.array([(v.x, v.y) for v in verts])
+        polys.append(np.array([(v.x, v.y) for v in verts]))
+    return polys or None
+
+
+def _layer_inside(body_shape, z_axis, z, pts, deflection):
+    """Boolean mask of which *pts* (XY, mm) lie inside *body_shape* at height *z*.
+
+    Tests every point at once with matplotlib. XOR-ing the wires applies the
+    even-odd rule, which carves holes and handles solids nested inside holes.
+    Returns ``None`` when the plane misses the solid.
+
+    For the (usual) case of points forming an axis-aligned lattice, prefer
+    :func:`_layer_inside_lattice` -- same answer, without the
+    ``O(points x vertices)``.
+    """
+    import numpy as np
+    from matplotlib.path import Path
+
+    polys = _section_polygons(body_shape, z_axis, z, deflection)
+    if polys is None:
+        return None
+    inside = np.zeros(len(pts), dtype=bool)
+    for poly in polys:
         inside ^= Path(poly).contains_points(pts)
-        any_wire = True
-    return inside if any_wire else None
+    return inside
+
+
+def _layer_inside_lattice(body_shape, z_axis, z, xs, ys, deflection):
+    """:func:`_layer_inside` for a lattice of sample points ``xs`` x ``ys``.
+
+    Returns a ``(len(xs), len(ys))`` mask (or ``None``) rather than a flat one --
+    the same values a flat call would give for
+    ``meshgrid(xs, ys, indexing="ij")``, since
+    :func:`wavesim_gui.scanline.lattice_inside` reproduces matplotlib's crossing
+    rule exactly (``tools/check_scanline.py``). ``xs`` must be ascending.
+    """
+    import numpy as np
+
+    from wavesim_gui.scanline import lattice_inside
+
+    polys = _section_polygons(body_shape, z_axis, z, deflection)
+    if polys is None:
+        return None
+    inside = np.zeros((len(xs), len(ys)), dtype=bool)
+    for poly in polys:
+        inside ^= lattice_inside(poly, xs, ys)
+    return inside
 
 
 # --------------------------------------------------------------------------- #
@@ -387,14 +426,12 @@ def _smooth_dielectric_body(arrays, body_shape, eps_r, mu_r,
     deflection = max(0.25 * df, df * 1.0e-6)
 
     Z_AXIS = FreeCAD.Vector(0.0, 0.0, 1.0)
-    gx, gy = np.meshgrid(xf, yf, indexing="ij")
-    pts = np.column_stack([gx.ravel(), gy.ravel()])
-    shape2d = (xf.size, yf.size)
     inside_fine = np.zeros((xf.size, yf.size, zf.size), dtype=bool)
     for kz in range(zf.size):
-        layer = _layer_inside(body_shape, Z_AXIS, float(zf[kz]), pts, deflection)
+        layer = _layer_inside_lattice(body_shape, Z_AXIS, float(zf[kz]),
+                                      xf, yf, deflection)
         if layer is not None and layer.any():
-            inside_fine[:, :, kz] = layer.reshape(shape2d)
+            inside_fine[:, :, kz] = layer
         if on_layer is not None and on_layer():
             raise VoxelizationCancelled()
 
@@ -506,6 +543,69 @@ def _dilate_band(mask):
     return out
 
 
+# The band's sample points are a *subset* of a lattice, not a lattice: only the
+# cells straddling the surface are sampled. Testing them on the smallest lattice
+# containing them (the band's occupied rows x its occupied columns) and gathering
+# the wanted cells back is far cheaper anyway, because the scanline's cost barely
+# depends on how many points it answers -- but only while the containing lattice
+# stays comparable to the band. It does for a compact cross-section; for a long
+# diagonal conductor the enclosing lattice is quadratic in the band, and past this
+# ratio the flat matplotlib path is the better of the two. Kept well under the
+# scanline's measured advantage so the chosen path always wins.
+_BAND_LATTICE_MAX_WASTE = 12.0
+
+
+def _band_lattice(ii, jj, xb, yb):
+    """Smallest sample lattice containing band cells ``(ii, jj)``, or ``None``.
+
+    Returns ``(xs, ys, mi, mj)``: the ascending sample coordinates of the
+    occupied cell columns/rows (each cell contributing its node + sub-centres),
+    and the index of each band cell within them, so a
+    ``(len(ui), os_+1, len(uj), os_+1)`` view of the lattice result gathers back
+    to one ``(n, os_+1, os_+1)`` sub-block per band cell. ``None`` asks the caller
+    to use the flat path -- see :data:`_BAND_LATTICE_MAX_WASTE`.
+    """
+    import numpy as np
+
+    ui = np.unique(ii)
+    uj = np.unique(jj)
+    if ui.size * uj.size > _BAND_LATTICE_MAX_WASTE * ii.size:
+        return None
+    return (xb[ui].ravel(), yb[uj].ravel(),
+            np.searchsorted(ui, ii), np.searchsorted(uj, jj))
+
+
+def _band_blocks_lattice(body_shape, z_axis, z, lat, os_, deflection):
+    """Per-band-cell ``(n, os_+1, os_+1)`` occupancy at *z*, via one scanline.
+
+    *lat* is :func:`_band_lattice`'s tuple. Returns ``None`` when the plane
+    misses the solid.
+    """
+    xs, ys, mi, mj = lat
+    grid = _layer_inside_lattice(body_shape, z_axis, z, xs, ys, deflection)
+    if grid is None:
+        return None
+    view = grid.reshape(xs.size // (os_ + 1), os_ + 1,
+                        ys.size // (os_ + 1), os_ + 1)
+    return view[mi, :, mj, :]
+
+
+def _band_blocks_flat(body_shape, z_axis, z, xs, ys, os_, deflection):
+    """:func:`_band_blocks_lattice`'s fallback: one flat point list per cell.
+
+    *xs*/*ys* are the ``(n, os_+1)`` per-cell sample coordinates.
+    """
+    import numpy as np
+
+    px = np.repeat(xs, os_ + 1, axis=1)
+    py = np.tile(ys, (1, os_ + 1))
+    flat = _layer_inside(body_shape, z_axis, z,
+                         np.column_stack([px.ravel(), py.ravel()]), deflection)
+    if flat is None:
+        return None
+    return flat.reshape(xs.shape[0], os_ + 1, os_ + 1)
+
+
 def _conformal_pec_body(covered, body_shape, nodes_mm, span, os_, on_layer=None):
     """Accumulate one PEC body's **covered** fractions into the six arrays.
 
@@ -544,6 +644,15 @@ def _conformal_pec_body(covered, body_shape, nodes_mm, span, os_, on_layer=None)
 
        That is ``~3*os^2`` samples per cell rather than ``os^3``.
 
+       Band cells are scattered, so their samples are a subset of a lattice
+       rather than one. :func:`_band_lattice` supplies the smallest lattice
+       containing them, which :func:`_layer_inside_lattice` answers in one
+       scanline pass and the caller gathers back per cell -- cheap enough that a
+       z-sub plane takes the whole sub-block and slices its cross out of it.
+       When that enclosing lattice would be much larger than the band itself the
+       helper declines and the original per-cell flat sampling runs instead; both
+       produce the same arrays.
+
     ``on_layer()`` is called once per OCC section (progress + cancellation); a
     truthy return raises :class:`VoxelizationCancelled`.
     """
@@ -576,14 +685,12 @@ def _conformal_pec_body(covered, body_shape, nodes_mm, span, os_, on_layer=None)
 
     # ---------------- pass 1: node lattice -> the surface band -------------- #
     xn, yn, zn = nx_mm[ia:ib + 1], ny_mm[ja:jb + 1], nz_mm[ka:kb + 1]
-    gx, gy = np.meshgrid(xn, yn, indexing="ij")
-    node_pts = np.column_stack([gx.ravel(), gy.ravel()])
     node_in = np.zeros((ni + 1, nj + 1, nk + 1), dtype=bool)
     for kk in range(nk + 1):
-        layer = _layer_inside(body_shape, Z_AXIS, float(zn[kk]),
-                              node_pts, deflection)
+        layer = _layer_inside_lattice(body_shape, Z_AXIS, float(zn[kk]),
+                                      xn, yn, deflection)
         if layer is not None and layer.any():
-            node_in[:, :, kk] = layer.reshape(ni + 1, nj + 1)
+            node_in[:, :, kk] = layer
         _tick()
 
     c = node_in
@@ -607,35 +714,49 @@ def _conformal_pec_body(covered, body_shape, nodes_mm, span, os_, on_layer=None)
             sel = bk == k
             ii, jj = bi[sel], bj[sel]
             xs, ys = xb[ii], yb[jj]                      # (n, os_+1) each
+            n = ii.size
+            lat = _band_lattice(ii, jj, xb, yb)
 
             # z-node plane: the full (os_+1)^2 xy sub-block per cell.
-            px = np.repeat(xs, os_ + 1, axis=1)
-            py = np.tile(ys, (1, os_ + 1))
-            pts = np.column_stack([px.ravel(), py.ravel()])
-            layer = _layer_inside(body_shape, Z_AXIS, float(zb[k, 0]),
-                                  pts, deflection)
+            layer = (_band_blocks_lattice(body_shape, Z_AXIS, float(zb[k, 0]),
+                                          lat, os_, deflection)
+                     if lat is not None else
+                     _band_blocks_flat(body_shape, Z_AXIS, float(zb[k, 0]),
+                                       xs, ys, os_, deflection))
             _tick()
-            blk = (np.zeros((ii.size, os_ + 1, os_ + 1), dtype=bool)
-                   if layer is None else
-                   layer.reshape(ii.size, os_ + 1, os_ + 1))
+            blk = (np.zeros((n, os_ + 1, os_ + 1), dtype=bool)
+                   if layer is None else layer)
             local["pec_edge_open_x"][ii, jj, k] = blk[:, 1:, 0].mean(axis=1)
             local["pec_edge_open_y"][ii, jj, k] = blk[:, 0, 1:].mean(axis=1)
             local["pec_face_open_z"][ii, jj, k] = blk[:, 1:, 1:].mean(axis=(1, 2))
 
-            # z-sub planes: the 2*os_+1 point cross through the low corner --
-            # [0] node/node, [1:1+os_] x-node/y-sub, [1+os_:] x-sub/y-node.
-            px = np.concatenate([xs[:, :1], np.repeat(xs[:, :1], os_, axis=1),
-                                 xs[:, 1:]], axis=1)
-            py = np.concatenate([ys[:, :1], ys[:, 1:],
-                                 np.repeat(ys[:, :1], os_, axis=1)], axis=1)
-            pts = np.column_stack([px.ravel(), py.ravel()])
-            cross = np.zeros((ii.size, os_, 1 + 2 * os_), dtype=bool)
+            # z-sub planes: only the 2*os_+1 point cross through the low corner
+            # is needed -- [0] node/node, [1:1+os_] x-node/y-sub, [1+os_:]
+            # x-sub/y-node. The flat path samples exactly that; the lattice path
+            # answers the whole sub-block for the same work and slices it.
+            if lat is None:
+                px = np.concatenate([xs[:, :1], np.repeat(xs[:, :1], os_, axis=1),
+                                     xs[:, 1:]], axis=1)
+                py = np.concatenate([ys[:, :1], ys[:, 1:],
+                                     np.repeat(ys[:, :1], os_, axis=1)], axis=1)
+                cross_pts = np.column_stack([px.ravel(), py.ravel()])
+            cross = np.zeros((n, os_, 1 + 2 * os_), dtype=bool)
             for m in range(os_):
-                layer = _layer_inside(body_shape, Z_AXIS, float(zb[k, m + 1]),
-                                      pts, deflection)
+                z = float(zb[k, m + 1])
+                if lat is None:
+                    layer = _layer_inside(body_shape, Z_AXIS, z,
+                                          cross_pts, deflection)
+                    _tick()
+                    if layer is not None and layer.any():
+                        cross[:, m, :] = layer.reshape(n, 1 + 2 * os_)
+                    continue
+                sub = _band_blocks_lattice(body_shape, Z_AXIS, z, lat, os_,
+                                           deflection)
                 _tick()
-                if layer is not None and layer.any():
-                    cross[:, m, :] = layer.reshape(ii.size, 1 + 2 * os_)
+                if sub is not None and sub.any():
+                    cross[:, m, 0] = sub[:, 0, 0]
+                    cross[:, m, 1:1 + os_] = sub[:, 0, 1:]
+                    cross[:, m, 1 + os_:] = sub[:, 1:, 0]
             local["pec_edge_open_z"][ii, jj, k] = cross[:, :, 0].mean(axis=1)
             local["pec_face_open_x"][ii, jj, k] = (
                 cross[:, :, 1:1 + os_].mean(axis=(1, 2)))
@@ -924,16 +1045,14 @@ def voxelize_materials(materials, cell_size_m,
             continue
         if len(i_idx) == 0 or len(j_idx) == 0 or len(k_idx) == 0:
             continue
-        # XY cell centres for this body's bbox, flattened to an (M, 2) point list
-        # tested in a single vectorised call per Z-layer cross-section.
-        gx, gy = np.meshgrid(xs[i_idx], ys[j_idx], indexing="ij")
-        pts = np.column_stack([gx.ravel(), gy.ravel()])
-        shape2d = (len(i_idx), len(j_idx))
+        # XY cell centres for this body's bbox -- a lattice, tested in a single
+        # vectorised call per Z-layer cross-section.
+        bx, by = xs[i_idx], ys[j_idx]
         for k in k_idx:
-            inside = _layer_inside(body_shape, Z_AXIS, float(zs[k]),
-                                   pts, deflection)
+            inside = _layer_inside_lattice(body_shape, Z_AXIS, float(zs[k]),
+                                           bx, by, deflection)
             if inside is not None and inside.any():
-                ii, jj = np.nonzero(inside.reshape(shape2d))
+                ii, jj = np.nonzero(inside)
                 gi, gj = i_idx[ii], j_idx[jj]
                 if pec:
                     pec_mask[gi, gj, k] = True

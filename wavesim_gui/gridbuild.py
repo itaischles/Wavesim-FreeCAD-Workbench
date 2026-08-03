@@ -12,8 +12,12 @@ The mesh is built per axis, independently:
 * **Snap (forced) lines.** Every material body contributes its bounding-box
   min/max planes on all three axes; every axis-aligned cylindrical face adds its
   transverse silhouette (centre +/- radius) on the two axes it spans and its own
-  extent on its axis. Grid lines are forced exactly at these coordinates so cells
-  conform to the geometry.
+  extent on its axis; every axis-normal *planar* face adds its own plane. Grid
+  lines are forced exactly at these coordinates so cells conform to the geometry.
+  The planar and cylindrical faces are what make **interior** features visible:
+  a bounding box only describes a body's outer extent, so a slot, pocket, step or
+  aperture cut into it -- geometry that never touches the box -- is snapped by its
+  own faces or not at all.
 * **Graded fill.** Between consecutive forced lines the interval is tiled with
   cells no larger than the coarse target (the Domain's ``Dx/Dy/Dz``, now the
   *background* resolution); a small gap gets fine cells and the size grows toward
@@ -55,11 +59,12 @@ _MAX_TOTAL_CELLS = 10_000_000
 # Snap-coordinate collection
 # --------------------------------------------------------------------------- #
 
-def _cyl_axis_index(axis_dir, tol=1.0e-6):
+def _axis_index(axis_dir, tol=1.0e-6):
     """Return 0/1/2 if *axis_dir* is ~parallel to the x/y/z axis, else ``None``.
 
-    Only axis-aligned cylinders get feature snapping; a tilted cylinder's silhouette
-    is not axis-separable, so it falls back to its body bounding box.
+    Used for both a cylinder's axis and a plane's normal. Only axis-aligned
+    features get snapping: a tilted cylinder's silhouette (or a tilted plane) is
+    not axis-separable, so it falls back to its body bounding box.
     """
     comps = (abs(axis_dir.x), abs(axis_dir.y), abs(axis_dir.z))
     for i, c in enumerate(comps):
@@ -106,7 +111,7 @@ def _add_cylinder_snaps(shape, axes):
         surf = getattr(face, "Surface", None)
         if not isinstance(surf, Part.Cylinder):
             continue
-        ai = _cyl_axis_index(surf.Axis)
+        ai = _axis_index(surf.Axis)
         if ai is None:
             continue
         centre = (surf.Center.x, surf.Center.y, surf.Center.z)
@@ -123,15 +128,62 @@ def _add_cylinder_snaps(shape, axes):
                 axes[t].extend((centre[t] - r, centre[t] + r))
 
 
+def _add_planar_snaps(shape, axes):
+    """Append every axis-normal planar face's own plane to *axes* (mm).
+
+    This is what makes a body's **interior** planar features visible to the
+    snapper. ``BoundBox`` only describes the outer extent, so a slot, pocket,
+    step or aperture cut into a body -- geometry that never touches the box --
+    used to force no grid line at all, and its walls landed wherever the uniform
+    fill happened to put them. Worst case that is dead centre of a cell, i.e.
+    half a cell of staircase error on a material interface, and (for an aperture)
+    a width quantised to the nearest whole cell. A face normal to an axis now
+    forces a line at its own plane, so a cell boundary lands exactly on the
+    interface.
+
+    Note the asymmetry this removes: :func:`_add_cylinder_snaps` already walks
+    *every* face with no inner/outer distinction, so a round hole through a plate
+    was snapped while a rectangular slot through the same plate was not.
+
+    Only faces whose normal is parallel to an axis qualify -- a tilted plane is
+    not axis-separable, exactly as for a tilted cylinder. Each axis is covered by
+    the faces normal to it, so a face contributes one coordinate rather than
+    three (its in-plane extent is some other face's normal). The coordinate comes
+    from the analytic ``Surface.Position`` rather than the face's ``BoundBox``,
+    for the tessellation reason spelt out in :func:`_exact_bbox`.
+
+    Deliberately **no size filter**: a small aperture is precisely the feature
+    worth snapping to, so dropping small faces would defeat the purpose. Nearly
+    coincident lines are merged (symmetrically) by :func:`_forced_lines`, and the
+    Domain's ``MinCellSize`` is what bounds the timestep a fine feature costs.
+    """
+    try:
+        import Part
+    except Exception:
+        return
+    for face in getattr(shape, "Faces", []) or []:
+        surf = getattr(face, "Surface", None)
+        if not isinstance(surf, Part.Plane):
+            continue
+        ai = _axis_index(surf.Axis)
+        if ai is None:
+            continue
+        pos = surf.Position  # a point on the plane, by definition
+        axes[ai].append((pos.x, pos.y, pos.z)[ai])
+
+
 def collect_axis_snaps(materials):
     """Per-axis forced grid-line coordinates (world mm) from material geometry.
 
-    Returns ``(xs, ys, zs)`` lists (unsorted, possibly with duplicates -- the
-    per-axis builder dedupes with a tolerance). Every solid body contributes its
-    bounding-box faces on all three axes; axis-aligned cylindrical faces add their
-    silhouettes (see :func:`_add_cylinder_snaps`). The box comes from
-    :func:`_exact_bbox`, so a curved body's box agrees with its own analytic
-    silhouette instead of landing a sliver away from it.
+    Returns ``(xs, ys, zs)`` lists (unsorted, with duplicates -- deduping is
+    :func:`_forced_lines`' job, and is deliberately left there so *all* merging
+    happens in one place under one symmetric rule). Every solid body contributes
+    its bounding-box faces on all three axes; axis-aligned cylindrical faces add
+    their silhouettes (:func:`_add_cylinder_snaps`) and axis-normal planar faces
+    their own planes (:func:`_add_planar_snaps`) -- the latter two are what reach
+    features *inside* a body. The box comes from :func:`_exact_bbox`, so a curved
+    body's box agrees with its own analytic silhouette instead of landing a
+    sliver away from it.
     """
     from wavesim_gui import voxelize as vox
 
@@ -142,6 +194,7 @@ def collect_axis_snaps(materials):
         axes[1].extend((bb.YMin, bb.YMax))
         axes[2].extend((bb.ZMin, bb.ZMax))
         _add_cylinder_snaps(shape, axes)
+        _add_planar_snaps(shape, axes)
     return axes
 
 
@@ -209,23 +262,52 @@ def _forced_lines(snaps, lo, hi, coarse, min_cell=0.0):
     Snap coordinates outside the inner region are dropped; the rest are clamped
     into ``[lo, hi]`` and merged when closer than a small tolerance (so two nearly
     coincident feature planes don't create a zero-width cell). When *min_cell* is
-    positive, lines closer together than it are also merged, so two nearby
-    features cannot force a sub-minimum cell. The result always starts at *lo* and
-    ends at *hi* and is strictly increasing.
+    positive it widens that tolerance, so two nearby features cannot force a
+    sub-minimum cell. The result always starts at *lo* and ends at *hi* and is
+    strictly increasing.
+
+    **A merged cluster collapses to its mean**, which is what keeps the mesh
+    mirror-symmetric when the geometry is. The obvious alternative -- walk the
+    sorted lines and keep the first of any close pair -- is not: given the
+    symmetric snaps ``[-2.5001, -2.4999, 2.4999, 2.5001]`` it keeps ``-2.5001``
+    on the low side but ``+2.4999`` on the high side, so a body symmetric about
+    the origin gets an asymmetric mesh and the fields inherit the break (this is
+    how a coax picked up an m=1 residual). The mean is invariant under mirroring,
+    and so is the single-linkage clustering that feeds it -- the gaps between
+    consecutive sorted values are themselves mirrored, so both sides cluster the
+    same way. (Single-linkage can chain across a run of closely spaced lines;
+    that is accepted as the price of the symmetry guarantee, and *tol* is tiny.)
+
+    A line merged under a large *min_cell* therefore moves by up to
+    ``min_cell/2`` -- an interface deliberately traded away for the timestep,
+    which is what asking for a minimum cell size means. *lo* and *hi* never move:
+    they are the domain bounds the PML pads are measured from, so a cluster
+    within *tol* of either is dropped rather than allowed to drag the edge.
     """
     tol = max(coarse * 1.0e-3, 1.0e-6, float(min_cell))
-    merged = [lo]
-    for v in sorted(snaps):
-        if v < lo - tol or v > hi + tol:
-            continue
-        v = min(max(v, lo), hi)
-        if v - merged[-1] > tol:
-            merged.append(v)
-    if hi - merged[-1] > tol:
-        merged.append(hi)
+
+    inside = sorted(min(max(v, lo), hi) for v in snaps
+                    if lo - tol <= v <= hi + tol)
+
+    # Single-linkage clusters of near-coincident lines (see the docstring on why
+    # this rule and the mean, rather than "first one wins").
+    clusters = []
+    for v in inside:
+        if clusters and v - clusters[-1][-1] <= tol:
+            clusters[-1].append(v)
+        else:
+            clusters.append([v])
+
+    lines = [lo]
+    for c in clusters:
+        v = math.fsum(c) / len(c)
+        if v - lines[-1] > tol and hi - v > tol:
+            lines.append(v)
+    if hi - lines[-1] > tol:
+        lines.append(hi)
     else:
-        merged[-1] = hi
-    return merged
+        lines[-1] = hi
+    return lines
 
 
 def _graded_widths(w, hL, hR, H, r):
@@ -236,6 +318,13 @@ def _graded_widths(w, hL, hR, H, r):
     always laid next so the two sides stay balanced; the (sub-cell) leftover is
     removed by scaling all widths uniformly, which preserves the grading ratios.
     Always returns at least one positive width.
+
+    A cell that *exactly* fills the remaining space is laid, not dropped: the
+    stopping test is ``> remaining`` (within a relative epsilon), not ``>=``. With
+    ``>=``, a gap that divides evenly by the target lost its last cell and the
+    uniform rescale then stretched the survivors to cover it -- asking for 5
+    cells of 1.0 mm across a 5 mm gap yielded 4 cells of 1.25 mm, 25% coarser
+    than requested on precisely the gaps whose size was chosen deliberately.
     """
     if w <= 0.0:
         return []
@@ -248,18 +337,19 @@ def _graded_widths(w, hL, hR, H, r):
     left, right = [], []
     xl = xr = 0.0
     sl, sr = hL, hR
+    eps = w * 1.0e-12  # `remaining` accumulates rounding; don't reject an exact fit
     while True:
         remaining = w - xl - xr
         if remaining <= 0.0:
             break
         if sl <= sr:
-            if sl >= remaining:
+            if sl > remaining + eps:
                 break
             left.append(sl)
             xl += sl
             sl = min(sl * r, H)
         else:
-            if sr >= remaining:
+            if sr > remaining + eps:
                 break
             right.append(sr)
             xr += sr

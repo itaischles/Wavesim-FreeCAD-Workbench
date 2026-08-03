@@ -68,6 +68,28 @@ def _cyl_axis_index(axis_dir, tol=1.0e-6):
     return None
 
 
+def _exact_bbox(shape):
+    """*shape*'s bounding box, from the exact geometry rather than a tessellation.
+
+    ``Shape.BoundBox`` is derived from the shape's triangulation, so a curved
+    body's box can be *under*-sized: a cylinder faceted with vertices on the x
+    axis reports XMin/XMax exactly but YMin/YMax short by ``r*(1 - cos(pi/n))``
+    -- 0.066 mm on a 9 mm radius at n=26. That lands a fraction of a cell away
+    from :func:`_add_cylinder_snaps`' exact ``centre +/- r``, and since
+    :func:`_forced_lines` merges near-coincident lines *keeping the lower one*,
+    the low side of a round body then snaps to the true silhouette while the high
+    side snaps to the faceted one. A symmetric body gets an asymmetric mesh, and
+    the symmetry break shows up in the fields (a coax rings in its m=1 mode).
+
+    ``optimalBoundingBox(useTriangulation=False)`` asks OCC for the box of the
+    real surfaces instead. Falls back to ``BoundBox`` if it is unavailable.
+    """
+    try:
+        return shape.optimalBoundingBox(False, False)
+    except Exception:
+        return shape.BoundBox
+
+
 def _add_cylinder_snaps(shape, axes):
     """Append every axis-aligned cylindrical face's snap lines to *axes* (mm).
 
@@ -89,6 +111,9 @@ def _add_cylinder_snaps(shape, axes):
             continue
         centre = (surf.Center.x, surf.Center.y, surf.Center.z)
         r = float(surf.Radius)
+        # Plain BoundBox is safe for the *axial* extent (unlike the transverse
+        # one -- see :func:`_exact_bbox`): the end circles' facet vertices sit
+        # exactly on the cap planes, so faceting cannot shorten this axis.
         fb = face.BoundBox
         axial = ((fb.XMin, fb.XMax), (fb.YMin, fb.YMax), (fb.ZMin, fb.ZMax))[ai]
         for t in range(3):
@@ -104,13 +129,15 @@ def collect_axis_snaps(materials):
     Returns ``(xs, ys, zs)`` lists (unsorted, possibly with duplicates -- the
     per-axis builder dedupes with a tolerance). Every solid body contributes its
     bounding-box faces on all three axes; axis-aligned cylindrical faces add their
-    silhouettes (see :func:`_add_cylinder_snaps`).
+    silhouettes (see :func:`_add_cylinder_snaps`). The box comes from
+    :func:`_exact_bbox`, so a curved body's box agrees with its own analytic
+    silhouette instead of landing a sliver away from it.
     """
     from wavesim_gui import voxelize as vox
 
     axes = ([], [], [])
     for shape, _eps, _mu, _pec in vox._gather(materials):
-        bb = shape.BoundBox
+        bb = _exact_bbox(shape)
         axes[0].extend((bb.XMin, bb.XMax))
         axes[1].extend((bb.YMin, bb.YMax))
         axes[2].extend((bb.ZMin, bb.ZMax))
@@ -146,7 +173,10 @@ def collect_material_caps(sim, domain, materials):
         if target_m is None:
             return ([], [], [])  # no max frequency -> no material sizing
         target_mm = target_m * _MM_PER_M
-        bb = shape.BoundBox
+        # Same box as :func:`collect_axis_snaps`, so every cap edge really is a
+        # forced grid line -- the invariant :func:`_gap_coarse`'s midpoint test
+        # relies on.
+        bb = _exact_bbox(shape)
         caps[0].append((bb.XMin, bb.XMax, target_mm))
         caps[1].append((bb.YMin, bb.YMax, target_mm))
         caps[2].append((bb.ZMin, bb.ZMax, target_mm))

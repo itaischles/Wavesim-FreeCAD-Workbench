@@ -138,7 +138,12 @@ dims, voxel counts, and ``<key>_final``/``<key>_max`` per recorded energy
 region). It also echoes ``conformal_pec`` — read off the *grid*, so it records
 what the conductors actually were rather than what the job asked for — and, for
 a conformal run, ``cut_cells``, ``clamped_faces`` and the
-``conformal_area_threshold`` in force. A snapshot stores one frame stack per recorded component (``snapshot_<idx>_<comp>_data``, e.g. ``snapshot_0_Ex_data``)
+``conformal_area_threshold`` in force. That last one is likewise what *ran*:
+building the Simulation measures this grid's small-cut stability and raises the
+threshold when it has to (solver S7), since 0.4 is not safe on real geometry and
+the failure is not monotone in resolution. When it was raised, the job's own
+value is kept alongside as ``conformal_area_threshold_requested`` and
+``clamped_faces`` counts the faces clamped at the threshold actually used. A snapshot stores one frame stack per recorded component (``snapshot_<idx>_<comp>_data``, e.g. ``snapshot_0_Ex_data``)
 plus the ``snapshot_<idx>_times`` and the two in-plane node/edge coordinate arrays
 (``snapshot_<idx>_edges0`` / ``_edges1``, metres, solver frame) they share; its
 summary entry lists the ``field`` and the ``components`` actually saved. The
@@ -1015,6 +1020,12 @@ def run_job(workdir):
                 "backend='numba' (or 'numpy'), or turn off the Simulation's "
                 "ConformalPEC to run staircased.")
         if grid.is_conformal:
+            # Provisional: building the Simulation below measures this grid's
+            # stability and may raise the threshold (solver S7), which moves
+            # both the threshold and the clamped-face count. They are re-recorded
+            # there. Recorded here as well so a mode-only request — which returns
+            # before any time loop exists, and so has no stability question to
+            # answer — still reports them.
             voxel_summary["cut_cells"] = int(ws.count_cut_cells(grid))
             voxel_summary["conformal_area_threshold"] = float(
                 grid.conformal_area_threshold)
@@ -1181,6 +1192,27 @@ def run_job(workdir):
         pec_faces=pec_faces,
         backend=backend,
     )
+
+    if grid.is_conformal:
+        # Only now is the clamp threshold settled. Constructing the Simulation
+        # probes this exact scheme for the small-cut instability and raises the
+        # threshold if it has to (solver S7), because 0.4 is not safe on real
+        # geometry and stability is not monotone in resolution — the reference
+        # coax diverges at a 0.25 mm cell and runs at 0.1875 mm. What the run
+        # used is what belongs in the summary; what the job asked for is exactly
+        # the thing that can go unhonoured.
+        requested = voxel_summary["conformal_area_threshold"]
+        used = float(grid.conformal_area_threshold)
+        if used != requested:
+            voxel_summary["conformal_area_threshold"] = used
+            voxel_summary["conformal_area_threshold_requested"] = requested
+            voxel_summary["clamped_faces"] = int(
+                ws.conformal_geometry(grid).n_clamped)
+            _emit_status(
+                "Conformal PEC: clamp threshold raised {:.2f} -> {:.2f} — the "
+                "run diverges at {:.2f}. {:,} faces are now clamped, which "
+                "costs accuracy.".format(requested, used, requested,
+                                         voxel_summary["clamped_faces"]))
 
     n_steps = int(job["steps"])
 

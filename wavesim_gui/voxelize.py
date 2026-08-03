@@ -277,7 +277,33 @@ def derive_grid_dims(sim, cell_size_m, padding_cells=8):
     }
 
 
-def _section_polygons(body_shape, z_axis, z, deflection):
+# OCC's ``Shape.slice`` returns *nothing* for a plane lying within a tolerance
+# band of a planar face of the solid, and that band scales with the shape rather
+# than with the model unit: measured 3e-4 mm on a 100 mm cylinder, 3e-5 mm on a
+# 1 mm one, 1e-6 mm on a 2 mm box. A conductor whose end face sits on a grid node
+# plane -- the *normal* case, since a transmission line runs the full length of
+# the domain -- therefore sections as empty, which reads as "no metal here at
+# all" rather than as an error. This is what silently emptied the whole z = 0
+# node plane of the conformal fractions; see :func:`_section_nudge`.
+_SLICE_DEAD_BAND = 1.0e-5           # of the shape's own extent (~30x measured)
+
+
+def _section_nudge(body_shape, sub_mm):
+    """How far (mm) to step off a degenerate section plane for *body_shape*.
+
+    Large enough to clear :data:`_SLICE_DEAD_BAND` for a shape this size, and
+    capped at a quarter of the finest sub-cell *sub_mm* so the retry can never
+    smear geometry that genuinely varies within one sub-layer. A body enormous
+    next to its sub-cell can hit that cap and still land inside the band; it
+    then behaves exactly as it does today (empty layer), so the cap trades a
+    rare unfixed case for never sampling the wrong sub-cell.
+    """
+    bb = body_shape.BoundBox
+    extent = max(bb.XLength, bb.YLength, bb.ZLength, 1.0e-9)
+    return min(_SLICE_DEAD_BAND * extent, 0.25 * sub_mm)
+
+
+def _section_polygons(body_shape, z_axis, z, deflection, nudge=0.0):
     """Cross-section of *body_shape* at height *z* as a list of XY polygons.
 
     Cuts the body with the horizontal plane at *z* -- one OCC section per layer
@@ -285,33 +311,50 @@ def _section_polygons(body_shape, z_axis, z, deflection):
     polygon (curved edges discretised to chord tolerance *deflection*). Returns
     ``None`` when the plane misses the solid (no section wires, or none that
     close), so the caller can leave that whole layer empty.
+
+    *nudge* > 0 asks for one retry just off a plane that sectioned to nothing,
+    which is how a face-coincident plane is told apart from a genuine miss (see
+    :data:`_SLICE_DEAD_BAND`). ``+nudge`` is tried first, so a solid resting *on*
+    the plane reports the material it carries; ``-nudge`` then catches a top
+    face, where ``+`` is a real miss. An internal horizontal face gets the
+    material above it, which is the same tie-break the tangency cases already
+    take: a surface counts as covered. Defaults to 0 -- **only the conformal
+    sampler passes it**, so the coarse binary sweep and the dielectric smoother
+    are bit-identical, and with them ``pec_mask`` and V2.
     """
     import numpy as np
 
-    try:
-        wires = body_shape.slice(z_axis, z)
-    except Exception:
-        return None
-    if not wires:
-        return None
-    polys = []
-    for w in wires:
+    def _at(zz):
         try:
-            verts = w.discretize(Deflection=deflection)
+            wires = body_shape.slice(z_axis, zz)
         except Exception:
-            continue
-        if len(verts) < 3:
-            continue
-        polys.append(np.array([(v.x, v.y) for v in verts]))
-    return polys or None
+            return None
+        if not wires:
+            return None
+        polys = []
+        for w in wires:
+            try:
+                verts = w.discretize(Deflection=deflection)
+            except Exception:
+                continue
+            if len(verts) < 3:
+                continue
+            polys.append(np.array([(v.x, v.y) for v in verts]))
+        return polys or None
+
+    polys = _at(z)
+    if polys is not None or not nudge:
+        return polys
+    return _at(z + nudge) or _at(z - nudge)
 
 
-def _layer_inside(body_shape, z_axis, z, pts, deflection):
+def _layer_inside(body_shape, z_axis, z, pts, deflection, nudge=0.0):
     """Boolean mask of which *pts* (XY, mm) lie inside *body_shape* at height *z*.
 
     Tests every point at once with matplotlib. XOR-ing the wires applies the
     even-odd rule, which carves holes and handles solids nested inside holes.
-    Returns ``None`` when the plane misses the solid.
+    Returns ``None`` when the plane misses the solid. *nudge* is
+    :func:`_section_polygons`'s degenerate-plane retry.
 
     For the (usual) case of points forming an axis-aligned lattice, prefer
     :func:`_layer_inside_lattice` -- same answer, without the
@@ -320,7 +363,7 @@ def _layer_inside(body_shape, z_axis, z, pts, deflection):
     import numpy as np
     from matplotlib.path import Path
 
-    polys = _section_polygons(body_shape, z_axis, z, deflection)
+    polys = _section_polygons(body_shape, z_axis, z, deflection, nudge)
     if polys is None:
         return None
     inside = np.zeros(len(pts), dtype=bool)
@@ -329,7 +372,7 @@ def _layer_inside(body_shape, z_axis, z, pts, deflection):
     return inside
 
 
-def _layer_inside_lattice(body_shape, z_axis, z, xs, ys, deflection):
+def _layer_inside_lattice(body_shape, z_axis, z, xs, ys, deflection, nudge=0.0):
     """:func:`_layer_inside` for a lattice of sample points ``xs`` x ``ys``.
 
     Returns a ``(len(xs), len(ys))`` mask (or ``None``) rather than a flat one --
@@ -337,12 +380,13 @@ def _layer_inside_lattice(body_shape, z_axis, z, xs, ys, deflection):
     ``meshgrid(xs, ys, indexing="ij")``, since
     :func:`wavesim_gui.scanline.lattice_inside` reproduces matplotlib's crossing
     rule exactly (``tools/check_scanline.py``). ``xs`` must be ascending.
+    *nudge* is :func:`_section_polygons`'s degenerate-plane retry.
     """
     import numpy as np
 
     from wavesim_gui.scanline import lattice_inside
 
-    polys = _section_polygons(body_shape, z_axis, z, deflection)
+    polys = _section_polygons(body_shape, z_axis, z, deflection, nudge)
     if polys is None:
         return None
     inside = np.zeros((len(xs), len(ys)), dtype=bool)
@@ -575,14 +619,15 @@ def _band_lattice(ii, jj, xb, yb):
             np.searchsorted(ui, ii), np.searchsorted(uj, jj))
 
 
-def _band_blocks_lattice(body_shape, z_axis, z, lat, os_, deflection):
+def _band_blocks_lattice(body_shape, z_axis, z, lat, os_, deflection, nudge=0.0):
     """Per-band-cell ``(n, os_+1, os_+1)`` occupancy at *z*, via one scanline.
 
     *lat* is :func:`_band_lattice`'s tuple. Returns ``None`` when the plane
     misses the solid.
     """
     xs, ys, mi, mj = lat
-    grid = _layer_inside_lattice(body_shape, z_axis, z, xs, ys, deflection)
+    grid = _layer_inside_lattice(body_shape, z_axis, z, xs, ys, deflection,
+                                 nudge)
     if grid is None:
         return None
     view = grid.reshape(xs.size // (os_ + 1), os_ + 1,
@@ -590,7 +635,7 @@ def _band_blocks_lattice(body_shape, z_axis, z, lat, os_, deflection):
     return view[mi, :, mj, :]
 
 
-def _band_blocks_flat(body_shape, z_axis, z, xs, ys, os_, deflection):
+def _band_blocks_flat(body_shape, z_axis, z, xs, ys, os_, deflection, nudge=0.0):
     """:func:`_band_blocks_lattice`'s fallback: one flat point list per cell.
 
     *xs*/*ys* are the ``(n, os_+1)`` per-cell sample coordinates.
@@ -600,7 +645,8 @@ def _band_blocks_flat(body_shape, z_axis, z, xs, ys, os_, deflection):
     px = np.repeat(xs, os_ + 1, axis=1)
     py = np.tile(ys, (1, os_ + 1))
     flat = _layer_inside(body_shape, z_axis, z,
-                         np.column_stack([px.ravel(), py.ravel()]), deflection)
+                         np.column_stack([px.ravel(), py.ravel()]), deflection,
+                         nudge)
     if flat is None:
         return None
     return flat.reshape(xs.shape[0], os_ + 1, os_ + 1)
@@ -677,6 +723,11 @@ def _conformal_pec_body(covered, body_shape, nodes_mm, span, os_, on_layer=None)
     df = min(_min_sub(nx_mm, ia, ib), _min_sub(ny_mm, ja, jb))
     deflection = max(_CONFORMAL_CHORD_FRACTION * df, df * 1.0e-6)
 
+    # Retry distance for a section plane that lands on a planar face of the body.
+    # A conductor spanning the domain puts its end faces on node planes, and this
+    # sampler is the only one that sections *on* node planes at all.
+    nudge = _section_nudge(body_shape, _min_sub(nz_mm, ka, kb))
+
     Z_AXIS = FreeCAD.Vector(0.0, 0.0, 1.0)
 
     def _tick():
@@ -688,7 +739,7 @@ def _conformal_pec_body(covered, body_shape, nodes_mm, span, os_, on_layer=None)
     node_in = np.zeros((ni + 1, nj + 1, nk + 1), dtype=bool)
     for kk in range(nk + 1):
         layer = _layer_inside_lattice(body_shape, Z_AXIS, float(zn[kk]),
-                                      xn, yn, deflection)
+                                      xn, yn, deflection, nudge)
         if layer is not None and layer.any():
             node_in[:, :, kk] = layer
         _tick()
@@ -719,10 +770,10 @@ def _conformal_pec_body(covered, body_shape, nodes_mm, span, os_, on_layer=None)
 
             # z-node plane: the full (os_+1)^2 xy sub-block per cell.
             layer = (_band_blocks_lattice(body_shape, Z_AXIS, float(zb[k, 0]),
-                                          lat, os_, deflection)
+                                          lat, os_, deflection, nudge)
                      if lat is not None else
                      _band_blocks_flat(body_shape, Z_AXIS, float(zb[k, 0]),
-                                       xs, ys, os_, deflection))
+                                       xs, ys, os_, deflection, nudge))
             _tick()
             blk = (np.zeros((n, os_ + 1, os_ + 1), dtype=bool)
                    if layer is None else layer)
@@ -745,13 +796,13 @@ def _conformal_pec_body(covered, body_shape, nodes_mm, span, os_, on_layer=None)
                 z = float(zb[k, m + 1])
                 if lat is None:
                     layer = _layer_inside(body_shape, Z_AXIS, z,
-                                          cross_pts, deflection)
+                                          cross_pts, deflection, nudge)
                     _tick()
                     if layer is not None and layer.any():
                         cross[:, m, :] = layer.reshape(n, 1 + 2 * os_)
                     continue
                 sub = _band_blocks_lattice(body_shape, Z_AXIS, z, lat, os_,
-                                           deflection)
+                                           deflection, nudge)
                 _tick()
                 if sub is not None and sub.any():
                     cross[:, m, 0] = sub[:, 0, 0]
@@ -1120,13 +1171,23 @@ def voxelize_materials(materials, cell_size_m,
 def _report_conformal(active, counts, threshold):
     """Console report after a voxelisation that asked for conformal PEC.
 
-    Says whether it took effect and, when it did, prints the two numbers that
-    predict trouble. ``min_open_face`` is the important one: the solver clamps
-    every face below *threshold* to keep ``dt`` untouched, and a run whose
-    smallest cut is far under it is the case measured to diverge -- with the
-    nasty property that stability is **not** monotone in resolution, so a finer
-    mesh is no guarantee. Warning here costs nothing and is the only notice the
-    user gets before a run that ends in NaN.
+    Says whether it took effect and, when it did, how well the mesh resolves the
+    conductor surfaces.
+
+    ``min_open_face`` is a **geometry** diagnostic, not a stability one, and this
+    used to claim otherwise. It cannot predict a divergence, because every face
+    below *threshold* is clamped to exactly ``threshold * A_full`` -- so its own
+    value never reaches the H update, and the measured record bears that out
+    (0.0044 stable, 0.0015 diverging, 0.0073 stable again on the same geometry
+    at three cell sizes). Stability is measured by the solver instead: it probes
+    the assembled scheme when the ``Simulation`` is built, raises the threshold
+    if it has to, and records what actually ran in ``summary.json`` alongside
+    ``conformal_area_threshold_requested`` when the two differ (S7 in
+    CONFORMAL_PEC_PLAN.md; the runner echoes the raise to the report view).
+
+    What the number *does* say is how much clamping the run will carry, which is
+    an accuracy cost concentrated in H near the conductor -- so that is what the
+    warning is about now.
     """
     if not active:
         FreeCAD.Console.PrintWarning(
@@ -1143,12 +1204,13 @@ def _report_conformal(active, counts, threshold):
     )
     if smallest < 0.1 * threshold:
         FreeCAD.Console.PrintWarning(
-            "Wavesim: the smallest cut cell is far below the clamp threshold "
-            "({:.4f} vs {:.2f}). Conformal runs have been seen to diverge in "
-            "this regime; if this one does, raise the Simulation's "
-            "ConformalAreaThreshold (towards 0.5) rather than refining the "
-            "mesh -- stability is not monotone in resolution.\n".format(
-                smallest, threshold)
+            "Wavesim: the mesh barely resolves the smallest cut ({:.4f} against "
+            "a clamp threshold of {:.2f}), so those faces are clamped by more "
+            "than 10x and the H field near the conductor there is "
+            "correspondingly weak. Moving cell boundaries onto the conductor's "
+            "tangents is what removes the slivers; the run's stability is "
+            "measured by the solver at setup, and the threshold it actually "
+            "used is in the run summary.\n".format(smallest, threshold)
         )
 
 

@@ -256,15 +256,16 @@ def _ensure_conformal_props(obj):
     the caller having to know which.
 
     ``ConformalPEC`` is **off by default**, unlike ``SubpixelSmoothing``. The
-    solver's small-cut stability threshold is not yet safe on arbitrary geometry
-    -- the reference coax diverges at one cell size and not at the next finer one
-    -- so this stays opt-in until that closes (S7 in CONFORMAL_PEC_PLAN.md).
+    small-cut instability that first justified that is closed -- the solver now
+    measures the assembled scheme and raises the clamp threshold itself (S7 in
+    CONFORMAL_PEC_PLAN.md) -- but flipping the default is its own decision, and
+    the plan still gates it on the rest of phase 6.
 
-    ``ConformalAreaThreshold`` deliberately gets **no panel row**. It is the
-    lever for that same unresolved problem, and a spin box in the main panel
-    would ask every user to have an opinion about cut-cell stability; leaving it
-    in the property editor puts it where someone chasing a divergence will find
-    it and nowhere else.
+    ``ConformalAreaThreshold`` deliberately gets **no panel row**. It is now only
+    a *starting* value for the solver's own stability probe, so a spin box in the
+    main panel would ask every user to have an opinion about something that
+    settles itself; leaving it in the property editor puts it where someone
+    deliberately trading accuracy against clamping will find it and nowhere else.
     """
     if not hasattr(obj, "ConformalPEC"):
         obj.addProperty(
@@ -281,9 +282,12 @@ def _ensure_conformal_props(obj):
             "App::PropertyFloat", "ConformalAreaThreshold", "Run",
             "Conformal PEC only: the smallest open area fraction an H face may "
             "have before it is clamped, which is what keeps a sliver cut cell "
-            "from destabilising the run at fixed dt. Raise it (towards 0.5) if "
-            "a conformal run diverges; lowering it costs stability, not just "
-            "accuracy.",
+            "from destabilising the run at fixed dt. This is the value the run "
+            "starts from -- the solver measures the assembled scheme and raises "
+            "it by itself if the grid needs it, reporting what it used in the "
+            "run summary. Raising it here costs accuracy and buys nothing the "
+            "probe would not have done anyway; lowering it is the deliberate "
+            "trade in the other direction.",
         )
         obj.ConformalAreaThreshold = CONFORMAL_AREA_THRESHOLD
 
@@ -446,9 +450,10 @@ if _GUI_AVAILABLE:
                 "Fixes the first-order impedance error and the parasitic "
                 "higher-order mode a staircased conductor launches at a modal "
                 "port; a modal port's Z0 is then the conformal one.\n\n"
-                "Costs voxelisation time (conductor surfaces are fine-sampled) "
-                "and is not yet safe on every geometry -- if a run diverges, "
-                "raise ConformalAreaThreshold in the property editor."
+                "Costs voxelisation time (conductor surfaces are fine-sampled). "
+                "Cells the conductor barely clips are clamped for stability, "
+                "which weakens H there; the solver measures the grid and "
+                "reports the clamp threshold it used in the run summary."
             )
 
             layout.addRow("Time unit:", self._time)

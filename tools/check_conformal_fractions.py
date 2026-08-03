@@ -155,12 +155,23 @@ class _Mat(object):
         self.Mu = 1.0
 
 
-def build():
-    """Inner conductor + shield, both overhanging the grid in z."""
-    base = FreeCAD.Vector(CX, CY, -1.0)
-    inner = Part.makeCylinder(A_MM, 6.0, base)
-    shield = Part.makeCylinder(OUT_MM, 6.0, base).cut(
-        Part.makeCylinder(B_MM, 8.0, FreeCAD.Vector(CX, CY, -2.0)))
+def build(flush=False):
+    """Inner conductor + shield.
+
+    *flush* puts their end faces exactly on the z = 0 and z = NZ*D_MM node
+    planes instead of overhanging -- which is what a transmission line running
+    the length of the domain actually looks like, and the case an overhanging
+    reference cannot test. OCC's ``Shape.slice`` returns *nothing* for a plane
+    inside its tolerance band of a planar face, so before
+    ``voxelize._section_nudge`` those node planes sectioned as empty and the
+    three quantities carried on them (``edge_x``, ``edge_y``, ``face_z``) read
+    "no metal at all" across the whole z = 0 plane.
+    """
+    z0, h = (0.0, NZ * D_MM) if flush else (-1.0, 6.0)
+    base = FreeCAD.Vector(CX, CY, z0)
+    inner = Part.makeCylinder(A_MM, h, base)
+    shield = Part.makeCylinder(OUT_MM, h, base).cut(
+        Part.makeCylinder(B_MM, h + 2.0, FreeCAD.Vector(CX, CY, z0 - 1.0)))
     return _Mat([_Body(inner), _Body(shield)], True)
 
 
@@ -270,6 +281,22 @@ def main(out_path):
                     got[key][i, j, k], ref[key][i, j, k]))
         if len(bad) > 8:
             emit("  %-18s ... %d more" % (key, len(bad) - 8))
+
+    # -- ends flush with the grid in z ---------------------------------------
+    # A z-invariant body must give a z-invariant answer, whatever its end faces
+    # land on. That is a zero-tolerance assertion needing no analytic reference,
+    # and it is far sharper than an error threshold: the failure it catches
+    # wiped an entire node plane while every other plane stayed correct.
+    emit()
+    flush = vox.voxelize_materials([build(flush=True)], cell, nodes_m=nodes_m,
+                                   subpixel=False, conformal=True,
+                                   conformal_oversample=ovr)["arrays"]
+    for key in vox.CONFORMAL_KEYS:
+        a = flush[key]
+        spread = float(np.abs(a - a[:, :, 1:2]).max())
+        emit("%-18s flush ends, z-invariant: %s (max plane-to-plane %.4f)"
+             % (key, "yes" if spread == 0.0 else "NO", spread))
+        ok = ok and spread == 0.0
 
     emit()
     emit("RESULT: %s" % ("PASS" if ok else "FAIL"))

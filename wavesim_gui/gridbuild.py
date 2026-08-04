@@ -188,7 +188,7 @@ def collect_axis_snaps(materials):
     from wavesim_gui import voxelize as vox
 
     axes = ([], [], [])
-    for shape, _eps, _mu, _pec in vox._gather(materials):
+    for shape, _eps, _mu, _pec, _sigma in vox._gather(materials):
         bb = _exact_bbox(shape)
         axes[0].extend((bb.XMin, bb.XMax))
         axes[1].extend((bb.YMin, bb.YMax))
@@ -219,7 +219,7 @@ def collect_material_caps(sim, domain, materials):
     from wavesim_gui import voxelize as vox
 
     caps = ([], [], [])
-    for shape, eps, mu, pec in vox._gather(materials):
+    for shape, eps, mu, pec, _sigma in vox._gather(materials):
         if pec:
             continue
         target_m = domain_mod.wavelength_cell_size_m(sim, eps, mu, domain)

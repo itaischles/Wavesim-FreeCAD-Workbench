@@ -5,6 +5,8 @@ After a successful run, :func:`build_results` adds a "Results" group to the
 Simulation tree holding one leaf object per monitor that produced data:
 
 * **Energy** -- the total-domain energy time series.
+* **Dissipation** -- the ohmic power P(t) = Σ σ|E|²·dV absorbed by lossy
+  material; the companion to Energy (``U(0) − U(t) = ∫P dt``).
 * **Probe**  -- a single field component (or magnitude) at one point vs. time.
 * **Voltage** / **Current** -- line-integral (V = ∫E·dl / I = ∮H·dl) time series.
 * **Snapshot** -- a whole field's 2D slices animated over time, with a dropdown
@@ -54,6 +56,7 @@ _RESULT_TYPE = "Result"     # a single result leaf
 
 # Result kinds (stored on each leaf's ResultKind property).
 _KIND_ENERGY = "energy"
+_KIND_DISSIPATION = "dissipation"
 _KIND_PROBE = "probe"
 _KIND_SNAPSHOT = "snapshot"
 _KIND_MODE = "mode"
@@ -65,6 +68,7 @@ _KIND_SPICE_I = "spice_i"   # SPICE co-simulation port current I(t)
 # Each result leaf shows the toolbar icon of the monitor/port that produced it.
 _KIND_ICONS = {
     _KIND_ENERGY: _icon("energy_monitor.png"),
+    _KIND_DISSIPATION: _icon("dissipation_monitor.png"),
     _KIND_PROBE: _icon("field_probe.png"),
     _KIND_SNAPSHOT: _icon("snapshot_monitor.png"),
     _KIND_MODE: _icon("tem_port.png"),
@@ -150,7 +154,8 @@ class ResultObject:
         if not hasattr(obj, "ResultKind"):
             obj.addProperty(
                 "App::PropertyString", "ResultKind", "Result",
-                "Kind of result: energy, probe or snapshot",
+                "Kind of result: energy, dissipation, probe, snapshot, mode, "
+                "voltage, current or a SPICE port series",
             )
             obj.ResultKind = kind
             obj.setEditorMode("ResultKind", 1)
@@ -297,6 +302,13 @@ def build_results(doc, sim, workdir, summary):
                                ("energy_interior", "Energy (excl. PML)")):
             if data_key + "_values" in keys:
                 _new_leaf(name, _KIND_ENERGY, data_key)
+
+        # Dissipation: the same per-region split, one leaf each.
+        for data_key, name in (("dissipation", "Dissipation (incl. PML)"),
+                               ("dissipation_interior",
+                                "Dissipation (excl. PML)")):
+            if data_key + "_values" in keys:
+                _new_leaf(name, _KIND_DISSIPATION, data_key)
 
         # Probes (one time series each).
         for idx, meta in enumerate(summary.get("probes", [])):
@@ -690,6 +702,8 @@ if _GUI_AVAILABLE:
         try:
             if kind == _KIND_ENERGY:
                 _plot_energy(obj)
+            elif kind == _KIND_DISSIPATION:
+                _plot_dissipation(obj)
             elif kind == _KIND_PROBE:
                 _plot_probe(obj)
             elif kind == _KIND_VOLTAGE:
@@ -726,11 +740,13 @@ if _GUI_AVAILABLE:
             "or deleted:\n{}".format(getattr(obj, "ResultsDir", "?")),
         )
 
-    def _plot_series(obj, ylabel, title, color):
+    def _plot_series(obj, ylabel, title, color, annotate=None):
         """1D time-series plot shared by the energy/probe/voltage/current leaves.
 
         Reads ``<DataKey>_times`` / ``<DataKey>_values`` from the leaf's
-        ``results.npz`` and draws them in a non-modal window.
+        ``results.npz`` and draws them in a non-modal window. *annotate*, if
+        given, is called as ``annotate(ax, times_si, values)`` once the curve is
+        drawn, for a per-kind derived quantity (see :func:`_plot_dissipation`).
         """
         workdir = str(obj.ResultsDir)
         key = str(obj.DataKey)
@@ -752,13 +768,40 @@ if _GUI_AVAILABLE:
         ax.set_ylabel(ylabel)
         ax.set_title(title)
         ax.grid(True, alpha=0.3)
+        if annotate is not None:
+            annotate(ax, times, values)
         dialog._canvas.draw()
         dialog.show()
         _register_window(dialog)
 
     def _plot_energy(obj):
         # Titled from the leaf label so the two regions' plots are told apart.
-        _plot_series(obj, "total energy", str(obj.Label), "#d65a00")
+        _plot_series(obj, "total energy (J)", str(obj.Label), "#d65a00")
+
+    def _plot_dissipation(obj):
+        """Ohmic power vs. time, annotated with the energy it integrates to.
+
+        The integral is the number worth reading next to the energy series --
+        for a closed run, ``U(0) - U(t)`` should equal it -- and it is the same
+        trapezoid the solver's ``DissipationMonitor.energy()`` takes, so the
+        plot and ``summary.json`` cannot disagree.
+        """
+        def _total(ax, times, values):
+            import numpy as np
+
+            if len(times) < 2:
+                return
+            # FreeCAD 1.1 bundles numpy 1.26, which has no ``trapezoid`` (the
+            # numpy-2 rename the solver side uses); ``trapz`` is the same rule.
+            trapz = getattr(np, "trapezoid", None) or np.trapz
+            joules = float(trapz(values, times))
+            ax.text(0.98, 0.95, "∫P dt = {:.4g} J".format(joules),
+                    transform=ax.transAxes, ha="right", va="top", fontsize=9,
+                    bbox=dict(boxstyle="round", fc="white", ec="0.7",
+                              alpha=0.85))
+
+        _plot_series(obj, "dissipated power (W)", str(obj.Label), "#b03000",
+                     annotate=_total)
 
     def _plot_probe(obj):
         comp = str(getattr(obj, "Component", "")) or "field"

@@ -30,8 +30,10 @@ job.json schema (Session 2)
                                               # _resolve_backend). The GPU path
                                               # allocates the grid as float32.
                                               # 'auto' never picks CUDA for a
-                                              # conformal job: that backend
-                                              # refuses cut-cell geometry.
+                                              # conformal or a lossy job: that
+                                              # backend refuses cut-cell
+                                              # geometry and has no lossy E
+                                              # update.
       "steps": 1000,
       "conformal_pec": false,       # did this job's voxelisation produce the six
                                     # pec_*_open_* arrays in materials.npz? What
@@ -45,6 +47,11 @@ job.json schema (Session 2)
                                     # H face may have before it is clamped, which
                                     # is what keeps a sliver cut cell stable at
                                     # fixed dt. Ignored without the arrays.
+      "lossy": false,               # does materials.npz carry the three sigma_*
+                                    # arrays? Same rule as conformal_pec: what
+                                    # actually got voxelised, and read before the
+                                    # arrays are opened, because a lossy grid is
+                                    # CPU-only and that sets the grid dtype.
       "grid":   {"Nx":.., "Ny":.., "Nz":.., "dx":.., "dy":.., "dz":..,
                  "x":[..], "y":[..], "z":[..]},  # optional node-coordinate
                  # arrays (metres, solver frame, strictly increasing, N+1 nodes
@@ -111,6 +118,12 @@ job.json schema (Session 2)
                       # "full" sums the entire grid, "interior" only the physical
                       # domain (PML cells dropped). Both false records no energy;
                       # a legacy bool true == {"full": true}
+        "dissipation": {"full": false, "interior": true},
+                      # ohmic power P = sum(sigma*|E|^2*dV), same regions and the
+                      # same both-false-means-nothing rule. 'interior' is usually
+                      # what is wanted: the PML dissipates by design and would
+                      # swamp the material's own loss. Records 0.0 on a lossless
+                      # grid rather than refusing.
         "probes":    [{"name":.., "component":"Ez", "x":.., "y":.., "z":..}, ...],
         "snapshots": [{"name":.., "field":"E", "normal":"z",
                        "position":.., "every_N_steps":20}, ...],
@@ -131,12 +144,22 @@ six or none (a partial set is refused): with them the solver integrates the cut
 contour, without them it staircases exactly as before. ``pec_mask`` stays in
 either case, but is only *read* on the staircase path.
 
+It may also carry the three ``sigma_x/y/z`` arrays — the electric conductivity
+in S/m seen by Ex/Ey/Ez — which switch the solver onto its two-coefficient
+(lossy-dielectric) E update. All three or none. **Lossy dielectrics only:** a
+good conductor belongs in ``pec_mask``, and where the two overlap PEC wins,
+since the mask zeroes E after the update regardless. Absent ⇒ the one-coefficient
+update, bit-identical to a pre-loss run.
+
 results.npz holds the recorded monitor series (e.g. ``energy_times`` /
 ``energy_values`` for the whole grid, ``energy_interior_*`` for the PML-free
-interior); summary.json holds scalar run metadata (dt, steps, wall time, grid
+interior, and ``dissipation_*``/``dissipation_interior_*`` for the ohmic power);
+summary.json holds scalar run metadata (dt, steps, wall time, grid
 dims, voxel counts, and ``<key>_final``/``<key>_max`` per recorded energy
-region). It also echoes ``conformal_pec`` — read off the *grid*, so it records
-what the conductors actually were rather than what the job asked for — and, for
+region — a dissipation region adds ``<key>_energy``, the time integral of the
+power, which is the number to weigh against ``U(0) - U(t)``). It also echoes
+``lossy`` and ``conformal_pec`` — both read off the *grid*, so they record what
+the materials actually were rather than what the job asked for — and, for
 a conformal run, ``cut_cells``, ``clamped_faces`` and the
 ``conformal_area_threshold`` in force. That last one is likewise what *ran*:
 building the Simulation measures this grid's small-cut stability and raises the
@@ -304,6 +327,12 @@ _CONFORMAL_KEYS = (
     "pec_face_open_x", "pec_face_open_y", "pec_face_open_z",
 )
 
+# The electric-conductivity arrays in materials.npz (S/m), in the order
+# wavesim.set_material_arrays takes them. All three or none, like the conformal
+# set: the solver refuses a partial one, since it would leave one field
+# component undamped while the other two decayed.
+_SIGMA_KEYS = ("sigma_x", "sigma_y", "sigma_z")
+
 
 def _cuda_available():
     """Return ``True`` when a CUDA GPU usable by the solver is present.
@@ -323,7 +352,7 @@ def _cuda_available():
         return False
 
 
-def _resolve_backend(requested, conformal=False):
+def _resolve_backend(requested, conformal=False, lossy=False):
     """Resolve a job's requested backend string to a concrete backend name.
 
     ``'auto'`` (the workbench default) becomes ``'cuda'`` when a CUDA GPU is
@@ -342,11 +371,17 @@ def _resolve_backend(requested, conformal=False):
     ``'numba'`` for a conformal job. An explicit ``'cuda'`` is left alone: the
     user named the GPU, and the solver's own ``NotImplementedError`` says far
     more than a silent downgrade would.
+
+    **A lossy dielectric is CPU-only** for the same reason: the CUDA E update has
+    no ``Ca``/``Cb`` pair, so a grid carrying conductivity would step as though it
+    were lossless. The solver refuses it rather than doing that, so ``'auto'``
+    resolves to ``'numba'`` here too, and an explicit ``'cuda'`` is again left to
+    the solver's own error.
     """
     requested = (requested or "auto").lower()
     if requested != "auto":
         return requested
-    if conformal:
+    if conformal or lossy:
         return "numba"
     return "cuda" if _cuda_available() else "numba"
 
@@ -463,12 +498,19 @@ def _field_of(component):
 # so older runs and their result leaves still read.
 _ENERGY_KEY = {"full": "energy", "interior": "energy_interior"}
 
+# Dissipation monitors, same scheme. No legacy bare-prefix case to preserve —
+# this monitor postdates the region split — but the naming mirrors energy's so
+# the two series read as the pair they are (U(0) - U(t) = integral of P dt).
+_DISSIPATION_KEY = {"full": "dissipation", "interior": "dissipation_interior"}
 
-def _energy_regions(cfg):
-    """The ``EnergyMonitor.region`` values requested by ``monitors.energy``.
+
+def _monitor_regions(cfg):
+    """The ``region`` values requested by a ``monitors.<name>`` entry.
 
     *cfg* is either the per-region dict the GUI emits (``{"full": .., "interior":
     ..}``) or a legacy bool, where true meant the one whole-domain monitor.
+    Shared by the energy and dissipation monitors, which carry the same
+    region/d_pml/faces trio solver-side and are auto-filled by the same hook.
     """
     if isinstance(cfg, dict):
         return [r for r in ("full", "interior") if cfg.get(r)]
@@ -923,14 +965,17 @@ def run_job(workdir):
     # cards, so the choice drives the grid dtype. Mode-only jobs never run the
     # FDTD loop (the backend is unused) and their mode solve is more accurate in
     # double precision, so they stay float64 / numba regardless.
-    # The conformal flag has to come from the job, not from materials.npz: this
-    # runs before the arrays are opened, because the backend choice is what sets
-    # the grid dtype. The workbench writes it as what actually got voxelised, not
-    # as what the checkbox said, so it is safe to key on.
+    # The conformal and lossy flags have to come from the job, not from
+    # materials.npz: this runs before the arrays are opened, because the backend
+    # choice is what sets the grid dtype. The workbench writes both as what
+    # actually got voxelised, not as what the checkbox said, so they are safe to
+    # key on. Both rule out the GPU (its kernels implement neither).
     mode_only = bool(job.get("mode_only", False))
     conformal = bool(job.get("conformal_pec", False))
+    lossy = bool(job.get("lossy", False))
     backend = ("numba" if mode_only
-               else _resolve_backend(job.get("backend", "auto"), conformal))
+               else _resolve_backend(job.get("backend", "auto"), conformal,
+                                     lossy))
     field_dtype = np.float32 if backend == "cuda" else np.float64
 
     # Importing the solver pulls in numba/scipy and, on a cold interpreter, can
@@ -980,6 +1025,22 @@ def run_job(workdir):
                 "materials.npz carries an incomplete set of conformal PEC "
                 "arrays: {}. All six or none.".format(
                     sorted(set(_CONFORMAL_KEYS) & set(data.files))))
+        # Electric conductivity (lossy dielectrics). Cast like eps/mu so the
+        # coefficient build stays in the field dtype. Absent -> the solver's
+        # one-coefficient E update, bit-identical to a pre-loss run; present ->
+        # the Ca/Cb pair. All three or none, checked here so a truncated npz is
+        # named rather than surfacing as a solver-side shape error.
+        sigma_arrays = {}
+        if all(key in data.files for key in _SIGMA_KEYS):
+            sigma_arrays = {
+                key: data[key].astype(field_dtype, copy=False)
+                for key in _SIGMA_KEYS
+            }
+        elif any(key in data.files for key in _SIGMA_KEYS):
+            raise ValueError(
+                "materials.npz carries an incomplete set of conductivity "
+                "arrays: {}. All three or none.".format(
+                    sorted(set(_SIGMA_KEYS) & set(data.files))))
         # Cast to the grid's dtype so the field and material arrays stay
         # matched — the CUDA backend keys its per-cell arithmetic and scalar
         # coefficients off the field dtype, so a float32 grid needs float32
@@ -998,11 +1059,16 @@ def run_job(workdir):
                 float(job["conformal_area_threshold"])
                 if conformal_arrays and "conformal_area_threshold" in job
                 else None),
-            **conformal_arrays
+            **conformal_arrays,
+            **sigma_arrays
         )
         if pec_mask is not None:
             voxel_summary["pec_cells"] = int(np.count_nonzero(pec_mask))
         voxel_summary["dielectric_cells"] = int(np.count_nonzero(data["eps_x"] != 1.0))
+        if sigma_arrays:
+            voxel_summary["lossy_cells"] = int(
+                np.count_nonzero(data["sigma_x"] > 0.0))
+            voxel_summary["max_sigma"] = float(data["sigma_x"].max())
         if grid.is_conformal and backend == "cuda":
             # The solver's own guard (backend_cuda._refuse_conformal) sits in the
             # per-call update_H wrapper, but Simulation.run('cuda') dispatches to
@@ -1019,6 +1085,18 @@ def run_job(workdir):
                 "would be silently wrong rather than merely slow. Use "
                 "backend='numba' (or 'numpy'), or turn off the Simulation's "
                 "ConformalPEC to run staircased.")
+        if grid.is_lossy and backend == "cuda":
+            # Unlike the conformal case above, the solver's own guard does cover
+            # the resident path (backend_cuda._refuse_lossy is called from
+            # CudaResident.__init__), so this is not closing a hole — it is
+            # raising before the grid is uploaded, and saying what to do about it
+            # in the workbench's own terms. 'auto' never reaches here.
+            raise NotImplementedError(
+                "backend='cuda' cannot run lossy dielectrics: the GPU E update "
+                "has no Ca/Cb coefficient pair, so a grid carrying conductivity "
+                "would step as though it were lossless. Pick 'numba' (or "
+                "'numpy') in Wavesim -> Settings, or clear the Sigma of every "
+                "material to run the model lossless deliberately.")
         if grid.is_conformal:
             # Provisional: building the Simulation below measures this grid's
             # stability and may raise the threshold (solver S7), which moves
@@ -1124,7 +1202,16 @@ def run_job(workdir):
     # solver takes the PML geometry off the CPML this run is built with, so the
     # interior monitor needs nothing from us but the region name.
     energy = [(region, ws.EnergyMonitor(region=region))
-              for region in _energy_regions(mon_cfg.get("energy", True))]
+              for region in _monitor_regions(mon_cfg.get("energy", True))]
+
+    # Dissipation: P = sum(sigma*|E|^2*dV), the ohmic power a lossy dielectric
+    # absorbs -- the term that makes the energy series legitimately decay.
+    # Region-selected exactly like energy ('interior' is usually what is wanted:
+    # the PML shell dissipates by design and would swamp the material's own
+    # loss). The solver records 0.0 on a lossless grid rather than refusing.
+    dissipation = [(region, ws.DissipationMonitor(region=region))
+                   for region in _monitor_regions(mon_cfg.get("dissipation",
+                                                              False))]
 
     probes = []  # (name, FieldProbe)
     for p in mon_cfg.get("probes", []):
@@ -1175,6 +1262,7 @@ def run_job(workdir):
         currents.append((c.get("name", "current"), ws.CurrentMonitor(c["path"])))
 
     all_monitors = [m for _region, m in energy]
+    all_monitors.extend(m for _region, m in dissipation)
     all_monitors.extend(m for _name, m in probes)
     all_monitors.extend(snapshot_solver_monitors)
     all_monitors.extend(m for _name, m in voltages)
@@ -1247,6 +1335,10 @@ def run_job(workdir):
     for region, mon in energy:
         result_arrays[_ENERGY_KEY[region] + "_times"] = np.asarray(mon.times)
         result_arrays[_ENERGY_KEY[region] + "_values"] = np.asarray(mon.values)
+    for region, mon in dissipation:
+        key = _DISSIPATION_KEY[region]
+        result_arrays[key + "_times"] = np.asarray(mon.times)
+        result_arrays[key + "_values"] = np.asarray(mon.values)
 
     # Probes: one time series each, keyed by index (names kept in the summary).
     probe_meta = []
@@ -1366,6 +1458,8 @@ def run_job(workdir):
         # absent array set falls back to staircase), and a stored result that
         # claims conformal when it staircased is worse than no field at all.
         "conformal_pec": bool(grid.is_conformal),
+        # Likewise off the grid: whether this run stepped the lossy E update.
+        "lossy": bool(grid.is_lossy),
     }
     summary.update(voxel_summary)
     # Per recorded region: <key>_final / <key>_max, so a run recording both the
@@ -1374,6 +1468,16 @@ def run_job(workdir):
         if mon.values:
             summary[_ENERGY_KEY[region] + "_final"] = float(mon.values[-1])
             summary[_ENERGY_KEY[region] + "_max"] = float(max(mon.values))
+    # Dissipation reports a third number the energy series has no analogue for:
+    # the time integral of the power, i.e. the joules the lossy material
+    # actually absorbed over the run. That is the quantity to compare against
+    # U(0) - U(t), and it is the monitor's own trapezoid so the two agree.
+    for region, mon in dissipation:
+        if mon.values:
+            key = _DISSIPATION_KEY[region]
+            summary[key + "_final"] = float(mon.values[-1])
+            summary[key + "_max"] = float(max(mon.values))
+            summary[key + "_energy"] = float(mon.energy())
     if probe_meta:
         summary["probes"] = probe_meta
     if snapshot_meta:

@@ -3,9 +3,16 @@
 
 A *Material* is a scripted FreeCAD DocumentObject grouped under the simulation's
 "Materials" child group. It carries the electromagnetic parameters (relative
-permittivity / permeability, or a PEC flag) and a link list to the CAD bodies it
-applies to. Session 3's voxeliser (:mod:`wavesim_gui.voxelize`) reads these to
-fill the per-cell material arrays the solver consumes.
+permittivity / permeability, an electric conductivity, or a PEC flag) and a link
+list to the CAD bodies it applies to. Session 3's voxeliser
+(:mod:`wavesim_gui.voxelize`) reads these to fill the per-cell material arrays
+the solver consumes.
+
+``Sigma`` (S/m) makes a material a **lossy dielectric**: the solver switches to a
+two-coefficient E update whose damping is unconditionally stable (conductivity
+does not touch the CFL limit). It is *not* a way to model metal -- see
+:func:`relaxation_ratio` and the k > 1 check below, which is the workbench-side
+half of the solver's own warning.
 
 Editing follows the standard FreeCAD task-panel pattern: ``Wavesim_AssignMaterial``
 creates the Material object from the current selection and immediately opens a
@@ -48,18 +55,42 @@ _DEFAULT_BODY_COLOR = (0.80, 0.80, 0.80)
 _VACUUM_COLOR = (0.75, 0.90, 1.00)
 _PEC_COLOR = (0.78, 0.78, 0.82)
 
+# Vacuum permittivity (F/m). Only used for the lossy-dielectric relaxation
+# check; the solver has its own copy in ``wavesim.constants``.
+_EPS0 = 8.8541878128e-12
+
 
 # --------------------------------------------------------------------------- #
 # Document-object model
 # --------------------------------------------------------------------------- #
+
+def _ensure_loss_props(obj):
+    """Add the conductivity property, back-filling a document saved without it.
+
+    Called from ``__init__`` and ``onDocumentRestored``, so an older material
+    gains ``Sigma = 0`` (lossless -- exactly what it always was) rather than
+    relying on every reader's ``getattr`` default.
+    """
+    if not hasattr(obj, "Sigma"):
+        obj.addProperty(
+            "App::PropertyFloat", "Sigma", "Material",
+            "Electric conductivity (S/m). Nonzero makes this a lossy "
+            "dielectric; leave at 0 for a lossless one. Lossy dielectrics "
+            "only -- a good conductor belongs in a PEC material, not here",
+        )
+        obj.Sigma = 0.0
+
 
 class MaterialObject:
     """``Proxy`` for a Material document object.
 
     Properties:
         ``Eps`` / ``Mu`` -- relative permittivity / permeability of the fill.
+        ``Sigma``        -- electric conductivity in S/m (0 = lossless). Makes
+                            the cells a lossy dielectric; ignored when ``Pec``.
         ``Pec``          -- if True the bodies are perfect electric conductor;
-                            ``Eps``/``Mu`` are ignored and the cells are masked.
+                            ``Eps``/``Mu``/``Sigma`` are ignored and the cells
+                            are masked.
         ``Color``        -- display colour applied to every assigned body.
         ``Bodies``       -- the CAD objects this material applies to. Bodies are
                             attached by dragging them onto the material in the
@@ -90,10 +121,11 @@ class MaterialObject:
                 "Relative permeability (mu_r)",
             )
             obj.Mu = 1.0
+        _ensure_loss_props(obj)
         if not hasattr(obj, "Pec"):
             obj.addProperty(
                 "App::PropertyBool", "Pec", "Material",
-                "Perfect electric conductor (overrides Eps/Mu)",
+                "Perfect electric conductor (overrides Eps/Mu/Sigma)",
             )
             obj.Pec = False
         if not hasattr(obj, "Color"):
@@ -111,6 +143,8 @@ class MaterialObject:
 
     def onDocumentRestored(self, obj):
         obj.Proxy = self
+        # Documents saved before conductivity existed were lossless.
+        _ensure_loss_props(obj)
         self.Type = getattr(self, "Type", _MATERIAL_TYPE)
 
     def execute(self, obj):
@@ -156,11 +190,103 @@ def find_materials(sim):
     return [obj for obj in grp.Group if is_material(obj)]
 
 
+def material_sigma(mat):
+    """Electric conductivity (S/m) of *mat*, clamped at 0; 0 for a PEC.
+
+    The single accessor for the property, so "a PEC material carries no
+    conductivity" is stated once. The solver refuses a negative conductivity,
+    and a PEC cell has its E zeroed after every update, which would make any
+    sigma there both meaningless and confusing in the summary counts.
+    """
+    if bool(getattr(mat, "Pec", False)):
+        return 0.0
+    return max(0.0, float(getattr(mat, "Sigma", 0.0)))
+
+
+def material_is_lossy(mat):
+    """True when *mat* carries a nonzero conductivity (and is not PEC)."""
+    return material_sigma(mat) > 0.0
+
+
+def relaxation_ratio(eps_r, sigma, dt):
+    """The solver's lossy-update parameter ``k = sigma*dt / (2*eps0*eps_r)``.
+
+    ``k`` is half the timestep measured in dielectric relaxation times
+    ``tau = eps0*eps_r/sigma``. The solver's damping factor is
+    ``Ca = (1-k)/(1+k)``: stable for every k, but **negative above k = 1**, where
+    the field alternates sign each step instead of decaying and bleeds off over
+    ~10^5 steps rather than dying inside a cell. That is the regime a metal-scale
+    sigma lands in, and it produces a run-shaped wrong answer rather than a
+    failure -- so the workbench checks it *before* the run, where the user can
+    still act on it (:func:`loss_warnings`), instead of leaving it to the
+    solver's own warning on stderr.
+    """
+    if eps_r <= 0.0 or dt <= 0.0:
+        return 0.0
+    return 0.5 * float(sigma) * float(dt) / (_EPS0 * float(eps_r))
+
+
+# The k above which the solver's Ca goes negative (wavesim.loss).
+_K_LIMIT = 1.0
+
+
+def loss_warnings(sim, dt=None):
+    """Warn about lossy materials whose conductivity outruns the timestep.
+
+    Returns a list of human-readable strings, one per offending material, or an
+    empty list when nothing is wrong (including when there is no domain to take
+    a timestep from -- the check simply cannot be made yet).
+
+    *dt* is the run's CFL step in seconds; omitted, it is read off the
+    simulation's Domain. Both the Material task panel and the job builder call
+    this, so the same sentence appears while editing and again before the run.
+    """
+    if sim is None:
+        return []
+    if dt is None:
+        from wavesim_gui import domain as domain_mod
+
+        dom = domain_mod.find_domain(sim)
+        if dom is None:
+            return []
+        dt = domain_mod.cfl_dt(dom)
+    if not dt or dt <= 0.0:
+        return []
+
+    out = []
+    for mat in find_materials(sim):
+        sigma = material_sigma(mat)
+        if sigma <= 0.0:
+            continue
+        eps_r = float(getattr(mat, "Eps", 1.0))
+        k = relaxation_ratio(eps_r, sigma, dt)
+        if k > _K_LIMIT:
+            out.append(loss_warning_text(mat.Label, eps_r, sigma, k))
+    return out
+
+
+def loss_warning_text(label, eps_r, sigma, k):
+    """The k > 1 sentence for one material (shared by the panel and the run)."""
+    return (
+        "Material '{}': sigma={:.4g} S/m at eps_r={:.4g} gives "
+        "sigma*dt/(2*eps0*eps_r) = {:.3g} > 1 on this grid's timestep. The "
+        "solver's damping factor is negative there, so the field alternates "
+        "sign every step instead of decaying -- a run-shaped wrong answer. "
+        "This is the regime a metal-scale conductivity lands in; model a good "
+        "conductor as a PEC material instead, or refine the grid (a smaller dt "
+        "lowers k proportionally).".format(label, sigma, eps_r, k)
+    )
+
+
 def _describe(obj):
     """Short human label for a material, e.g. ``PEC`` or ``eps=2.20``."""
     if getattr(obj, "Pec", False):
         return "PEC"
-    return "eps={:.3g}".format(getattr(obj, "Eps", 1.0))
+    text = "eps={:.3g}".format(getattr(obj, "Eps", 1.0))
+    sigma = material_sigma(obj)
+    if sigma > 0.0:
+        text += ", sigma={:.3g} S/m".format(sigma)
+    return text
 
 
 def _is_solid_body(obj):
@@ -215,7 +341,8 @@ def _detach_body(body, keep):
             mat.Bodies = [b for b in bodies if b is not body]
 
 
-def create_material(doc, sim, label, eps=1.0, mu=1.0, pec=False, color=None):
+def create_material(doc, sim, label, eps=1.0, mu=1.0, pec=False, color=None,
+                    sigma=0.0):
     """Create a Material under *sim* with the given parameters and return it.
 
     Attaches the tree view provider when a GUI is available, so it works both
@@ -227,6 +354,7 @@ def create_material(doc, sim, label, eps=1.0, mu=1.0, pec=False, color=None):
     mat.Pec = bool(pec)
     mat.Eps = float(eps)
     mat.Mu = float(mu)
+    mat.Sigma = float(sigma)
     if color is not None:
         mat.Color = color
     mat.Label = label
@@ -389,6 +517,19 @@ if _GUI_AVAILABLE:
             self._mu.setSingleStep(0.1)
             self._mu.setValue(float(getattr(obj, "Mu", 1.0)))
 
+            # Conductivity. A lossy dielectric spans many decades (silicon
+            # ~1e-3, seawater ~4), so the box is logarithmic in feel: plenty of
+            # decimals and a small step, with the range stopping well short of
+            # metal -- which belongs in a PEC material, not here.
+            self._sigma = QtWidgets.QDoubleSpinBox()
+            self._sigma.setRange(0.0, 1.0e6)
+            self._sigma.setDecimals(6)
+            self._sigma.setSingleStep(0.01)
+            self._sigma.setValue(float(getattr(obj, "Sigma", 0.0)))
+
+            self._loss_hint = QtWidgets.QLabel("")
+            self._loss_hint.setWordWrap(True)
+
             self._bodies_label = QtWidgets.QLabel(self._bodies_text())
             self._bodies_label.setWordWrap(True)
 
@@ -397,6 +538,8 @@ if _GUI_AVAILABLE:
             layout.addRow(self._pec)
             layout.addRow("Relative permittivity (eps_r):", self._eps)
             layout.addRow("Relative permeability (mu_r):", self._mu)
+            layout.addRow("Conductivity (S/m):", self._sigma)
+            layout.addRow(self._loss_hint)
             layout.addRow("Assigned bodies:", self._bodies_label)
 
             hint = QtWidgets.QLabel(
@@ -408,8 +551,68 @@ if _GUI_AVAILABLE:
 
             self._pec.toggled.connect(self._on_pec)
             self._on_pec(self._pec.isChecked())
+            # The k > 1 check depends on eps_r and sigma together, so watch both.
+            self._sigma.valueChanged.connect(self._update_loss_hint)
+            self._eps.valueChanged.connect(self._update_loss_hint)
+            self._update_loss_hint()
 
             self.form = form
+
+        def _update_loss_hint(self, *_args):
+            """Show the lossy-dielectric status (and the k > 1 warning) live.
+
+            Computed here rather than only at run time because the answer
+            depends on the grid's timestep, which the user cannot see from the
+            material panel -- and because a metal-scale conductivity typed here
+            costs a whole run to discover otherwise.
+            """
+            sigma = self._sigma.value()
+            if self._pec.isChecked() or sigma <= 0.0:
+                self._loss_hint.setText("")
+                self._loss_hint.setVisible(False)
+                return
+
+            dt = self._panel_dt()
+            if dt is None:
+                text = ("Lossy dielectric. The stability/accuracy check needs a "
+                        "Domain to take a timestep from.")
+                style = ""
+            else:
+                eps_r = self._eps.value()
+                k = relaxation_ratio(eps_r, sigma, dt)
+                if k > _K_LIMIT:
+                    text = loss_warning_text(
+                        self._name.text().strip() or "this material",
+                        eps_r, sigma, k)
+                    style = "color: #b03000;"
+                else:
+                    text = (
+                        "Lossy dielectric: sigma*dt/(2*eps0*eps_r) = {:.3g} "
+                        "(must stay under 1). Conductivity does not affect the "
+                        "timestep.".format(k)
+                    )
+                    style = ""
+            self._loss_hint.setText(text)
+            self._loss_hint.setStyleSheet(style)
+            self._loss_hint.setVisible(True)
+
+        def _panel_dt(self):
+            """The grid's CFL timestep in seconds, or None with no Domain."""
+            from wavesim_gui import domain as domain_mod
+
+            sim = self.sim
+            if sim is None and self.obj is not None:
+                sim = active_simulation(self.obj.Document)
+            if sim is None:
+                return None
+            dom = domain_mod.find_domain(sim)
+            if dom is None:
+                return None
+            try:
+                dt = domain_mod.cfl_dt(dom)
+            except Exception:
+                return None
+            return dt if dt > 0.0 else None
 
         def _bodies_text(self):
             bodies = getattr(self.obj, "Bodies", []) or []
@@ -443,9 +646,12 @@ if _GUI_AVAILABLE:
                 self._update_color_swatch()
 
         def _on_pec(self, checked):
-            # eps/mu are meaningless for a PEC region.
+            # eps/mu/sigma are meaningless for a PEC region: its E is zeroed
+            # after every update, so a conductivity there could have no effect.
             self._eps.setEnabled(not checked)
             self._mu.setEnabled(not checked)
+            self._sigma.setEnabled(not checked)
+            self._update_loss_hint()
 
         def accept(self):
             # The object is created here (not at command time), so a cancelled
@@ -466,6 +672,7 @@ if _GUI_AVAILABLE:
                 self.obj.Pec = self._pec.isChecked()
                 self.obj.Eps = self._eps.value()
                 self.obj.Mu = self._mu.value()
+                self.obj.Sigma = self._sigma.value()
                 self.obj.Color = self._color
                 name = self._name.text().strip()
                 self.obj.Label = name or "Material ({})".format(_describe(self.obj))
@@ -519,8 +726,8 @@ if _GUI_AVAILABLE:
             return {
                 "Pixmap": _MATERIAL_ICON,
                 "MenuText": "New Material",
-                "ToolTip": "Create an EM material (eps_r / mu_r / PEC); drag "
-                "bodies onto it in the tree to assign them",
+                "ToolTip": "Create an EM material (eps_r / mu_r / sigma / PEC); "
+                "drag bodies onto it in the tree to assign them",
             }
 
         def Activated(self):

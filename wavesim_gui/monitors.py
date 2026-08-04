@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """Diagnostic monitors for the Wavesim workbench (Session 7).
 
-Five kinds of monitor are scripted FreeCAD DocumentObjects grouped under the
+Six kinds of monitor are scripted FreeCAD DocumentObjects grouped under the
 simulation's "Monitors" child group, each mapping onto one of the solver's
 monitor dataclasses (:mod:`wavesim.monitors`):
 
@@ -17,6 +17,12 @@ monitor dataclasses (:mod:`wavesim.monitors`):
   location, so it is a tree-only object with no 3D representation; its panel
   instead picks the volume(s) summed: the PML-free interior (the default), the
   whole grid including the PML, or both as two separate series.
+* **Dissipation** (``DissipationMonitor``) -- the ohmic-loss diagnostic,
+  P(t) = Σ σ|E|²·dV over the chosen volume. Location-free and region-selected
+  exactly like Energy, and its companion: the dissipated power is what makes a
+  lossy run's energy legitimately decay, so ``U(0) − U(t) = ∫P dt`` is the check
+  that tells absorbed power from a solver leak. Only a material with a nonzero
+  ``Sigma`` dissipates; on a lossless run the series is flat zero.
 * **Voltage** (``VoltageMonitor``) -- records V(t) = ∫E·dl along an *open*
   curve, integrated from the curve's first vertex to its last.
 * **Current** (``CurrentMonitor``) -- records I(t) = ∮H·dl around a *closed*
@@ -38,8 +44,9 @@ convert to metres and into the solver frame (measured from the domain origin) fo
 the runner, mirroring :func:`wavesim_gui.source.source_spec`.
 
 Importing this module registers ``Wavesim_AddProbe``, ``Wavesim_AddSnapshot``,
-``Wavesim_AddEnergyMonitor``, ``Wavesim_AddVoltageMonitor`` and
-``Wavesim_AddCurrentMonitor`` with ``Gui.addCommand`` when a GUI is available.
+``Wavesim_AddEnergyMonitor``, ``Wavesim_AddDissipationMonitor``,
+``Wavesim_AddVoltageMonitor`` and ``Wavesim_AddCurrentMonitor`` with
+``Gui.addCommand`` when a GUI is available.
 """
 
 import os
@@ -63,6 +70,8 @@ _VOLTAGE_MONITOR_ICON = os.path.join(_RESOURCES_DIR, "voltage_monitor.png")
 _CURRENT_MONITOR_ICON = os.path.join(_RESOURCES_DIR, "current_monitor.png")
 _FIELD_PROBE_ICON = os.path.join(_RESOURCES_DIR, "field_probe.png")
 _ENERGY_MONITOR_ICON = os.path.join(_RESOURCES_DIR, "energy_monitor.png")
+_DISSIPATION_MONITOR_ICON = os.path.join(_RESOURCES_DIR,
+                                         "dissipation_monitor.png")
 
 # Marker property, mirroring the other entities' identity scheme so the object is
 # recognisable before its Python proxy is re-attached on reload.
@@ -70,6 +79,7 @@ _TYPE_PROP = "WavesimType"
 _PROBE_TYPE = "Probe"
 _SNAPSHOT_TYPE = "Snapshot"
 _ENERGY_TYPE = "EnergyMonitor"
+_DISSIPATION_TYPE = "DissipationMonitor"
 _VOLTAGE_TYPE = "VoltageMonitor"
 _CURRENT_TYPE = "CurrentMonitor"
 
@@ -335,30 +345,49 @@ class SnapshotObject:
     __setstate__ = loads
 
 
-def _ensure_energy_regions(obj, legacy=False):
+def _ensure_region_props(obj, quantity, legacy=False):
     """Add the two region-selection properties, defaulting per *legacy*.
 
+    Shared by the Energy and Dissipation monitors, which map onto the two solver
+    monitors carrying the same ``region``/``d_pml``/``faces`` trio (and filled
+    from the run's CPML by the same hook). *quantity* only names the summed
+    quantity in the property tooltips.
+
     A new monitor defaults to the interior alone: the PML absorbs whatever
-    reaches it, so whole-grid energy conflates the energy still stored in the
-    model with the energy already on its way out, while the interior series
-    decays to ~0 once the fields have left. A monitor restored from a document
-    saved before the regions existed recorded the whole grid, so it migrates to
-    that and keeps recording what it always did.
+    reaches it, so a whole-grid sum conflates what is still stored in the model
+    with what is already on its way out, while the interior series decays to ~0
+    once the fields have left. *legacy* is for a monitor restored from a document
+    saved before the regions existed: it recorded the whole grid, so it migrates
+    to that and keeps recording what it always did.
     """
     if not hasattr(obj, "RecordInterior"):
         obj.addProperty(
             "App::PropertyBool", "RecordInterior", "Monitor",
-            "Record the energy of the physical domain only, excluding the PML "
-            "absorbing layers",
+            "Record the {} of the physical domain only, excluding the PML "
+            "absorbing layers".format(quantity),
         )
         obj.RecordInterior = not legacy
     if not hasattr(obj, "RecordFullDomain"):
         obj.addProperty(
             "App::PropertyBool", "RecordFullDomain", "Monitor",
-            "Record the energy of the whole grid, including the PML absorbing "
-            "layers",
+            "Record the {} of the whole grid, including the PML absorbing "
+            "layers".format(quantity),
         )
         obj.RecordFullDomain = legacy
+
+
+def _ensure_energy_regions(obj, legacy=False):
+    """Region properties for the Energy monitor (see :func:`_ensure_region_props`)."""
+    _ensure_region_props(obj, "energy", legacy=legacy)
+
+
+def _ensure_dissipation_regions(obj):
+    """Region properties for the Dissipation monitor.
+
+    No *legacy* case: this monitor postdates the region split, so every
+    document that has one has one with both properties already.
+    """
+    _ensure_region_props(obj, "ohmic power dissipated in")
 
 
 class EnergyObject:
@@ -398,6 +427,48 @@ class EnergyObject:
     def loads(self, state):
         if isinstance(state, dict):
             self.Type = state.get("Type", _ENERGY_TYPE)
+        return None
+
+    __getstate__ = dumps
+    __setstate__ = loads
+
+
+class DissipationObject:
+    """``Proxy`` for the ohmic-dissipation monitor.
+
+    Like the energy monitor it has no spatial location -- it is a volume sum, so
+    it is a tree-only object whose panel picks the volume(s), not a position.
+
+    Properties:
+        ``RecordInterior``   -- sum only the physical domain, dropping the PML
+                                cells (the solver's ``region='interior'``).
+        ``RecordFullDomain`` -- sum the whole grid, PML included (``'full'``).
+
+    ``'interior'`` is the default here for a sharper reason than on the energy
+    monitor: the PML **dissipates by design**, and its absorbed power swamps the
+    material's own loss, which is the quantity this monitor exists to report.
+    """
+
+    def __init__(self, obj):
+        self.Type = _DISSIPATION_TYPE
+        obj.Proxy = self
+        _add_type_marker(obj, _DISSIPATION_TYPE)
+        _ensure_dissipation_regions(obj)
+
+    def onDocumentRestored(self, obj):
+        obj.Proxy = self
+        _ensure_dissipation_regions(obj)
+        self.Type = getattr(self, "Type", _DISSIPATION_TYPE)
+
+    def execute(self, obj):
+        pass
+
+    def dumps(self):
+        return {"Type": getattr(self, "Type", _DISSIPATION_TYPE)}
+
+    def loads(self, state):
+        if isinstance(state, dict):
+            self.Type = state.get("Type", _DISSIPATION_TYPE)
         return None
 
     __getstate__ = dumps
@@ -474,6 +545,11 @@ def is_energy_monitor(obj):
     return _is_type(obj, _ENERGY_TYPE)
 
 
+def is_dissipation_monitor(obj):
+    """Return True if *obj* is a Wavesim Dissipation monitor."""
+    return _is_type(obj, _DISSIPATION_TYPE)
+
+
 def monitors_group(sim):
     """Return the "Monitors" child group of the Simulation container *sim*.
 
@@ -508,6 +584,11 @@ def find_snapshots(sim):
 def find_energy_monitors(sim):
     """Return all Energy monitors under the Simulation container *sim*."""
     return _find(sim, is_energy_monitor)
+
+
+def find_dissipation_monitors(sim):
+    """Return all Dissipation monitors under the Simulation container *sim*."""
+    return _find(sim, is_dissipation_monitor)
 
 
 def is_voltage_monitor(obj):
@@ -745,10 +826,10 @@ def _path_spec(mon, origin_m, deflection_mm):
 def monitors_spec(sim, origin_m):
     """Return the ``job.json`` ``monitors`` dict for the simulation *sim*.
 
-    Every entry is user-defined: ``energy`` names a volume only when an explicit
-    Energy monitor asks for it (see :func:`energy_spec`). A simulation with no
-    monitors records nothing, so the job contains exactly what was asked for and
-    nothing else.
+    Every entry is user-defined: ``energy`` and ``dissipation`` name a volume
+    only when an explicit monitor asks for it (see :func:`_region_spec`). A
+    simulation with no monitors records nothing, so the job contains exactly
+    what was asked for and nothing else.
     """
     probes = [probe_spec(p, origin_m) for p in find_probes(sim)]
     snapshots = [snapshot_spec(s, origin_m) for s in find_snapshots(sim)]
@@ -763,39 +844,57 @@ def monitors_spec(sim, origin_m):
     ]
     return {
         "energy": energy_spec(find_energy_monitors(sim)),
+        "dissipation": dissipation_spec(find_dissipation_monitors(sim)),
         "probes": probes, "snapshots": snapshots,
         "voltages": voltages, "currents": currents,
     }
 
 
-def energy_spec(energy_objs):
-    """Return the ``monitors.energy`` dict for the Energy monitors *energy_objs*.
+def _region_spec(objs):
+    """Return the ``{"full": .., "interior": ..}`` dict for region monitors *objs*.
 
-    One flag per solver ``EnergyMonitor.region``: ``interior`` sums the physical
-    domain with the PML cells dropped, ``full`` sums the whole grid. Both false
-    (the no-monitor case) means no energy is recorded at all.
+    One flag per solver ``region`` value: ``interior`` sums the physical domain
+    with the PML cells dropped, ``full`` sums the whole grid. Both false (the
+    no-monitor case) means the quantity is not recorded at all. Shared by the
+    energy and dissipation entries, which the runner reads with one helper.
     """
     return {
-        "full": any(bool(getattr(o, "RecordFullDomain", False))
-                    for o in energy_objs),
-        "interior": any(bool(getattr(o, "RecordInterior", True))
-                        for o in energy_objs),
+        "full": any(bool(getattr(o, "RecordFullDomain", False)) for o in objs),
+        "interior": any(bool(getattr(o, "RecordInterior", True)) for o in objs),
     }
+
+
+def energy_spec(energy_objs):
+    """Return the ``monitors.energy`` dict for the Energy monitors *energy_objs*."""
+    return _region_spec(energy_objs)
+
+
+def dissipation_spec(dissipation_objs):
+    """Return the ``monitors.dissipation`` dict for the Dissipation monitors."""
+    return _region_spec(dissipation_objs)
+
+
+def _region_text(obj):
+    """The "(excl. PML)"-style suffix naming the volume(s) a monitor sums."""
+    interior = bool(getattr(obj, "RecordInterior", True))
+    full = bool(getattr(obj, "RecordFullDomain", False))
+    if interior and full:
+        return "excl. + incl. PML"
+    if full:
+        return "incl. PML"
+    if interior:
+        return "excl. PML"
+    return "nothing selected"
 
 
 def _energy_label(obj):
     """Tree label naming the volume(s) this energy monitor sums."""
-    interior = bool(getattr(obj, "RecordInterior", True))
-    full = bool(getattr(obj, "RecordFullDomain", False))
-    if interior and full:
-        what = "excl. + incl. PML"
-    elif full:
-        what = "incl. PML"
-    elif interior:
-        what = "excl. PML"
-    else:
-        what = "nothing selected"
-    return "Energy ({})".format(what)
+    return "Energy ({})".format(_region_text(obj))
+
+
+def _dissipation_label(obj):
+    """Tree label naming the volume(s) this dissipation monitor sums."""
+    return "Dissipation ({})".format(_region_text(obj))
 
 
 def _probe_label(obj):
@@ -1045,6 +1144,41 @@ if _GUI_AVAILABLE:
 
         def doubleClicked(self, vobj):
             _open_energy_panel(vobj.Object)
+            return True
+
+        def dumps(self):
+            return None
+
+        def loads(self, state):
+            return None
+
+        __getstate__ = dumps
+        __setstate__ = loads
+
+    class DissipationViewProvider:
+        """Tree-only view provider for the dissipation monitor.
+
+        No 3D geometry (it is a volume sum, with no location), so the object is
+        simply listed under Monitors; double-click opens its panel to choose
+        which volume(s) the power sum covers.
+        """
+
+        def __init__(self, vobj):
+            vobj.Proxy = self
+
+        def attach(self, vobj):
+            self.ViewObject = vobj
+            self.Object = vobj.Object
+
+        def getIcon(self):
+            return _DISSIPATION_MONITOR_ICON
+
+        def setEdit(self, vobj, mode=0):
+            _open_dissipation_panel(vobj.Object)
+            return True
+
+        def doubleClicked(self, vobj):
+            _open_dissipation_panel(vobj.Object)
             return True
 
         def dumps(self):
@@ -1471,6 +1605,105 @@ if _GUI_AVAILABLE:
         def getStandardButtons(self):
             return _ok_cancel_buttons()
 
+    class TaskDissipationPanel:
+        """Task-tab panel: which volume(s) the ohmic-power sum covers."""
+
+        def __init__(self, obj, created=False):
+            QtWidgets = _qt_widgets()
+            self.obj = obj
+            self.created = created
+
+            form = QtWidgets.QWidget()
+            form.setWindowTitle("Wavesim Dissipation Monitor")
+            layout = QtWidgets.QVBoxLayout(form)
+
+            self._interior = QtWidgets.QCheckBox(
+                "Interior only — exclude the PML volume"
+            )
+            self._interior.setChecked(bool(getattr(obj, "RecordInterior", True)))
+            self._full = QtWidgets.QCheckBox(
+                "Whole domain — include the PML volume"
+            )
+            self._full.setChecked(bool(getattr(obj, "RecordFullDomain", False)))
+            layout.addWidget(self._interior)
+            layout.addWidget(self._full)
+
+            info = QtWidgets.QLabel(
+                "Records the ohmic power P = Σ σ|E|²·dV absorbed by lossy "
+                "material at every timestep — the term that makes a lossy run's "
+                "energy legitimately decay. Only a material with a nonzero "
+                "conductivity dissipates; on a lossless model the series is "
+                "flat zero.\n\n"
+                "Keep to the interior unless you mean otherwise: the PML "
+                "absorbs by design, and its power swamps the material's own "
+                "loss."
+            )
+            info.setWordWrap(True)
+            layout.addWidget(info)
+
+            self._lossy_hint = QtWidgets.QLabel("")
+            self._lossy_hint.setWordWrap(True)
+            layout.addWidget(self._lossy_hint)
+            self._update_lossy_hint()
+            layout.addStretch(1)
+
+            # A monitor recording neither volume records nothing, so unticking
+            # the last remaining box ticks the other one instead.
+            self._interior.toggled.connect(
+                lambda on: self._keep_one_checked(on, self._full))
+            self._full.toggled.connect(
+                lambda on: self._keep_one_checked(on, self._interior))
+
+            self.form = form
+
+        def _update_lossy_hint(self):
+            """Say so when the model has nothing for this monitor to measure."""
+            from wavesim_gui import materials as materials_mod
+
+            sim = active_simulation(self.obj.Document)
+            lossy = any(materials_mod.material_is_lossy(m)
+                        for m in materials_mod.find_materials(sim))
+            if lossy:
+                self._lossy_hint.setText("")
+                self._lossy_hint.setVisible(False)
+                return
+            self._lossy_hint.setText(
+                "No material in this simulation carries a conductivity, so "
+                "this monitor will record zero. Set a material's Sigma to make "
+                "it lossy."
+            )
+            self._lossy_hint.setStyleSheet("color: #806000;")
+            self._lossy_hint.setVisible(True)
+
+        @staticmethod
+        def _keep_one_checked(checked, other):
+            if not checked and not other.isChecked():
+                other.setChecked(True)
+
+        def accept(self):
+            doc = self.obj.Document
+            doc.openTransaction("Wavesim: Edit Dissipation Monitor")
+            self.obj.RecordInterior = self._interior.isChecked()
+            self.obj.RecordFullDomain = self._full.isChecked()
+            self.obj.Label = _dissipation_label(self.obj)
+            doc.commitTransaction()
+            doc.recompute()
+            Gui.Control.closeDialog()
+            return True
+
+        def reject(self):
+            doc = self.obj.Document
+            if self.created:
+                doc.openTransaction("Wavesim: Cancel Dissipation Monitor")
+                doc.removeObject(self.obj.Name)
+                doc.commitTransaction()
+                doc.recompute()
+            Gui.Control.closeDialog()
+            return True
+
+        def getStandardButtons(self):
+            return _ok_cancel_buttons()
+
     def _open_probe_panel(obj, created=False):
         Gui.Control.closeDialog()
         Gui.Control.showDialog(TaskProbePanel(obj, created=created))
@@ -1478,6 +1711,10 @@ if _GUI_AVAILABLE:
     def _open_energy_panel(obj, created=False):
         Gui.Control.closeDialog()
         Gui.Control.showDialog(TaskEnergyPanel(obj, created=created))
+
+    def _open_dissipation_panel(obj, created=False):
+        Gui.Control.closeDialog()
+        Gui.Control.showDialog(TaskDissipationPanel(obj, created=created))
 
     def _open_snapshot_panel(obj, created=False):
         Gui.Control.closeDialog()
@@ -1612,6 +1849,45 @@ if _GUI_AVAILABLE:
         def IsActive(self):
             return active_simulation(FreeCAD.ActiveDocument) is not None
 
+    class CommandAddDissipationMonitor:
+        """Add the ohmic-dissipation monitor (tree-only) and open its editor."""
+
+        def GetResources(self):
+            return {
+                "Pixmap": _DISSIPATION_MONITOR_ICON,
+                "MenuText": "Add Dissipation Monitor",
+                "ToolTip": "Record the ohmic power absorbed by lossy material "
+                "over time, with or without the PML volume",
+            }
+
+        def Activated(self):
+            doc = FreeCAD.ActiveDocument
+            sim = _require_simulation()
+            if sim is None:
+                return
+            if find_dissipation_monitors(sim):
+                FreeCAD.Console.PrintWarning(
+                    "Wavesim: a dissipation monitor already exists.\n"
+                )
+                return
+            doc.openTransaction("Wavesim: Add Dissipation Monitor")
+            try:
+                mon = doc.addObject("App::FeaturePython", "DissipationMonitor")
+                DissipationObject(mon)
+                mon.Label = _dissipation_label(mon)
+                if mon.ViewObject is not None:
+                    DissipationViewProvider(mon.ViewObject)
+                monitors_group(sim).addObject(mon)
+            except Exception:
+                doc.abortTransaction()
+                raise
+            doc.commitTransaction()
+            doc.recompute()
+            _open_dissipation_panel(mon, created=True)
+
+        def IsActive(self):
+            return active_simulation(FreeCAD.ActiveDocument) is not None
+
     class _CommandAddPathMonitor:
         """Shared Activated/IsActive for the voltage and current commands."""
 
@@ -1683,5 +1959,7 @@ if _GUI_AVAILABLE:
     Gui.addCommand("Wavesim_AddProbe", CommandAddProbe())
     Gui.addCommand("Wavesim_AddSnapshot", CommandAddSnapshot())
     Gui.addCommand("Wavesim_AddEnergyMonitor", CommandAddEnergyMonitor())
+    Gui.addCommand("Wavesim_AddDissipationMonitor",
+                   CommandAddDissipationMonitor())
     Gui.addCommand("Wavesim_AddVoltageMonitor", CommandAddVoltageMonitor())
     Gui.addCommand("Wavesim_AddCurrentMonitor", CommandAddCurrentMonitor())

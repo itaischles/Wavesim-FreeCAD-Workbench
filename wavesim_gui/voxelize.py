@@ -8,14 +8,16 @@ of that cross-section over the layer's cell centres) to fill the per-cell
 ``eps``/``mu`` arrays and ``pec_mask`` the solver consumes via
 ``set_material_arrays``. With ``conformal=True`` a PEC body additionally
 contributes the six Dey-Mittra open-fraction arrays (:data:`CONFORMAL_KEYS`), so
-the solver can integrate the cut geometry instead of a staircase.
+the solver can integrate the cut geometry instead of a staircase. A material
+carrying a conductivity adds the three :data:`SIGMA_KEYS` arrays, which switch
+the solver onto its lossy-dielectric E update.
 :func:`build_job_from_document` derives a grid that bounds all material bodies,
 voxelises into it, and returns a job spec plus the arrays to write as
 ``materials.npz``. Each future array-input concern (e.g. deferred array sources)
 gets its own descriptively-named ``.npz`` rather than growing this one.
 
 Empty voxels are filled with the Domain's chosen *background* Material (its
-eps/mu/PEC), defaulting to vacuum; bodies overwrite the cells they cover.
+eps/mu/sigma/PEC), defaulting to vacuum; bodies overwrite the cells they cover.
 
 This module is FreeCAD-side: it uses ``Part``/``Shape`` (FreeCAD's bundled
 ``numpy`` for the arrays) and is **not** importable by the solver Python.
@@ -52,6 +54,12 @@ import FreeCAD
 # Forward-slash JSON paths and mm->m conversion are the only unit handling here.
 _MM_PER_M = 1000.0
 
+# The three ``materials.npz`` conductivity keys (S/m), in the order
+# ``wavesim.set_material_arrays`` takes them. Written **all three or none**: the
+# solver refuses a partial set, and a model with no conductivity anywhere emits
+# none at all, which keeps it on the untouched one-coefficient E update.
+SIGMA_KEYS = ("sigma_x", "sigma_y", "sigma_z")
+
 
 class GridRequiredError(Exception):
     """Raised when materials are assigned but no Grid object exists.
@@ -72,28 +80,33 @@ class VoxelizationCancelled(Exception):
 
 
 def _gather(materials):
-    """Return ``[(shape_mm, eps, mu, pec), ...]`` for every assigned body.
+    """Return ``[(shape_mm, eps, mu, pec, sigma), ...]`` for every assigned body.
 
     One entry per body (a material with several bodies contributes several
     entries sharing its parameters). Bodies without a solid shape are skipped.
+    ``sigma`` is the electric conductivity in S/m, always 0 for a PEC body
+    (:func:`wavesim_gui.materials.material_sigma` owns that rule).
     """
+    from wavesim_gui.materials import material_sigma
+
     entries = []
     for mat in materials:
         eps = float(getattr(mat, "Eps", 1.0))
         mu = float(getattr(mat, "Mu", 1.0))
         pec = bool(getattr(mat, "Pec", False))
+        sigma = material_sigma(mat)
         for body in getattr(mat, "Bodies", []) or []:
             shape = getattr(body, "Shape", None)
             if shape is None or not getattr(shape, "Solids", None):
                 continue
-            entries.append((shape, eps, mu, pec))
+            entries.append((shape, eps, mu, pec, sigma))
     return entries
 
 
 def _combined_bbox(entries):
     """Union BoundBox (mm) of all entry shapes, or ``None`` if there are none."""
     bbox = None
-    for shape, _eps, _mu, _pec in entries:
+    for shape, _eps, _mu, _pec, _sigma in entries:
         bb = shape.BoundBox
         if bbox is None:
             bbox = FreeCAD.BoundBox(bb)
@@ -431,8 +444,9 @@ def _cell_span(nodes_mm, lo, hi, margin=1):
 
 
 def _smooth_dielectric_body(arrays, body_shape, eps_r, mu_r,
-                            nodes_mm, span, oversample, on_layer=None):
-    """Subpixel-smooth one dielectric body into ``eps_x/y/z`` (+ mu) in place.
+                            nodes_mm, span, oversample, on_layer=None,
+                            sigma_r=0.0):
+    """Subpixel-smooth one dielectric body into ``eps_x/y/z`` (+ mu, sigma).
 
     *span* is ``((ia, ib), (ja, jb), (ka, kb))`` -- the half-open coarse sub-block
     covering the body's bbox (plus margin) from :func:`_cell_span`. The body is
@@ -443,10 +457,13 @@ def _smooth_dielectric_body(arrays, body_shape, eps_r, mu_r,
 
     The **background** inside the block is the current ``eps_x`` there, so bodies
     compose in placement order (mirrors the solver's repeated
-    ``smooth_shape_region`` calls). ``mu_r != 1`` is applied by volume-fraction
-    averaging; a dielectric that majority-covers a cell clears a PEC background.
-    ``on_layer()`` is called once per fine Z sub-layer (progress + cancellation);
-    a truthy return raises :class:`VoxelizationCancelled`.
+    ``smooth_shape_region`` calls). ``mu_r != 1`` and ``sigma_r`` are applied by
+    volume-fraction averaging -- Kottke's reduction is derived for a real
+    permittivity and has no conductivity analogue that is not
+    frequency-dependent (see :func:`voxelize_materials`); a dielectric that
+    majority-covers a cell clears a PEC background. ``on_layer()`` is called once
+    per fine Z sub-layer (progress + cancellation); a truthy return raises
+    :class:`VoxelizationCancelled`.
     """
     import numpy as np
 
@@ -496,6 +513,17 @@ def _smooth_dielectric_body(arrays, body_shape, eps_r, mu_r,
             mu_bg = arrays[key][ia:ib, ja:jb, ka:kb]
             arrays[key][ia:ib, ja:jb, ka:kb] = (
                 frac * float(mu_r) + (1.0 - frac) * mu_bg
+            )
+    # Conductivity, when this run carries any. Unconditional once the arrays
+    # exist (not gated on ``sigma_r != 0`` the way mu is on ``mu_r != 1``): a
+    # lossless body must blend the background's conductivity *down* over its own
+    # cells, and skipping the write would leave a lossy background standing
+    # inside it.
+    if SIGMA_KEYS[0] in arrays:
+        for key in SIGMA_KEYS:
+            sigma_bg = arrays[key][ia:ib, ja:jb, ka:kb]
+            arrays[key][ia:ib, ja:jb, ka:kb] = (
+                frac * float(sigma_r) + (1.0 - frac) * sigma_bg
             )
     # A dielectric body clears a PEC background where it majority-covers a cell
     # (matching the coarse centre-inside rule to within half a cell).
@@ -834,7 +862,7 @@ def voxelize_materials(materials, cell_size_m,
                        spacing_lo_m=(0.0, 0.0, 0.0), spacing_hi_m=(0.0, 0.0, 0.0),
                        pad_lo=(8, 8, 8), pad_hi=(8, 8, 8),
                        extra_points_mm=(), extra_axis_offsets=(),
-                       bg_eps=1.0, bg_mu=1.0, bg_pec=False,
+                       bg_eps=1.0, bg_mu=1.0, bg_pec=False, bg_sigma=0.0,
                        nodes_m=None, subpixel=False, oversample=4,
                        conformal=False, conformal_oversample=None,
                        max_total_cells=10_000_000, progress=None):
@@ -881,6 +909,16 @@ def voxelize_materials(materials, cell_size_m,
         geometry). PEC bodies are unaffected (a hard field constraint, not a
         material average). When False (default) every body is snapped as before
         and ``eps_x == eps_y == eps_z``.
+
+        A **lossy** body's conductivity is smoothed by plain volume fraction
+        (``frac*sigma + (1-frac)*background``), the same rule ``mu_r`` already
+        takes, not by Kottke's tensor -- that reduction is derived for a real
+        permittivity, and conductivity is the imaginary part of
+        ``eps~ = eps - j*sigma/(w*eps0)``, so its correct smoothing is
+        frequency-dependent and a real (eps, sigma) pair cannot carry it. The
+        volume fraction is the standard approximation and keeps the boundary
+        cell consistent with its own smoothed eps; the exact treatment would be
+        a dispersive material model.
     oversample : int or (int, int, int)
         Sub-samples per cell per axis used when ``subpixel=True`` (default 4).
         Higher is more accurate but costs ``O(oversample^3)`` setup memory/time
@@ -900,11 +938,11 @@ def voxelize_materials(materials, cell_size_m,
         Sub-samples per coarse cell per axis for the conformal fractions
         (default :data:`CONFORMAL_OVERSAMPLE`). An edge fraction is the mean of
         this many samples, so it is quantised to ``1/conformal_oversample``.
-    bg_eps, bg_mu, bg_pec : float / float / bool
-        The background medium filling every "empty" voxel -- the eps/mu/PEC of
-        the Domain's chosen background Material (vacuum: ``1.0, 1.0, False``).
-        The arrays start filled with these; bodies overwrite the cells they
-        cover.
+    bg_eps, bg_mu, bg_pec, bg_sigma : float / float / bool / float
+        The background medium filling every "empty" voxel -- the
+        eps/mu/PEC/conductivity of the Domain's chosen background Material
+        (vacuum: ``1.0, 1.0, False, 0.0``). The arrays start filled with these;
+        bodies overwrite the cells they cover.
     max_total_cells : int
         Guard against an accidentally huge grid; raises ``ValueError`` above it.
     progress : callable, optional
@@ -917,7 +955,13 @@ def voxelize_materials(materials, cell_size_m,
     dict
         ``arrays``  : the six ``eps``/``mu`` arrays + ``pec_mask`` (numpy), plus
                       the six :data:`CONFORMAL_KEYS` arrays when *conformal* is
-                      on and the geometry actually cuts a face.
+                      on and the geometry actually cuts a face, plus the three
+                      :data:`SIGMA_KEYS` arrays when any material (or the
+                      background) is lossy. All three or none: the solver takes
+                      them together, and a partial set would leave one field
+                      component undamped. A model with no conductivity anywhere
+                      emits none, and runs the untouched one-coefficient E
+                      update.
         ``grid``    : ``{Nx, Ny, Nz, dx, dy, dz}`` with spacings in metres.
         ``origin_m``: domain min corner in FreeCAD world metres.
         ``counts``  : ``{dielectric_cells, pec_cells}`` for a quick sanity check,
@@ -992,6 +1036,18 @@ def voxelize_materials(materials, cell_size_m,
         "pec_mask": pec_mask,
     }
 
+    # Conductivity, allocated only when something in the model is actually
+    # lossy. Absent arrays are not the same as all-zero ones: they select the
+    # solver's one-coefficient E update, which cannot differ from a lossless run
+    # because it is the same code (all-zero arrays are bit-identical too, but
+    # cost three array reads per E component per step for nothing).
+    bg_sigma = max(0.0, float(bg_sigma))
+    lossy = bg_sigma > 0.0 or any(s > 0.0 for *_rest, s in entries)
+    if lossy:
+        for key in SIGMA_KEYS:
+            arrays[key] = np.full(shape, bg_sigma, dtype=np.float64)
+    sigma_arrays = [arrays[key] for key in SIGMA_KEYS] if lossy else []
+
     # Subpixel oversampling factors (only used for dielectric bodies when on).
     if subpixel:
         from wavesim_gui import subpixel as _sp
@@ -1033,7 +1089,7 @@ def voxelize_materials(materials, cell_size_m,
     # over the otherwise opaque, GUI-blocking sweep.
     plans = []
     total_layers = 0
-    for body_shape, eps, mu, pec in entries:
+    for body_shape, eps, mu, pec, sigma in entries:
         bb = body_shape.BoundBox
         # Only test cells whose centre lies inside this body's bounding box.
         i_idx = cell_range(bb.XMin, bb.XMax, xs)
@@ -1065,8 +1121,8 @@ def voxelize_materials(materials, cell_size_m,
             )
             n_layers += conformal_layer_estimate(c_span[2][1] - c_span[2][0],
                                                  c_ovr)
-        plans.append((body_shape, eps, mu, pec, i_idx, j_idx, k_idx, smooth,
-                      span, c_span))
+        plans.append((body_shape, eps, mu, pec, sigma, i_idx, j_idx, k_idx,
+                      smooth, span, c_span))
         total_layers += n_layers
 
     done_layers = 0
@@ -1078,7 +1134,7 @@ def voxelize_materials(materials, cell_size_m,
         return bool(progress is not None
                     and progress(done_layers, total_layers))
 
-    for (body_shape, eps, mu, pec, i_idx, j_idx, k_idx, smooth,
+    for (body_shape, eps, mu, pec, sigma, i_idx, j_idx, k_idx, smooth,
          span, c_span) in plans:
         # Conformal open fractions for a PEC body, alongside (not instead of) the
         # binary mask below: pec_mask stays in the contract as the fully-covered
@@ -1091,7 +1147,7 @@ def voxelize_materials(materials, cell_size_m,
             # and reduce to an anisotropic effective permittivity (in place).
             _smooth_dielectric_body(
                 arrays, body_shape, eps, mu, nodes_mm, span, ovr,
-                on_layer=_on_layer,
+                on_layer=_on_layer, sigma_r=sigma,
             )
             continue
         if len(i_idx) == 0 or len(j_idx) == 0 or len(k_idx) == 0:
@@ -1114,6 +1170,11 @@ def voxelize_materials(materials, cell_size_m,
                     mu_x[gi, gj, k] = mu
                     mu_y[gi, gj, k] = mu
                     mu_z[gi, gj, k] = mu
+                    # Written even when this body is lossless, so a lossless
+                    # body placed over a lossy background actually clears the
+                    # conductivity there instead of inheriting it.
+                    for arr in sigma_arrays:
+                        arr[gi, gj, k] = sigma
                     # A dielectric body overrides a PEC background at its cells.
                     pec_mask[gi, gj, k] = False
             done_layers += 1
@@ -1128,6 +1189,9 @@ def voxelize_materials(materials, cell_size_m,
         "dielectric_cells": int(np.count_nonzero(eps_x != float(bg_eps))),
         "pec_cells": int(np.count_nonzero(pec_mask)),
     }
+    if lossy:
+        counts["lossy_cells"] = int(np.count_nonzero(arrays["sigma_x"] > 0.0))
+        counts["max_sigma"] = float(arrays["sigma_x"].max())
     if covered is not None:
         faces = [np.clip(1.0 - covered[key], 0.0, 1.0)
                  for key in CONFORMAL_KEYS[3:]]
@@ -1298,6 +1362,14 @@ def build_job_from_document(doc, steps=None, fmax=30.0e9, progress=None):
     bg_eps = float(getattr(bg_mat, "Eps", 1.0)) if bg_mat is not None else 1.0
     bg_mu = float(getattr(bg_mat, "Mu", 1.0)) if bg_mat is not None else 1.0
     bg_pec = bool(getattr(bg_mat, "Pec", False)) if bg_mat is not None else False
+    bg_sigma = (materials_mod.material_sigma(bg_mat)
+                if bg_mat is not None else 0.0)
+    # Lossy dielectrics: warn now, before the (slow) voxelisation, about any
+    # material whose conductivity has outrun the timestep. The solver warns too,
+    # but by then the run is already going -- and its symptom is a plausible
+    # decaying-looking field rather than a failure.
+    for message in materials_mod.loss_warnings(sim, dt=domain_mod.cfl_dt(dom)):
+        FreeCAD.Console.PrintWarning("Wavesim: " + message + "\n")
     # Non-uniform grid: when the Domain's snapper is enabled, hand its explicit
     # node arrays to the voxeliser (which then ignores cell size / spacing / PML
     # padding -- the snapper already baked them in). Off (the default) leaves
@@ -1324,7 +1396,7 @@ def build_job_from_document(doc, steps=None, fmax=30.0e9, progress=None):
         pad_lo=pad_lo, pad_hi=pad_hi,
         extra_points_mm=source_points_mm(sim),
         extra_axis_offsets=snapshot_axis_offsets(sim),
-        bg_eps=bg_eps, bg_mu=bg_mu, bg_pec=bg_pec,
+        bg_eps=bg_eps, bg_mu=bg_mu, bg_pec=bg_pec, bg_sigma=bg_sigma,
         nodes_m=nodes_m, subpixel=subpixel, conformal=want_conformal,
         progress=progress,
     )
@@ -1337,6 +1409,10 @@ def build_job_from_document(doc, steps=None, fmax=30.0e9, progress=None):
     conformal = all(key in vox["arrays"] for key in CONFORMAL_KEYS)
     if want_conformal:
         _report_conformal(conformal, vox["counts"], area_threshold)
+    # Same rule as ``conformal``: what the arrays actually say, not what was
+    # asked for. The runner reads this *before* it opens materials.npz, because
+    # the backend choice (lossy is CPU-only) has to be made first.
+    lossy = all(key in vox["arrays"] for key in SIGMA_KEYS)
     grid = vox["grid"]
     Nx, Ny, Nz = grid["Nx"], grid["Ny"], grid["Nz"]
     dx, dy, dz = grid["dx"], grid["dy"], grid["dz"]
@@ -1435,6 +1511,10 @@ def build_job_from_document(doc, steps=None, fmax=30.0e9, progress=None):
         "subpixel": subpixel,
         "conformal_pec": conformal,
         "conformal_area_threshold": area_threshold,
+        # Whether materials.npz carries conductivity. Read by the runner before
+        # the arrays are loaded, because a lossy grid is CPU-only (the CUDA E
+        # update has no Ca/Cb pair) and the backend decides the grid dtype.
+        "lossy": lossy,
         "boundary": {
             "d_pml": int(d_pml),
             "faces": pml_faces,

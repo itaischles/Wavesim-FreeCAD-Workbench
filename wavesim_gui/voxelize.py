@@ -80,12 +80,14 @@ class VoxelizationCancelled(Exception):
 
 
 def _gather(materials):
-    """Return ``[(shape_mm, eps, mu, pec, sigma), ...]`` for every assigned body.
+    """Return ``[(shape_mm, eps, mu, pec, sigma, body), ...]`` per assigned body.
 
     One entry per body (a material with several bodies contributes several
     entries sharing its parameters). Bodies without a solid shape are skipped.
     ``sigma`` is the electric conductivity in S/m, always 0 for a PEC body
-    (:func:`wavesim_gui.materials.material_sigma` owns that rule).
+    (:func:`wavesim_gui.materials.material_sigma` owns that rule). ``body`` is the
+    document object itself, carried so a conductor can be labelled by the solid
+    it came from (see ``conductor_names`` in :func:`voxelize_materials`).
     """
     from wavesim_gui.materials import material_sigma
 
@@ -99,14 +101,14 @@ def _gather(materials):
             shape = getattr(body, "Shape", None)
             if shape is None or not getattr(shape, "Solids", None):
                 continue
-            entries.append((shape, eps, mu, pec, sigma))
+            entries.append((shape, eps, mu, pec, sigma, body))
     return entries
 
 
 def _combined_bbox(entries):
     """Union BoundBox (mm) of all entry shapes, or ``None`` if there are none."""
     bbox = None
-    for shape, _eps, _mu, _pec, _sigma in entries:
+    for shape, _eps, _mu, _pec, _sigma, _body in entries:
         bb = shape.BoundBox
         if bbox is None:
             bbox = FreeCAD.BoundBox(bb)
@@ -531,6 +533,14 @@ def _smooth_dielectric_body(arrays, body_shape, eps_r, mu_r,
     if covered.any():
         sub = arrays["pec_mask"][ia:ib, ja:jb, ka:kb]
         sub[covered] = False
+        # ...and the part label with it. A name identifies a conductor, it does
+        # not create one, so a label left standing on a cell that is no longer
+        # metal describes something the field solver cannot see -- which the
+        # solver refuses outright. Found by a coax, where the dielectric annulus
+        # majority-covers the conductors' own boundary cells.
+        part = arrays.get("pec_id")
+        if part is not None:
+            part[ia:ib, ja:jb, ka:kb][covered] = 0
 
 
 # --------------------------------------------------------------------------- #
@@ -865,6 +875,7 @@ def voxelize_materials(materials, cell_size_m,
                        bg_eps=1.0, bg_mu=1.0, bg_pec=False, bg_sigma=0.0,
                        nodes_m=None, subpixel=False, oversample=4,
                        conformal=False, conformal_oversample=None,
+                       conductor_names=None,
                        max_total_cells=10_000_000, progress=None):
     """Voxelise *materials* onto a regular grid bounding all their bodies.
 
@@ -938,6 +949,15 @@ def voxelize_materials(materials, cell_size_m,
         Sub-samples per coarse cell per axis for the conformal fractions
         (default :data:`CONFORMAL_OVERSAMPLE`). An edge fraction is the mean of
         this many samples, so it is quantised to ``1/conformal_oversample``.
+    conductor_names : dict, optional
+        ``{body.Name: "part label"}`` for the PEC bodies an **electrostatic** run
+        must be able to address individually. Passing it adds a ``pec_id``
+        integer array to the returned arrays (the part owning each conductor
+        cell, 0 = unnamed metal) and a ``pec_names`` map to the result. Omitting
+        it (the default) allocates neither, so a full-wave ``materials.npz`` is
+        exactly what it always was -- the FDTD path has no use for a conductor's
+        identity, a perfect conductor being a boundary condition rather than a
+        thing with a name.
     bg_eps, bg_mu, bg_pec, bg_sigma : float / float / bool / float
         The background medium filling every "empty" voxel -- the
         eps/mu/PEC/conductivity of the Domain's chosen background Material
@@ -1042,11 +1062,28 @@ def voxelize_materials(materials, cell_size_m,
     # because it is the same code (all-zero arrays are bit-identical too, but
     # cost three array reads per E component per step for nothing).
     bg_sigma = max(0.0, float(bg_sigma))
-    lossy = bg_sigma > 0.0 or any(s > 0.0 for *_rest, s in entries)
+    lossy = bg_sigma > 0.0 or any(entry[4] > 0.0 for entry in entries)
     if lossy:
         for key in SIGMA_KEYS:
             arrays[key] = np.full(shape, bg_sigma, dtype=np.float64)
     sigma_arrays = [arrays[key] for key in SIGMA_KEYS] if lossy else []
+
+    # Named PEC parts: an integer label per conductor cell (0 = unnamed metal),
+    # so the electrostatic solver can hold *this* solid at a potential. The FDTD
+    # path reads neither the array nor the names, and the array is only allocated
+    # when names were asked for, so a full-wave materials.npz is unchanged.
+    # Labels are 1-based and assigned in the order the caller listed them, not in
+    # raster order: a refinement must not renumber a saved potential onto
+    # different metal.
+    pec_id = None
+    part_ids = {}
+    pec_names = {}
+    if conductor_names:
+        pec_id = np.zeros(shape, dtype=np.int32)
+        arrays["pec_id"] = pec_id
+        for body_name, label in conductor_names.items():
+            part_ids[str(body_name)] = len(pec_names) + 1
+            pec_names[str(label)] = part_ids[str(body_name)]
 
     # Subpixel oversampling factors (only used for dielectric bodies when on).
     if subpixel:
@@ -1089,7 +1126,7 @@ def voxelize_materials(materials, cell_size_m,
     # over the otherwise opaque, GUI-blocking sweep.
     plans = []
     total_layers = 0
-    for body_shape, eps, mu, pec, sigma in entries:
+    for body_shape, eps, mu, pec, sigma, body in entries:
         bb = body_shape.BoundBox
         # Only test cells whose centre lies inside this body's bounding box.
         i_idx = cell_range(bb.XMin, bb.XMax, xs)
@@ -1121,8 +1158,14 @@ def voxelize_materials(materials, cell_size_m,
             )
             n_layers += conformal_layer_estimate(c_span[2][1] - c_span[2][0],
                                                  c_ovr)
+        # The part label this body's cells are stamped with, or 0 for metal the
+        # electrostatic solver will treat as unnamed (and ground). Resolved here
+        # so the sweep below has nothing to look up.
+        part = 0
+        if pec and conductor_names:
+            part = part_ids.get(str(getattr(body, "Name", "")), 0)
         plans.append((body_shape, eps, mu, pec, sigma, i_idx, j_idx, k_idx,
-                      smooth, span, c_span))
+                      smooth, span, c_span, part))
         total_layers += n_layers
 
     done_layers = 0
@@ -1135,7 +1178,7 @@ def voxelize_materials(materials, cell_size_m,
                     and progress(done_layers, total_layers))
 
     for (body_shape, eps, mu, pec, sigma, i_idx, j_idx, k_idx, smooth,
-         span, c_span) in plans:
+         span, c_span, part) in plans:
         # Conformal open fractions for a PEC body, alongside (not instead of) the
         # binary mask below: pec_mask stays in the contract as the fully-covered
         # test and as the staircase path's own geometry.
@@ -1163,6 +1206,12 @@ def voxelize_materials(materials, cell_size_m,
                 gi, gj = i_idx[ii], j_idx[jj]
                 if pec:
                     pec_mask[gi, gj, k] = True
+                    if pec_id is not None:
+                        # Later bodies win the overlap, exactly as pec_mask
+                        # composes: the label has to describe the metal the mask
+                        # ends up carrying, or the solver would pin a potential
+                        # on cells the field solver does not see as that part.
+                        pec_id[gi, gj, k] = part
                 else:
                     eps_x[gi, gj, k] = eps
                     eps_y[gi, gj, k] = eps
@@ -1177,6 +1226,10 @@ def voxelize_materials(materials, cell_size_m,
                         arr[gi, gj, k] = sigma
                     # A dielectric body overrides a PEC background at its cells.
                     pec_mask[gi, gj, k] = False
+                    if pec_id is not None:
+                        # ...and takes the part label with it. A label outside
+                        # the mask would describe metal that is no longer there.
+                        pec_id[gi, gj, k] = 0
             done_layers += 1
             if progress is not None and progress(done_layers, total_layers):
                 raise VoxelizationCancelled()
@@ -1192,6 +1245,14 @@ def voxelize_materials(materials, cell_size_m,
     if lossy:
         counts["lossy_cells"] = int(np.count_nonzero(arrays["sigma_x"] > 0.0))
         counts["max_sigma"] = float(arrays["sigma_x"].max())
+    if pec_id is not None:
+        # Metal the electrostatic solve will ground for want of a name. Usually
+        # zero -- every PEC body is named -- and worth reporting when it is not,
+        # because a body whose cells were all overwritten by a later one looks
+        # exactly like this.
+        counts["unnamed_pec_cells"] = int(
+            np.count_nonzero(pec_mask & (pec_id == 0)))
+        counts["named_conductors"] = len(pec_names)
     if covered is not None:
         faces = [np.clip(1.0 - covered[key], 0.0, 1.0)
                  for key in CONFORMAL_KEYS[3:]]
@@ -1229,6 +1290,9 @@ def voxelize_materials(materials, cell_size_m,
         "grid": grid_dict,
         "origin_m": (ox / _MM_PER_M, oy / _MM_PER_M, oz / _MM_PER_M),
         "counts": counts,
+        # ``{part label: pec_id value}``; empty unless conductor_names was given.
+        # Metadata, not bulk, so it travels in job.json rather than the npz.
+        "pec_names": pec_names,
     }
 
 
@@ -1388,6 +1452,18 @@ def build_job_from_document(doc, steps=None, fmax=30.0e9, progress=None):
     from wavesim_gui.commands import conformal_pec
 
     want_conformal, area_threshold = conformal_pec(sim)
+    # Electrostatics: the solve addresses conductors by name, so every PEC body
+    # is labelled. Only in that mode -- a full-wave materials.npz gains nothing
+    # from an identity the FDTD update cannot read.
+    from wavesim_gui.commands import is_electrostatic
+
+    electrostatic = is_electrostatic(sim)
+    conductor_names = None
+    if electrostatic:
+        conductor_names = {
+            str(body.Name): name
+            for body, name, _volts in materials_mod.conductors(sim)
+        }
     # Grow the grid to include every source position and snapshot slice, so an
     # input outside the material bounds (or in the PML) still lands inside it.
     vox = voxelize_materials(
@@ -1398,6 +1474,7 @@ def build_job_from_document(doc, steps=None, fmax=30.0e9, progress=None):
         extra_axis_offsets=snapshot_axis_offsets(sim),
         bg_eps=bg_eps, bg_mu=bg_mu, bg_pec=bg_pec, bg_sigma=bg_sigma,
         nodes_m=nodes_m, subpixel=subpixel, conformal=want_conformal,
+        conductor_names=conductor_names,
         progress=progress,
     )
     # What actually ran, not what was asked for: the fractions are absent when
@@ -1526,4 +1603,147 @@ def build_job_from_document(doc, steps=None, fmax=30.0e9, progress=None):
         "spice_ports": spice_ports,
         "monitors": monitors,
     }
+    if electrostatic:
+        spec.update(_electrostatic_spec(sim, dom, vox, monitors))
     return spec, vox["arrays"]
+
+
+def _electrostatic_spec(sim, dom, vox, monitors):
+    """The job.json keys that turn a run into an electrostatic solve.
+
+    Layered on top of the ordinary spec rather than replacing it: the grid,
+    materials, conformal geometry and snapshot planes are the same objects
+    meaning the same things, and only what is *done* with them changes. The
+    runner ignores ``source``/``modal_ports``/``spice_ports`` and the time-series
+    monitors in this mode, so they are left in the job rather than stripped --
+    switching the mode back must not have quietly discarded them.
+    """
+    from wavesim_gui import materials as materials_mod
+    from wavesim_gui import domain as domain_mod
+    from wavesim_gui.commands import MODE_ELECTROSTATIC, extract_capacitance
+
+    potentials = materials_mod.conductor_potentials(sim)
+    names = list(vox.get("pec_names") or {})
+    # Extraction energises one conductor at a time, so it needs at least two:
+    # a lone conductor in a box has a capacitance only to the box, which is a
+    # legitimate answer but not a matrix, and the solver refuses an all-zero one.
+    capacitance = bool(extract_capacitance(sim)) and len(names) >= 2
+
+    boundary = domain_mod.electrostatic_boundary(dom)
+    for message in _electrostatic_warnings(sim, dom, potentials, boundary,
+                                           capacitance):
+        FreeCAD.Console.PrintWarning("Wavesim: " + message + "\n")
+
+    return {
+        "mode": MODE_ELECTROSTATIC,
+        # No time loop, so no step count for a progress bar to divide: the run
+        # dialog runs indeterminate and is driven by the runner's STATUS lines.
+        "steps": 0,
+        "electrostatic": {
+            "potentials": potentials,
+            "boundary": boundary,
+            "capacitance": capacitance,
+            # Which planes to save, taken from the snapshot monitors: same
+            # plane/offset the full-wave path uses, minus the cadence.
+            "slices": [
+                {"name": s["name"], "field": s["field"],
+                 "normal": s["normal"], "position": s["position"]}
+                for s in monitors.get("snapshots", [])
+            ],
+        },
+        # The part labels behind ``pec_id`` in materials.npz. Metadata, so it
+        # rides in the job rather than the array file.
+        "pec_names": dict(vox.get("pec_names") or {}),
+    }
+
+
+def _electrostatic_warnings(sim, dom, potentials, boundary, capacitance):
+    """Console warnings worth giving before an electrostatic run starts.
+
+    Cheap checks the user can act on now; the solver makes the authoritative
+    ones (two named parts that turn out to be one conductor, a singular problem)
+    once it has the voxelised geometry in front of it.
+    """
+    from wavesim_gui import source as source_mod
+    from wavesim_gui import modal_port as modal_mod
+    from wavesim_gui import monitors as monitors_mod
+    from wavesim_gui import materials as materials_mod
+    from wavesim_gui import domain as domain_mod
+
+    out = []
+    # A conductor sitting on a Ground face is shorted to it. Harmless while that
+    # conductor is itself at 0 V -- which is why the potential solve can succeed
+    # and the extraction then fail, one solve later, when the same conductor is
+    # driven to 1 V. Said here rather than left to surface halfway through.
+    if capacitance:
+        out.extend(_grounded_face_shorts(dom, sim, boundary))
+    if not potentials:
+        out.append(
+            "electrostatic run with no PEC bodies: nothing holds a potential, "
+            "so the field has no source. Assign bodies to a PEC material.")
+    elif len(set(potentials.values())) == 1:
+        out.append(
+            "every conductor is at {:g} V, so the field is uniformly that "
+            "potential and every charge is zero. Set at least two different "
+            "potentials (a driven conductor and a ground).".format(
+                next(iter(potentials.values()))))
+    ignored = []
+    if source_mod.find_sources(sim):
+        ignored.append("point sources")
+    if modal_mod.find_modal_ports(sim):
+        ignored.append("modal ports")
+    if monitors_mod.find_probes(sim):
+        ignored.append("probes")
+    if ignored:
+        out.append(
+            "electrostatic mode ignores {} — there is no time axis for them to "
+            "act on.".format(", ".join(ignored)))
+    return out
+
+
+def _grounded_face_shorts(dom, sim, boundary):
+    """Warn about each conductor that reaches a Ground domain face.
+
+    Extraction drives every conductor to 1 V in turn, so a conductor touching a
+    face held at 0 V has no solution then even though the potential solve before
+    it was fine. The check is against the **grid** bounds (the node arrays, which
+    include the PML pad) rather than the drawn domain box, because that is where
+    the boundary condition is actually applied.
+    """
+    from wavesim_gui import materials as materials_mod
+    from wavesim_gui import domain as domain_mod
+
+    try:
+        nodes = domain_mod.node_coords_m(dom)
+    except Exception:
+        return []
+    if not all(len(a) >= 2 for a in nodes):
+        return []
+    lo = [float(a[0]) * _MM_PER_M for a in nodes]
+    hi = [float(a[-1]) * _MM_PER_M for a in nodes]
+    # Half the smallest cell: a body reaching within that of the wall lands on
+    # the boundary node once voxelised.
+    tol = 0.5 * min(min(float(a[i + 1] - a[i]) for i in range(len(a) - 1))
+                    for a in nodes) * _MM_PER_M
+
+    faces = (("xmin", 0, "XMin", lo), ("xmax", 0, "XMax", hi),
+             ("ymin", 1, "YMin", lo), ("ymax", 1, "YMax", hi),
+             ("zmin", 2, "ZMin", lo), ("zmax", 2, "ZMax", hi))
+    out = []
+    for body, name, _volts in materials_mod.conductors(sim):
+        shape = getattr(body, "Shape", None)
+        if shape is None:
+            continue
+        bb = shape.BoundBox
+        touching = [key for key, axis, attr, bound in faces
+                    if boundary.get(key) == "ground"
+                    and abs(getattr(bb, attr) - bound[axis]) <= tol]
+        if touching:
+            out.append(
+                "conductor {!r} reaches the grounded domain face(s) {}, so "
+                "extracting its capacitance shorts it to the wall and the run "
+                "will fail there. Set those faces to Symmetry (right for a "
+                "shielded structure — the mutual capacitances stay exact), add "
+                "background spacing, or clear Extract capacitance."
+                .format(name, ", ".join(touching)))
+    return out

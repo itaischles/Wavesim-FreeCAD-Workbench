@@ -64,6 +64,11 @@ _KIND_VOLTAGE = "voltage"
 _KIND_CURRENT = "current"
 _KIND_SPICE_V = "spice_v"   # SPICE co-simulation port voltage V(t)
 _KIND_SPICE_I = "spice_i"   # SPICE co-simulation port current I(t)
+# The electrostatic run's scalar results: applied potentials, per-conductor
+# charge, field energy and the capacitance matrix. One leaf, because they are one
+# answer -- the charges are the matrix's raw material and the energy is the same
+# quadratic form.
+_KIND_CAPACITANCE = "capacitance"
 
 # Each result leaf shows the toolbar icon of the monitor/port that produced it.
 _KIND_ICONS = {
@@ -76,6 +81,7 @@ _KIND_ICONS = {
     _KIND_CURRENT: _icon("current_monitor.png"),
     _KIND_SPICE_V: _icon("spice_line_port.png"),
     _KIND_SPICE_I: _icon("spice_line_port.png"),
+    _KIND_CAPACITANCE: _icon("energy_monitor.png"),
 }
 
 _RESULTS_GROUP = "Results"
@@ -371,6 +377,19 @@ def build_results(doc, sim, workdir, summary):
                 _store_edges(leaf, "XEdges", npz[e0k])
                 _store_edges(leaf, "YEdges", npz[e1k])
 
+        # Electrostatics: one leaf for the scalar results. Created whenever the
+        # run was electrostatic, even with no capacitance matrix -- the applied
+        # potentials, the conductor charges and the field energy are the answer
+        # the run was for, and a run that produced them and showed nothing would
+        # look like a failure.
+        es_meta = summary.get("electrostatic")
+        if es_meta:
+            leaf = _new_leaf("Capacitance matrix"
+                             if es_meta.get("capacitance")
+                             else "Electrostatic solution",
+                             _KIND_CAPACITANCE, "capacitance")
+            _store_electrostatic_meta(leaf, es_meta)
+
         # Port modes (one leaf per solved port mode). Each opens a figure of the
         # mode shape plus the port's per-unit-length parameters.
         for meta in summary.get("modes", []):
@@ -504,6 +523,47 @@ def _store_mode_meta(leaf, meta):
     _add("Fmax", "App::PropertyFloat", float(meta.get("fmax", 0.0)))
     _add("Amplitude", "App::PropertyFloat", float(meta.get("amplitude", 1.0)))
     _add("Fields", "App::PropertyString", str(meta.get("fields", "")))
+
+
+def _store_electrostatic_meta(leaf, meta):
+    """Stash an electrostatic run's scalar results on its leaf.
+
+    Everything the window shows lives on the object, not in ``summary.json``, so
+    the leaf still opens after the document is reloaded and the run directory has
+    been cleaned out -- the same reason a mode leaf carries its own parameters.
+    The matrix is stored flattened row-major with its conductor names beside it;
+    the two are read back together, so the width never has to be guessed.
+    """
+    def _add(prop, kind, value, group="Electrostatic"):
+        if not hasattr(leaf, prop):
+            leaf.addProperty(kind, prop, group, "")
+            leaf.setEditorMode(prop, 1)
+        setattr(leaf, prop, value)
+
+    charges = meta.get("charges") or {}
+    potentials = meta.get("potentials") or {}
+    names = sorted(set(charges) | set(potentials))
+    _add("Conductors", "App::PropertyStringList", names)
+    _add("Potentials", "App::PropertyFloatList",
+         [float(potentials.get(n, 0.0)) for n in names])
+    _add("Charges", "App::PropertyFloatList",
+         [float(charges.get(n, 0.0)) for n in names])
+    _add("FieldEnergy", "App::PropertyFloat", float(meta.get("energy", 0.0)))
+    _add("SolveMethod", "App::PropertyString", str(meta.get("method", "")))
+    _add("Iterations", "App::PropertyInteger", int(meta.get("iterations", 0)))
+    _add("Unknowns", "App::PropertyInteger", int(meta.get("unknowns", 0)))
+
+    cap = meta.get("capacitance") or {}
+    cap_names = list(cap.get("names") or [])
+    maxwell = cap.get("maxwell") or []
+    _add("CapNames", "App::PropertyStringList", cap_names)
+    _add("CapMaxwell", "App::PropertyFloatList",
+         [float(v) for row in maxwell for v in row])
+    # Conductors the run found fused into one body, each group reported as one
+    # comma-joined entry: they are why a named part may be missing from the
+    # matrix, and the answer is a modelling fix rather than a solver setting.
+    _add("CapFused", "App::PropertyStringList",
+         [", ".join(group) for group in (cap.get("fused") or [])])
 
 
 # --------------------------------------------------------------------------- #
@@ -718,6 +778,8 @@ if _GUI_AVAILABLE:
                 _plot_snapshot(obj)
             elif kind == _KIND_MODE:
                 _plot_mode(obj)
+            elif kind == _KIND_CAPACITANCE:
+                _show_electrostatic(obj)
             else:
                 FreeCAD.Console.PrintWarning(
                     "Wavesim: unknown result kind '{}'.\n".format(kind)
@@ -875,9 +937,14 @@ if _GUI_AVAILABLE:
         # only that.
         comps = [c for c in str(getattr(obj, "Components", "")).split(",") if c]
         field = str(getattr(obj, "Field", "")) or "E"
-        if comps:
+        if len(comps) > 1:
             magnitude = "|{}|".format(field)
             choices = comps + [magnitude]
+        elif comps:
+            # A scalar quantity (the electrostatic potential): there is nothing
+            # to take a magnitude of, and offering |phi| would suggest otherwise.
+            magnitude = None
+            choices = list(comps)
         else:
             magnitude = None
             choices = [str(getattr(obj, "Component", "")) or "field"]
@@ -914,8 +981,19 @@ if _GUI_AVAILABLE:
 
         unit = _time_unit(obj)
 
-        def _is_magnitude(choice):
-            return choice.startswith("|") or choice.startswith("∣")
+        # A one-sided (0..max) colour scale, as against the zero-centred one a
+        # signed field wants. Magnitudes always; and a scalar quantity that never
+        # goes negative -- an electrostatic potential between a grounded and a
+        # driven conductor -- for the same reason, since a diverging map would
+        # spend half its range on values the picture does not contain.
+        _positive_scalar = (
+            magnitude is None and len(comps) == 1
+            and float(np.nanmin(np.asarray(frames, dtype=float))) >= 0.0
+        )
+
+        def _one_sided(choice):
+            return (choice.startswith("|") or choice.startswith("∣")
+                    or _positive_scalar)
 
         # In-plane node/edge coordinates (mm) from the runner: when present the
         # frame is drawn with pcolormesh on the real (possibly non-uniform) grid.
@@ -944,7 +1022,7 @@ if _GUI_AVAILABLE:
         view = {"comp": comp, "frames": frames, "clip": _CLIP_CHOICES[0]}
 
         def _cmap_for(choice):
-            return "turbo" if _is_magnitude(choice) else "RdBu_r"
+            return "turbo" if _one_sided(choice) else "RdBu_r"
 
         # (component, percentile) -> vmax. Each limit spans the whole run so the
         # scale holds still while the animation plays, which makes recomputing
@@ -964,7 +1042,7 @@ if _GUI_AVAILABLE:
             # linear map from a handful of outlying cells.
             vmax = _vmax_for(100.0 if log else view["clip"])
             linthresh = vmax / 1e3
-            if _is_magnitude(view["comp"]):
+            if _one_sided(view["comp"]):
                 if log:
                     return mcolors.LogNorm(vmin=linthresh, vmax=vmax)
                 return mcolors.Normalize(vmin=0.0, vmax=vmax)
@@ -1086,7 +1164,7 @@ if _GUI_AVAILABLE:
 
         def _arrow_color(choice):
             """Arrow colour that reads against the current colour map."""
-            return "white" if _is_magnitude(choice) else "black"
+            return "white" if _one_sided(choice) else "black"
 
         quiver = {"art": None, "uv": None}
 
@@ -1105,7 +1183,7 @@ if _GUI_AVAILABLE:
         # clip, so switching between the two kinds of map rebuilds the bar --
         # `extend` is fixed at construction.
         def _extend_for(choice):
-            return "max" if _is_magnitude(choice) else "both"
+            return "max" if _one_sided(choice) else "both"
 
         cbar = {"art": None, "extend": None}
 
@@ -1132,7 +1210,15 @@ if _GUI_AVAILABLE:
                 return units.time_from_si(float(times[idx]), unit)
             return float("nan")
 
+        # A static solution is one frame: there is no time to report and no
+        # animation to drive, so the title and the controls drop both rather
+        # than reading "frame 1/1 at t = 0" as though the run had stopped there.
+        static = len(frames) == 1
+
         def _set_title(idx):
+            if static:
+                ax.set_title("{}{}".format(view["comp"], suffix))
+                return
             ax.set_title("{}{}\nframe {}/{}  t = {:.4g} {}".format(
                 view["comp"], suffix, idx + 1, len(view["frames"]),
                 _frame_time(idx), unit,
@@ -1154,8 +1240,13 @@ if _GUI_AVAILABLE:
             component.addItems(choices)
             component.setCurrentText(comp)
             controls.addWidget(component)
-        controls.addWidget(play)
-        controls.addWidget(slider, 1)
+        if static:
+            play.setVisible(False)
+            slider.setVisible(False)
+            controls.addStretch(1)
+        else:
+            controls.addWidget(play)
+            controls.addWidget(slider, 1)
         clip = QtWidgets.QComboBox()
         for pct in _CLIP_CHOICES:
             clip.addItem(
@@ -1259,6 +1350,149 @@ if _GUI_AVAILABLE:
         play.toggled.connect(on_play)
         dialog._timer = timer  # keep the timer alive with the dialog
 
+        dialog.show()
+        _register_window(dialog)
+
+    # ------------------------------------------------------------------ #
+    # Electrostatic scalar results
+    # ------------------------------------------------------------------ #
+
+    # Capacitance spans many decades between a bond pad and a plate capacitor,
+    # and reading 3.7e-13 F off a table is work the window can do instead.
+    _CAP_UNITS = ((1e-3, "mF"), (1e-6, "uF"), (1e-9, "nF"),
+                  (1e-12, "pF"), (1e-15, "fF"), (1e-18, "aF"))
+
+    def _fmt_cap(value):
+        """A capacitance in farads as a number and a unit, e.g. ``'1.234 pF'``."""
+        mag = abs(float(value))
+        if mag == 0.0:
+            return "0"
+        for scale, name in _CAP_UNITS:
+            if mag >= scale:
+                return "{:.4g} {}".format(value / scale, name)
+        return "{:.3e} F".format(value)
+
+    def _fill_matrix(table, names, rows, fmt):
+        """Fill *table* with a square matrix labelled by *names* on both axes."""
+        _QtCore, QtWidgets = _qt()
+        n = len(names)
+        table.setRowCount(n)
+        table.setColumnCount(n)
+        table.setHorizontalHeaderLabels(list(names))
+        table.setVerticalHeaderLabels(list(names))
+        for i in range(n):
+            for j in range(n):
+                item = QtWidgets.QTableWidgetItem(fmt(rows[i][j]))
+                item.setFlags(_QtCore.Qt.ItemIsEnabled | _QtCore.Qt.ItemIsSelectable)
+                item.setTextAlignment(
+                    _QtCore.Qt.AlignRight | _QtCore.Qt.AlignVCenter)
+                table.setItem(i, j, item)
+        table.resizeColumnsToContents()
+
+    def _show_electrostatic(obj):
+        """Window for the electrostatic run's scalar results.
+
+        Reports both capacitance conventions explicitly rather than calling one
+        of them "the" capacitance matrix. Maxwell is dQ_i/dV_j with every other
+        conductor grounded -- what the field solve measures and what circuit
+        extraction consumes; mutual is the two-terminal capacitor people draw
+        between pins. Reporting one under the other's name is wrong by more than
+        a sign.
+        """
+        _QtCore, QtWidgets = _qt()
+
+        names = list(getattr(obj, "Conductors", []) or [])
+        potentials = list(getattr(obj, "Potentials", []) or [])
+        charges = list(getattr(obj, "Charges", []) or [])
+        cap_names = list(getattr(obj, "CapNames", []) or [])
+        flat = [float(v) for v in (getattr(obj, "CapMaxwell", []) or [])]
+
+        dialog = QtWidgets.QDialog(Gui.getMainWindow())
+        dialog.setWindowTitle("Wavesim Results - {}".format(obj.Label))
+        dialog.setAttribute(_QtCore.Qt.WA_DeleteOnClose, False)
+        layout = QtWidgets.QVBoxLayout(dialog)
+
+        header = QtWidgets.QLabel(
+            "Field energy: {:.6g} J    Solver: {} ({:,} unknowns, {:,} "
+            "iterations)".format(
+                float(getattr(obj, "FieldEnergy", 0.0)),
+                str(getattr(obj, "SolveMethod", "?")),
+                int(getattr(obj, "Unknowns", 0)),
+                int(getattr(obj, "Iterations", 0)),
+            )
+        )
+        header.setWordWrap(True)
+        layout.addWidget(header)
+
+        # Conductors: what was applied and what came back. The charge is the flux
+        # the solved equations balanced, not a re-integration of the field, so it
+        # agrees with the matrix below by construction.
+        layout.addWidget(QtWidgets.QLabel("<b>Conductors</b>"))
+        table = QtWidgets.QTableWidget(len(names), 3)
+        table.setHorizontalHeaderLabels(["Conductor", "Potential (V)", "Charge (C)"])
+        table.verticalHeader().setVisible(False)
+        for row, name in enumerate(names):
+            volts = potentials[row] if row < len(potentials) else 0.0
+            charge = charges[row] if row < len(charges) else 0.0
+            for col, text in enumerate(
+                    (name, "{:g}".format(volts), "{:.6g}".format(charge))):
+                item = QtWidgets.QTableWidgetItem(text)
+                item.setFlags(_QtCore.Qt.ItemIsEnabled | _QtCore.Qt.ItemIsSelectable)
+                if col:
+                    item.setTextAlignment(
+                        _QtCore.Qt.AlignRight | _QtCore.Qt.AlignVCenter)
+                table.setItem(row, col, item)
+        table.resizeColumnsToContents()
+        table.setMaximumHeight(220)
+        layout.addWidget(table)
+
+        if cap_names and len(flat) == len(cap_names) ** 2:
+            n = len(cap_names)
+            maxwell = [flat[i * n:(i + 1) * n] for i in range(n)]
+            # The two-terminal form, derived here exactly as the solver derives
+            # it: off-diagonal -C_ij, diagonal the row sum (to ground).
+            mutual = [[-maxwell[i][j] if i != j else sum(maxwell[i])
+                       for j in range(n)] for i in range(n)]
+
+            layout.addWidget(QtWidgets.QLabel(
+                "<b>Maxwell (short-circuit) capacitance</b> — dQ<sub>i</sub>/"
+                "dV<sub>j</sub> with every other conductor at 0 V. Each row sums "
+                "to that conductor's capacitance to ground."))
+            m_table = QtWidgets.QTableWidget()
+            _fill_matrix(m_table, cap_names, maxwell, _fmt_cap)
+            layout.addWidget(m_table)
+
+            layout.addWidget(QtWidgets.QLabel(
+                "<b>Mutual (two-terminal) capacitance</b> — the lumped capacitor "
+                "between each pair; the diagonal is to ground."))
+            t_table = QtWidgets.QTableWidget()
+            _fill_matrix(t_table, cap_names, mutual, _fmt_cap)
+            layout.addWidget(t_table)
+
+            if all(abs(sum(row)) <= 1e-12 * max(abs(v) for v in row)
+                   for row in maxwell if any(row)):
+                layout.addWidget(QtWidgets.QLabel(
+                    "Every row sums to zero: with no path to ground the Maxwell "
+                    "matrix is genuinely rank-deficient — there is no ground to "
+                    "have a capacitance to. The mutual capacitances are still "
+                    "exact; this is the ordinary way a shielded structure "
+                    "measures."))
+
+        fused = list(getattr(obj, "CapFused", []) or [])
+        if fused:
+            note = QtWidgets.QLabel(
+                "These bodies touch and are one conductor, so only the first of "
+                "each group appears above: {}. Two solids that clear each other "
+                "by less than a cell voxelise as one lump of metal.".format(
+                    "; ".join(fused)))
+            note.setWordWrap(True)
+            layout.addWidget(note)
+
+        buttons = QtWidgets.QDialogButtonBox(QtWidgets.QDialogButtonBox.Close)
+        buttons.rejected.connect(dialog.close)
+        layout.addWidget(buttons)
+
+        dialog.resize(640, 520)
         dialog.show()
         _register_window(dialog)
 

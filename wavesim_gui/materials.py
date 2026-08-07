@@ -168,6 +168,117 @@ def is_material(obj):
     return getattr(obj, _TYPE_PROP, None) == _MATERIAL_TYPE
 
 
+# --------------------------------------------------------------------------- #
+# Conductor potentials (electrostatic mode)
+# --------------------------------------------------------------------------- #
+
+# Potentials live on the *body*, not on the Material, because a Material is a
+# set of bodies at one set of EM parameters while a potential is a property of
+# one lump of metal: a "PEC" material commonly holds a signal trace and its
+# ground plane, and those are exactly the two things that must differ.
+#
+# The property is added to a foreign document object (a Part::Box, a PartDesign
+# Body, ...), so it is namespaced. It is edited through the PEC material's task
+# panel; the property editor shows it too, which is where a scripted document
+# will set it.
+POTENTIAL_PROP = "WavesimPotential"
+
+
+def ensure_potential_prop(body):
+    """Add the potential property to *body* if it has none. Returns *body*.
+
+    Idempotent and guarded: a body type that refuses dynamic properties must not
+    break material assignment, which is the common path this sits on.
+    """
+    if body is None or hasattr(body, POTENTIAL_PROP):
+        return body
+    try:
+        body.addProperty(
+            "App::PropertyFloat", POTENTIAL_PROP, "Wavesim",
+            "Potential in volts held on this conductor by an electrostatic "
+            "run. Ignored by a full-wave run, where a PEC body is a boundary "
+            "condition and has no potential to speak of.",
+        )
+        setattr(body, POTENTIAL_PROP, 0.0)
+    except Exception:
+        pass
+    return body
+
+
+def body_potential(body):
+    """Potential in volts assigned to *body*; 0 V when it carries none.
+
+    0 V is both the useful default (an enclosure or a ground plane is normally
+    exactly that) and what the solver would do with an unnamed conductor anyway.
+    """
+    try:
+        return float(getattr(body, POTENTIAL_PROP, 0.0))
+    except Exception:
+        return 0.0
+
+
+def set_body_potential(body, volts):
+    """Assign *volts* to *body*, adding the property if it is missing."""
+    ensure_potential_prop(body)
+    if hasattr(body, POTENTIAL_PROP):
+        setattr(body, POTENTIAL_PROP, float(volts))
+
+
+def is_pec(mat):
+    """True if *mat* is a Material whose bodies are perfect conductors."""
+    return is_material(mat) and bool(getattr(mat, "Pec", False))
+
+
+def _conductor_name(body, taken):
+    """A unique, solver-side name for *body*, avoiding names in *taken*.
+
+    The body's Label, because that is what the user reads in the tree and in the
+    capacitance matrix, and because it survives a mesh refinement -- unlike a
+    connected-component number, which is assigned in raster order and would
+    silently re-point a saved potential at different metal. FreeCAD keeps labels
+    unique by default but can be told not to, so a collision falls back to the
+    internal Name, which cannot collide.
+    """
+    label = str(getattr(body, "Label", "") or getattr(body, "Name", "") or "PEC")
+    if label not in taken:
+        return label
+    name = str(getattr(body, "Name", label))
+    if name not in taken:
+        return name
+    i = 2
+    while "{} ({})".format(label, i) in taken:
+        i += 1
+    return "{} ({})".format(label, i)
+
+
+def conductors(sim):
+    """``[(body, name, volts), ...]`` for every solid body of every PEC material.
+
+    The electrostatic solver addresses conductors by name (``grid.pec_names``),
+    so this is where a FreeCAD solid acquires the identity the solve pins a
+    potential to. Bodies without a solid shape are skipped, matching what the
+    voxeliser will actually place.
+    """
+    out = []
+    taken = set()
+    for mat in find_materials(sim):
+        if not is_pec(mat):
+            continue
+        for body in getattr(mat, "Bodies", []) or []:
+            shape = getattr(body, "Shape", None)
+            if shape is None or not getattr(shape, "Solids", None):
+                continue
+            name = _conductor_name(body, taken)
+            taken.add(name)
+            out.append((body, name, body_potential(body)))
+    return out
+
+
+def conductor_potentials(sim):
+    """``{name: volts}`` for every PEC body in *sim* (the job.json potentials)."""
+    return {name: volts for _body, name, volts in conductors(sim)}
+
+
 def materials_group(sim):
     """Return the "Materials" child group of the Simulation container *sim*.
 
@@ -448,6 +559,11 @@ if _GUI_AVAILABLE:
             bodies = getattr(mat, "Bodies", []) or []
             if obj not in bodies:
                 mat.Bodies = list(bodies) + [obj]
+            if is_pec(mat):
+                # A conductor gains its potential property as soon as it becomes
+                # one, so the property editor offers it without a round trip
+                # through the material panel.
+                ensure_potential_prop(obj)
             _set_body_color(obj, material_color(mat))
             _after_bodies_changed(mat.Document)
 
@@ -533,6 +649,31 @@ if _GUI_AVAILABLE:
             self._bodies_label = QtWidgets.QLabel(self._bodies_text())
             self._bodies_label.setWordWrap(True)
 
+            # Per-conductor potentials, shown only for a PEC material. This is
+            # the one place every conductor in the model is visible at once,
+            # which is what makes a missing or duplicated potential obvious --
+            # the property editor shows them one body at a time.
+            self._pot_table = QtWidgets.QTableWidget(0, 2)
+            self._pot_table.setHorizontalHeaderLabels(["Body", "Potential (V)"])
+            self._pot_table.verticalHeader().setVisible(False)
+            self._pot_table.setEditTriggers(
+                QtWidgets.QAbstractItemView.AllEditTriggers
+            )
+            header = self._pot_table.horizontalHeader()
+            try:
+                header.setSectionResizeMode(0, QtWidgets.QHeaderView.Stretch)
+            except AttributeError:      # PySide2/Qt5 spelling
+                header.setResizeMode(0, QtWidgets.QHeaderView.Stretch)
+            self._pot_table.setMaximumHeight(180)
+            self._fill_potentials()
+
+            self._pot_hint = QtWidgets.QLabel(
+                "Used by an electrostatic run: each body is held at its "
+                "potential. Bodies that touch are one conductor and cannot sit "
+                "at two potentials."
+            )
+            self._pot_hint.setWordWrap(True)
+
             layout.addRow("Name:", self._name)
             layout.addRow("Colour:", self._color_btn)
             layout.addRow(self._pec)
@@ -541,6 +682,9 @@ if _GUI_AVAILABLE:
             layout.addRow("Conductivity (S/m):", self._sigma)
             layout.addRow(self._loss_hint)
             layout.addRow("Assigned bodies:", self._bodies_label)
+            layout.addRow("Potentials:", self._pot_table)
+            layout.addRow(self._pot_hint)
+            self._layout = layout
 
             hint = QtWidgets.QLabel(
                 "Drag bodies from the model tree onto this material to assign "
@@ -620,6 +764,49 @@ if _GUI_AVAILABLE:
                 return "(none -- drag bodies here)"
             return ", ".join(b.Label for b in bodies)
 
+        def _fill_potentials(self):
+            """Populate the potential table from the material's bodies."""
+            from PySide import QtCore
+            try:
+                from PySide import QtWidgets
+            except ImportError:
+                from PySide import QtGui as QtWidgets
+            bodies = list(getattr(self.obj, "Bodies", []) or [])
+            self._pot_bodies = bodies
+            self._pot_table.setRowCount(len(bodies))
+            for row, body in enumerate(bodies):
+                name = QtWidgets.QTableWidgetItem(str(body.Label))
+                name.setFlags(name.flags() & ~QtCore.Qt.ItemIsEditable)
+                self._pot_table.setItem(row, 0, name)
+                spin = QtWidgets.QDoubleSpinBox()
+                spin.setRange(-1.0e9, 1.0e9)
+                spin.setDecimals(4)
+                spin.setSingleStep(0.5)
+                spin.setSuffix(" V")
+                spin.setValue(body_potential(body))
+                self._pot_table.setCellWidget(row, 1, spin)
+
+        def _write_potentials(self):
+            """Push the table's values onto the bodies (inside the caller's
+            transaction). A no-op for a material that is not PEC: a dielectric
+            has no potential to hold, and writing one would leave a stale value
+            behind if it is later made a conductor."""
+            if not self._pec.isChecked():
+                return
+            for row, body in enumerate(getattr(self, "_pot_bodies", [])):
+                spin = self._pot_table.cellWidget(row, 1)
+                if spin is not None:
+                    set_body_potential(body, spin.value())
+
+        def _set_potentials_visible(self, visible):
+            """Show/hide the potential table, its label and its note."""
+            show = bool(visible) and self._pot_table.rowCount() > 0
+            self._pot_table.setVisible(show)
+            self._pot_hint.setVisible(show)
+            label = self._layout.labelForField(self._pot_table)
+            if label is not None:
+                label.setVisible(show)
+
         def _update_color_swatch(self):
             r, g, b = (int(round(c * 255)) for c in self._color)
             self._color_btn.setText("  {}, {}, {}  ".format(r, g, b))
@@ -651,6 +838,7 @@ if _GUI_AVAILABLE:
             self._eps.setEnabled(not checked)
             self._mu.setEnabled(not checked)
             self._sigma.setEnabled(not checked)
+            self._set_potentials_visible(checked)
             self._update_loss_hint()
 
         def accept(self):
@@ -677,6 +865,13 @@ if _GUI_AVAILABLE:
                 name = self._name.text().strip()
                 self.obj.Label = name or "Material ({})".format(_describe(self.obj))
                 apply_material_color(self.obj)
+                # A body that has just become a conductor gains its potential
+                # property here, so the table the panel showed and the property
+                # editor agree from the first commit.
+                if self.obj.Pec:
+                    for body in getattr(self.obj, "Bodies", []) or []:
+                        ensure_potential_prop(body)
+                self._write_potentials()
             except Exception:
                 doc.abortTransaction()
                 raise

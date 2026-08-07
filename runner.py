@@ -34,6 +34,15 @@ job.json schema (Session 2)
                                               # backend refuses cut-cell
                                               # geometry and has no lossy E
                                               # update.
+      "mode": "fdtd",               # optional; "electrostatic" solves once for the
+                                    # potential instead of time-stepping (see
+                                    # "Electrostatics" below). Absent == "fdtd",
+                                    # so every earlier job is unchanged.
+      "pec_names": {"trace": 1, ..},# optional; part label -> the value that
+                                    # labels its cells in materials.npz's
+                                    # ``pec_id``. Both together or neither; only
+                                    # an electrostatic job writes them, and the
+                                    # FDTD path reads neither.
       "steps": 1000,
       "conformal_pec": false,       # did this job's voxelisation produce the six
                                     # pec_*_open_* arrays in materials.npz? What
@@ -111,6 +120,14 @@ job.json schema (Session 2)
          "directional":true, "sign":1.0, "uic":false}, ...],
                       # A SPICE TEM port is still a *lumped* launch on an interior
                       # plane, so unlike a modal port its face IS forced to PML.
+      "electrostatic": {                      # required when mode == "electrostatic"
+        "potentials": {"trace": 5.0, "gnd": 0.0},  # volts, keyed by part name
+        "boundary": "ground" | "neumann" | {"xmin": "ground", ...},
+        "capacitance": true,                  # also extract the C matrix
+        "method": "auto",                     # 'auto'|'direct'|'cg'
+        "slices": [{"name":.., "field":"phi"|"E"|"D",
+                    "normal":"z", "position":..}, ...]
+      },
       "mode_only": false,                     # solve TEM modes only; no FDTD run
       "monitors": {
         "energy": {"full": false, "interior": true},
@@ -243,6 +260,39 @@ shape), so the runner crops the *saved* ``mode_*`` profiles and
 their ``_ca``/``_cb`` coords back to the solved sub-rect (:func:`_bounds_window`)
 — the results plot then shows the bounded region, not a face of zeros around it.
 The port's own mode keeps its full shape.
+
+Electrostatics
+--------------
+With ``mode: "electrostatic"`` the runner solves ``div(eps grad phi) = 0`` on the
+same grid, with each named PEC part held at its assigned potential
+(:func:`_run_electrostatic`), and never builds a CPML, a source, a port or a time
+loop. It reuses the grid because the geometry *is* the same geometry: eps, the
+conductors and the cut-cell open fractions all mean here what they mean to the
+field solver, so a conformal or a graded run stays conformal or graded. Nothing
+in this path reads ``dt``, ``Ex``..``Hz`` or the CFL condition.
+
+Conductors are addressed by name, which ``pec_mask`` alone cannot express (it
+answers "is this cell metal?", and a boundary condition has no name). The
+workbench labels every PEC body: ``materials.npz`` gains ``pec_id`` and job.json
+the matching ``pec_names``.
+
+phi lives on the Yee **nodes**, which is what makes it fit -- the difference of
+phi across an edge is that edge's E component. Slices are saved under the same
+``snapshot_<i>_<comp>_data`` keys as a time-domain snapshot, as a stack of one
+frame, with ``E``/``D`` collocated **to the nodes** (not to cell centres) so that
+every quantity shares phi's coordinate grid. Their ``_edges0``/``_edges1`` are
+therefore the **dual** cells (:func:`_node_dual_edges`), not ``grid.x``: that
+array holds the N+1 boundaries of N cells while these are N samples sitting at
+nodes, and drawing one against the other shifts the picture half a cell.
+
+``summary["electrostatic"]`` carries the applied potentials, the per-conductor
+charge, the field energy, and -- when asked for -- the capacitance matrix in both
+conventions. ``maxwell[i][j]`` is dQ_i/dV_j with every other conductor grounded,
+which is what a field solve measures; ``mutual`` is the two-terminal capacitance
+people draw between pins. They are routinely confused, so both are named rather
+than one being "the" capacitance matrix. Extraction drives one *body* at a time:
+two named parts that are one lump of metal cannot be driven independently, so a
+representative is chosen and the fusion reported under ``capacitance.fused``.
 
 SPICE co-simulation ports
 -------------------------
@@ -853,6 +903,231 @@ def _solve_all_modes(ws, np, grid, job):
 # SPICE co-simulation ports — build one SpicePort per spice_ports entry
 # --------------------------------------------------------------------------- #
 
+# --------------------------------------------------------------------------- #
+# Electrostatics
+# --------------------------------------------------------------------------- #
+
+# The axis a slice normal indexes into, matching ``_INPLANE_AXES`` above and the
+# solver's own ``viz._ES_PLANES``.
+_NORMAL_AXIS = {"x": 0, "y": 1, "z": 2}
+
+
+def _node_dual_edges(np, nodes, centres, n):
+    """The ``n+1`` drawing boundaries for *n* node-centred samples.
+
+    Electrostatic quantities live on the Yee **nodes**, not at cell centres, so
+    ``grid.x`` is *not* their pcolormesh edge array: that holds the ``n+1``
+    boundaries of ``n`` cells, while these are ``n`` samples sitting *at* nodes.
+    Drawing one against the other shifts the picture half a cell. Node ``i`` owns
+    the half cell either side of it, so the boundaries are the cell centres,
+    closed by the two end nodes -- exactly the dual cell the operator integrates
+    over, which is what puts a symmetry plane on the edge of the picture rather
+    than half a cell inside it. Mirrors ``wavesim.viz._node_edges``.
+    """
+    nodes = np.asarray(nodes, dtype=np.float64)
+    if n < 2:
+        return nodes[:2]
+    return np.concatenate([nodes[:1], np.asarray(centres, dtype=np.float64)[:n - 1],
+                           nodes[n - 1:n]])
+
+
+def _es_quantities(np, sol, field):
+    """``(components, arrays)`` for one electrostatic slice quantity.
+
+    ``phi`` is the potential itself -- the only exact thing in the picture, being
+    what was solved for -- and has no components. ``E`` and ``D`` are taken at the
+    **nodes** rather than on their Yee edges, so every quantity shares phi's
+    coordinate grid and two of these pictures can be compared point for point.
+    """
+    text = str(field)
+    if text.lower().startswith("phi"):
+        return ["phi"], [sol.phi]
+    if text.upper().startswith("D"):
+        return ["Dx", "Dy", "Dz"], list(sol.D_nodes)
+    return ["Ex", "Ey", "Ez"], list(sol.E_nodes)
+
+
+def _run_electrostatic(ws, np, grid, job, workdir, voxel_summary):
+    """Solve the electrostatic problem described by *job* and write the results.
+
+    Reuses everything the FDTD path built -- the same grid, the same eps/mu, the
+    same conductors, cut cells included -- because the geometry is the same
+    geometry. Nothing here reads ``dt``, the field arrays or the CFL condition.
+    """
+    cfg = job.get("electrostatic") or {}
+    potentials = dict(cfg.get("potentials") or {})
+    boundary = cfg.get("boundary") or "ground"
+    method = str(cfg.get("method", "auto"))
+
+    known = set(getattr(grid, "pec_names", None) or {})
+    missing = sorted(set(potentials) - known)
+    if missing:
+        # Names come from job.json and the labels from materials.npz; they are
+        # written together, so a mismatch means the two files are from different
+        # builds rather than a user error worth guessing around.
+        raise ValueError(
+            "job.json assigns a potential to {} but materials.npz labels no such "
+            "conductor (it has: {}). Re-run the job, or check that the PEC body "
+            "still exists.".format(
+                ", ".join(repr(m) for m in missing),
+                ", ".join(sorted(known)) or "none"))
+
+    _emit_status("Solving electrostatics ({:,} nodes, {} conductor(s))...".format(
+        grid.Nx * grid.Ny * grid.Nz, len(known)))
+    es = ws.Electrostatics(grid)
+    for name, volts in potentials.items():
+        es.set_potential(name, float(volts))
+    t0 = time.perf_counter()
+    sol = es.solve(boundary=boundary, method=method)
+    wall_time = time.perf_counter() - t0
+
+    result_arrays = {}
+
+    # --- slices ---------------------------------------------------------- #
+    # Saved under the same ``snapshot_*`` keys the time-domain path uses, as a
+    # stack of exactly one frame: the results window already knows how to draw a
+    # plane with a component selector and an in-plane quiver, and a static
+    # solution is that with the time axis removed rather than a different thing.
+    boundary_cfg = job.get("boundary") or {}
+    d_pml = int(boundary_cfg.get("d_pml", 0))
+    pml_set = set(boundary_cfg.get("faces") or ())
+
+    def _pad(axis):
+        return (d_pml if (axis + "0") in pml_set else 0,
+                d_pml if (axis + "1") in pml_set else 0)
+
+    snapshot_meta = []
+    for idx, spec in enumerate(cfg.get("slices") or []):
+        normal = str(spec.get("normal", "z"))
+        n_axis = _NORMAL_AXIS.get(normal, 2)
+        comps, fields = _es_quantities(np, sol, spec.get("field", "phi"))
+        shape = sol.phi.shape
+        # ``axis_index`` can return the N-th node, which the solution does not
+        # carry (phi has one sample per cell, not per grid line).
+        k = min(int(grid.axis_index(normal, float(spec.get("position", 0.0)))),
+                shape[n_axis] - 1)
+        ax0, ax1 = _INPLANE_AXES.get(normal, ("x", "y"))
+        edges0 = _node_dual_edges(np, _axis_nodes(grid, ax0),
+                                  _axis_centers(grid, ax0),
+                                  shape[_NORMAL_AXIS[ax0]])
+        edges1 = _node_dual_edges(np, _axis_nodes(grid, ax1),
+                                  _axis_centers(grid, ax1),
+                                  shape[_NORMAL_AXIS[ax1]])
+        # Strip the absorber padding, as the time-domain path does: those cells
+        # are plain background here, but they are still outside the box the user
+        # drew, and showing them would put the grounded wall in the wrong place.
+        (lo0, hi0), (lo1, hi1) = _pad(ax0), _pad(ax1)
+        n0, n1 = shape[_NORMAL_AXIS[ax0]], shape[_NORMAL_AXIS[ax1]]
+        stop0, stop1 = n0 - hi0, n1 - hi1
+        crop = stop0 > lo0 and stop1 > lo1
+        saved = []
+        for comp, arr in zip(comps, fields):
+            plane = np.take(np.asarray(arr, dtype=np.float64), k, axis=n_axis)
+            if crop:
+                plane = plane[lo0:stop0, lo1:stop1]
+            result_arrays["snapshot_{}_{}_data".format(idx, comp)] = \
+                plane[np.newaxis, ...]
+            saved.append(comp)
+        if crop:
+            edges0 = edges0[lo0:stop0 + 1]
+            edges1 = edges1[lo1:stop1 + 1]
+        result_arrays["snapshot_{}_times".format(idx)] = np.zeros(1)
+        result_arrays["snapshot_{}_edges0".format(idx)] = edges0
+        result_arrays["snapshot_{}_edges1".format(idx)] = edges1
+        field = "phi" if len(saved) == 1 else saved[0][0]
+        snapshot_meta.append({
+            "name": spec.get("name", "slice"),
+            "field": field,
+            "components": saved,
+            # A scalar has no in-plane vector to overlay.
+            "inplane": [] if len(saved) == 1 else [field + ax0, field + ax1],
+            "frames": 1,
+        })
+
+    # --- integrals ------------------------------------------------------- #
+    # Charges come from the same face coefficients the operator was assembled
+    # from, so the reported charge is exactly the flux the solved equations
+    # balanced -- not a second discretisation of the same integral.
+    charges = {}
+    for name in sorted(known):
+        try:
+            charges[name] = float(sol.charge(name))
+        except KeyError:
+            # Named, but occupying no conductor body: every cell it would have
+            # owned was overwritten by a body placed after it.
+            charges[name] = 0.0
+
+    es_summary = {
+        "potentials": potentials,
+        "charges": charges,
+        "energy": float(sol.energy),
+        "method": sol.method,
+        "iterations": int(sol.iterations),
+        "unknowns": int(sol.n_unknowns),
+        "grounded_bodies": int(sol.grounded_bodies),
+        "boundary": sol.boundary if isinstance(sol.boundary, dict) else boundary,
+    }
+
+    # --- capacitance matrix ---------------------------------------------- #
+    if cfg.get("capacitance"):
+        # One conductor per *body*: two named parts that turn out to be the same
+        # lump of metal cannot be driven independently, and the solver refuses
+        # the pair rather than reporting a capacitance between them. Picking a
+        # representative here turns that refusal into a run that still produces
+        # the matrix, and names the fusion in the summary.
+        bodies = ws.body_parts(grid)
+        names, fused = [], []
+        for group in bodies:
+            group = sorted(group)
+            if not group:
+                continue
+            names.append(group[0])
+            if len(group) > 1:
+                fused.append(group)
+        if len(names) >= 2:
+            _emit_status(
+                "Extracting the capacitance matrix ({} conductors, {} solves)..."
+                .format(len(names), len(names)))
+            cap = ws.capacitance_matrix(grid, names, boundary=boundary,
+                                        method=method)
+            result_arrays["capacitance_maxwell"] = np.asarray(cap.maxwell)
+            es_summary["capacitance"] = {
+                "names": list(cap.names),
+                "maxwell": [[float(v) for v in row] for row in cap.maxwell],
+                "mutual": [[float(v) for v in row] for row in cap.mutual()],
+            }
+            if fused:
+                es_summary["capacitance"]["fused"] = fused
+        else:
+            es_summary["capacitance_skipped"] = (
+                "fewer than two independent conductors: {} named part(s) form "
+                "{} conductor body(s)".format(len(known), len(names)))
+
+    _emit_status("Saving electrostatic results...")
+    np.savez(os.path.join(workdir, "results.npz"), **result_arrays)
+
+    summary = {
+        "ok": True,
+        "mode": "electrostatic",
+        "steps": 0,
+        "dt": float(grid.dt),
+        "sim_time_s": 0.0,
+        "wall_time_s": wall_time,
+        "Nx": int(grid.Nx), "Ny": int(grid.Ny), "Nz": int(grid.Nz),
+        "subpixel": bool(job.get("subpixel", False)),
+        "conformal_pec": bool(grid.is_conformal),
+        "electrostatic": es_summary,
+    }
+    summary.update(voxel_summary)
+    if snapshot_meta:
+        summary["snapshots"] = snapshot_meta
+    with open(os.path.join(workdir, "summary.json"), "w",
+              encoding="utf-8") as handle:
+        json.dump(summary, handle, indent=2)
+    _emit_progress(1, 1)
+    return summary
+
+
 def _prepare_ngspice_library(job):
     """Make the configured ``ngspice.dll`` and its sibling DLLs loadable.
 
@@ -971,9 +1246,13 @@ def run_job(workdir):
     # actually got voxelised, not as what the checkbox said, so they are safe to
     # key on. Both rule out the GPU (its kernels implement neither).
     mode_only = bool(job.get("mode_only", False))
+    electrostatic = str(job.get("mode", "fdtd")) == "electrostatic"
     conformal = bool(job.get("conformal_pec", False))
     lossy = bool(job.get("lossy", False))
-    backend = ("numba" if mode_only
+    # An electrostatic job never enters the time loop either: it assembles a
+    # sparse operator and hands it to scipy, which wants float64 and has no
+    # backend to choose. Treated like ``mode_only`` for exactly that reason.
+    backend = ("numba" if mode_only or electrostatic
                else _resolve_backend(job.get("backend", "auto"), conformal,
                                      lossy))
     field_dtype = np.float32 if backend == "cuda" else np.float64
@@ -1046,6 +1325,18 @@ def run_job(workdir):
         # coefficients off the field dtype, so a float32 grid needs float32
         # eps/mu to do genuine single-precision math (the arrays are written as
         # float64 by the FreeCAD-side voxeliser).
+        # Named PEC parts: the label array pairs with the ``pec_names`` map in
+        # job.json (the array is bulk and belongs in the npz, the names are
+        # metadata and belong in the job). Both together or neither, which the
+        # solver enforces -- a label outside the mask would describe metal the
+        # field solver cannot see. Written only by an electrostatic job; the FDTD
+        # path reads neither.
+        part_arrays = {}
+        pec_names = job.get("pec_names") or {}
+        if "pec_id" in data.files and pec_names:
+            part_arrays = {"pec_id": data["pec_id"],
+                           "pec_names": {str(k): int(v)
+                                         for k, v in pec_names.items()}}
         grid = ws.set_material_arrays(
             grid,
             data["eps_x"].astype(field_dtype, copy=False),
@@ -1059,6 +1350,7 @@ def run_job(workdir):
                 float(job["conformal_area_threshold"])
                 if conformal_arrays and "conformal_area_threshold" in job
                 else None),
+            **part_arrays,
             **conformal_arrays,
             **sigma_arrays
         )
@@ -1116,6 +1408,13 @@ def run_job(workdir):
                 "(threshold {:.2f})".format(
                     voxel_summary["cut_cells"], voxel_summary["clamped_faces"],
                     grid.conformal_area_threshold))
+
+    # Electrostatics: a different question about the same geometry. Taken here,
+    # after the materials are on the grid (the solve reads eps, the conductors
+    # and the cut-cell fractions) and before anything that assumes a time axis --
+    # there are no ports to solve, no absorber to build and no loop to step.
+    if electrostatic:
+        return _run_electrostatic(ws, np, grid, job, workdir, voxel_summary)
 
     # Ports: solve each port plane's transverse mode. Done after the materials are
     # loaded (the mode solve reads the grid's own eps/mu/PEC) and before the FDTD

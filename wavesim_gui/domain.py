@@ -66,6 +66,33 @@ _FACE_PROPS = (
 
 _BC_CHOICES = ["PML", "PEC"]
 
+# Electrostatic per-face boundary conditions. A separate property set rather
+# than a reinterpretation of the PML/PEC one: neither of those words means
+# anything to a static field (an absorber has no curl to absorb at DC), and
+# overloading them would make a document's boundary depend on which solver mode
+# happened to be selected when it was read.
+_ES_FACE_PROPS = (
+    ("x0", "ESBoundaryXMin", "Electrostatic boundary on the low-x face"),
+    ("x1", "ESBoundaryXMax", "Electrostatic boundary on the high-x face"),
+    ("y0", "ESBoundaryYMin", "Electrostatic boundary on the low-y face"),
+    ("y1", "ESBoundaryYMax", "Electrostatic boundary on the high-y face"),
+    ("z0", "ESBoundaryZMin", "Electrostatic boundary on the low-z face"),
+    ("z1", "ESBoundaryZMax", "Electrostatic boundary on the high-z face"),
+)
+
+# 'Ground' is Dirichlet phi = 0 -- the box becomes the reference conductor, which
+# is what gives every conductor a capacitance to ground. 'Symmetry' is Neumann
+# (no normal field), i.e. a mirror plane, which is the reason to halve a model.
+_ES_BC_CHOICES = ["Ground", "Symmetry"]
+_ES_BC_TOKENS = {"Ground": "ground", "Symmetry": "neumann"}
+
+# Face name -> the solver's electrostatic boundary key.
+_ES_FACE_KEYS = {
+    "x0": "xmin", "x1": "xmax",
+    "y0": "ymin", "y1": "ymax",
+    "z0": "zmin", "z1": "zmax",
+}
+
 # Shown (read-only) in the Domain panel for a face whose boundary is not the
 # user's to set. Neither is a stored ``App::PropertyEnumeration`` value -- the
 # job builder overrides such a face through ``domain_grid_params``, so an
@@ -234,6 +261,8 @@ class DomainObject:
                 setattr(obj, prop, _BC_CHOICES)
                 setattr(obj, prop, "PML")
 
+        _ensure_es_bc_props(obj)
+
         # Geometry for the view provider (hidden corners, in mm world coords).
         for name in ("DomainMin", "DomainMax", "PmlMin", "PmlMax"):
             if not hasattr(obj, name):
@@ -252,6 +281,7 @@ class DomainObject:
         obj.Proxy = self
         self.Type = getattr(self, "Type", _DOMAIN_TYPE)
         self._migrate_spacing(obj)
+        _ensure_es_bc_props(obj)
 
     @staticmethod
     def _migrate_spacing(obj):
@@ -672,6 +702,40 @@ def spacings_m(domain):
         value = getattr(domain, prop, None)
         mm = float(value.Value) if value is not None else default
         out[face] = mm / _MM_PER_M
+    return out
+
+
+def _ensure_es_bc_props(obj):
+    """Add the six electrostatic per-face boundary properties if absent.
+
+    Idempotent; called from ``__init__`` and ``onDocumentRestored`` so a document
+    saved before electrostatics existed gains a grounded box -- the condition
+    that makes the domain the reference conductor, and the one a capacitance
+    extraction assumes.
+    """
+    for _face, prop, doc in _ES_FACE_PROPS:
+        if not hasattr(obj, prop):
+            obj.addProperty("App::PropertyEnumeration", prop, "Boundary", doc)
+            setattr(obj, prop, _ES_BC_CHOICES)
+            setattr(obj, prop, _ES_BC_CHOICES[0])
+
+
+def electrostatic_boundary(domain):
+    """The solver's ``boundary`` dict for an electrostatic solve on *domain*.
+
+    Keys are the solver's ``'xmin'``..``'zmax'``; values are ``'ground'``
+    (Dirichlet phi = 0) or ``'neumann'`` (a symmetry plane). A domain with none
+    of the properties reads as a grounded box.
+
+    The PML/PEC faces are deliberately not consulted. A PML face is padding an
+    electrostatic run keeps only as extra background -- the absorber corrects
+    terms inside a curl, and a static field has no curl for it to act on -- so
+    mapping it onto either condition would be an invention.
+    """
+    out = {}
+    for face, prop, _doc in _ES_FACE_PROPS:
+        label = str(getattr(domain, prop, _ES_BC_CHOICES[0]))
+        out[_ES_FACE_KEYS[face]] = _ES_BC_TOKENS.get(label, "ground")
     return out
 
 
@@ -1226,8 +1290,22 @@ if _GUI_AVAILABLE:
 
             # Per-face boundary conditions. A "same on all faces" checkbox drives
             # every face from the first (X min) combo and greys the rest out.
-            layout.addRow(QtWidgets.QLabel("<b>Boundary conditions</b>"))
-            self._bc_order = [prop for _f, prop, _d in _FACE_PROPS]
+            #
+            # Which set of six properties this edits depends on the solver mode:
+            # PML/PEC for a full-wave run, Ground/Symmetry for an electrostatic
+            # one. Both are stored, so switching modes back and forth never
+            # discards either answer.
+            from wavesim_gui.commands import active_simulation, is_electrostatic
+            _sim = active_simulation(obj.Document)
+            self._es = is_electrostatic(_sim)
+            if self._es:
+                _ensure_es_bc_props(obj)
+            self._bc_props = _ES_FACE_PROPS if self._es else _FACE_PROPS
+            self._bc_choices = _ES_BC_CHOICES if self._es else _BC_CHOICES
+            layout.addRow(QtWidgets.QLabel(
+                "<b>Electrostatic boundary</b>" if self._es
+                else "<b>Boundary conditions</b>"))
+            self._bc_order = [prop for _f, prop, _d in self._bc_props]
             self._same_bc = QtWidgets.QCheckBox("Same condition on all faces")
             all_same = len({str(getattr(obj, p)) for p in self._bc_order}) == 1
             self._same_bc.setChecked(all_same)
@@ -1237,15 +1315,15 @@ if _GUI_AVAILABLE:
             # the job builder overrides them regardless (see ``pml_port_faces`` /
             # ``modal_port_faces`` and ``domain_grid_params``), so show that state
             # as its own locked entry rather than an editable combo that silently
-            # does not apply.
-            from wavesim_gui.commands import active_simulation
-            _sim = active_simulation(obj.Document)
-            self._modal_faces = set(modal_port_faces(_sim))
-            self._port_faces = set(pml_port_faces(_sim)) - self._modal_faces
+            # does not apply. Electrostatics ignores ports entirely, so nothing is
+            # locked there.
+            self._modal_faces = set() if self._es else set(modal_port_faces(_sim))
+            self._port_faces = (set() if self._es
+                                else set(pml_port_faces(_sim)) - self._modal_faces)
             self._combos = {}
-            for face, prop, _doc in _FACE_PROPS:
+            for face, prop, _doc in self._bc_props:
                 combo = QtWidgets.QComboBox()
-                combo.addItems(_BC_CHOICES)
+                combo.addItems(self._bc_choices)
                 if face in self._modal_faces:
                     combo.addItem(_MODAL_BC_LABEL)
                     combo.setCurrentText(_MODAL_BC_LABEL)
@@ -1272,6 +1350,16 @@ if _GUI_AVAILABLE:
                 layout.addRow(_FACE_LABELS[face], combo)
 
             info = QtWidgets.QLabel(
+                "The domain box auto-sizes to the assigned geometry plus the "
+                "per-face background spacing (filled with the background "
+                "material). A Ground face holds phi = 0, which makes the box the "
+                "reference conductor every capacitance to ground is measured "
+                "against; a Symmetry face lets no field cross it, which is what "
+                "halves a mirror-symmetric model. The PML thickness still pads "
+                "the grid, as plain background: an absorber corrects terms "
+                "inside a curl and a static field has none, so those cells only "
+                "give the field room."
+                if self._es else
                 "The domain box auto-sizes to the assigned geometry plus the "
                 "per-face background spacing (filled with the background "
                 "material). PML faces absorb outgoing waves and enlarge the grid; "

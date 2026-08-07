@@ -117,10 +117,37 @@ def _solver_component(label):
 # the in-plane power-flow quiver come out of the same plot machinery as a field.
 _FIELDS = ["E", "H", "S"]
 
+# What an *electrostatic* run can put on a slice. 'phi' is the potential itself,
+# which is the only quantity in the picture that is exact -- it is what was
+# solved for, on the nodes; E and D are differences of it. There is no H and no
+# Poynting vector to record: nothing is propagating.
+_ES_FIELDS = ["phi", "E", "D"]
+
+# The stored enumeration carries every value either mode can produce, so
+# switching the solver mode never invalidates a saved monitor. The panel offers
+# the subset that the current mode can actually record.
+_ALL_FIELDS = _FIELDS + ["phi", "D"]
+
+
+def fields_for_mode(sim):
+    """The Field values a snapshot may take under *sim*'s solver mode."""
+    from wavesim_gui.commands import is_electrostatic
+
+    return list(_ES_FIELDS) if is_electrostatic(sim) else list(_FIELDS)
+
 
 def _field_components(field):
-    """The three component tokens of field ``'E'``/``'H'``/``'S'`` (Poynting)."""
-    u = str(field).upper()
+    """The component tokens of *field*.
+
+    Three for a vector field (E/H/S, and electrostatic D); one for the scalar
+    potential, which has no components to choose between.
+    """
+    text = str(field)
+    if text.lower().startswith("phi"):
+        return ["phi"]
+    u = text.upper()
+    if u.startswith("D"):
+        return ["D" + axis for axis in ("x", "y", "z")]
     f = "S" if u.startswith("S") else ("H" if u.startswith("H") else "E")
     return [f + axis for axis in ("x", "y", "z")]
 
@@ -217,12 +244,23 @@ def _ensure_snapshot_field(obj):
     if not hasattr(obj, "Field"):
         obj.addProperty(
             "App::PropertyEnumeration", "Field", "Monitor",
-            "Quantity captured in the slice: E, H, or S (the Poynting vector "
-            "S = E x H, i.e. power-flux density). All three components are "
+            "Quantity captured in the slice. Full-wave: E, H, or S (the "
+            "Poynting vector S = E x H, i.e. power-flux density). "
+            "Electrostatic: phi (the potential), E or D. Every component is "
             "recorded (and the magnitude derived), selectable when plotting",
         )
-        obj.Field = _FIELDS
+        obj.Field = _ALL_FIELDS
         obj.Field = _field_of(getattr(obj, "Component", "E"))
+    else:
+        # A monitor saved before electrostatics existed carries the three-value
+        # enumeration; widen it in place, keeping whatever it was set to.
+        try:
+            current = str(obj.Field)
+            if set(obj.getEnumerationsOfProperty("Field")) != set(_ALL_FIELDS):
+                obj.Field = _ALL_FIELDS
+                obj.Field = current if current in _ALL_FIELDS else _ALL_FIELDS[0]
+        except Exception:
+            pass
     if hasattr(obj, "Component"):
         try:
             obj.removeProperty("Component")
@@ -907,6 +945,13 @@ def _snapshot_label(obj):
     off_mm = float(obj.Offset.Value) if hasattr(obj, "Offset") else 0.0
     interval = float(getattr(obj, "RecordInterval", 0.0))
     sim = active_simulation(obj.Document)
+    from wavesim_gui.commands import is_electrostatic
+
+    if is_electrostatic(sim):
+        # One solve, one picture: a cadence in the label would be a lie.
+        return "Snapshot ({} {} @ {}={:g} mm)".format(
+            getattr(obj, "Field", "E"), plane, axis, off_mm,
+        )
     if interval > 0.0 and sim is not None:
         unit = units.get_time_unit(sim)
         every = "{:g} {}".format(units.time_from_si(interval, unit), unit)
@@ -1394,9 +1439,19 @@ if _GUI_AVAILABLE:
             form.setWindowTitle("Wavesim Snapshot")
             layout = QtWidgets.QFormLayout(form)
 
+            # Only the quantities this simulation's solver can produce: a static
+            # solve has no H and no Poynting vector, and a time-stepping one has
+            # no potential. The stored property keeps every value, so switching
+            # modes does not silently rewrite a monitor.
+            _sim_mode = active_simulation(obj.Document)
+            self._fields = fields_for_mode(_sim_mode)
+            self._electrostatic = self._fields is not None and "phi" in self._fields
             self._field = QtWidgets.QComboBox()
-            self._field.addItems(_FIELDS)
-            self._field.setCurrentText(str(getattr(obj, "Field", "E")))
+            self._field.addItems(self._fields)
+            current_field = str(getattr(obj, "Field", "E"))
+            self._field.setCurrentText(
+                current_field if current_field in self._fields else self._fields[0]
+            )
 
             self._plane = QtWidgets.QComboBox()
             self._plane.addItems(_PLANES)
@@ -1432,6 +1487,13 @@ if _GUI_AVAILABLE:
 
             info = QtWidgets.QLabel(
                 "The snapshot captures a 2D slice of the chosen quantity on the "
+                "selected plane, offset along its normal axis. Pick phi (the "
+                "potential), E or D; the electrostatic solve produces one "
+                "picture, so the recording interval does not apply. All three "
+                "components of a vector quantity are recorded — the one to view "
+                "is chosen in the results window."
+                if self._electrostatic else
+                "The snapshot captures a 2D slice of the chosen quantity on the "
                 "selected plane, offset along its normal axis. Pick E, H, or S "
                 "(the Poynting vector S = E x H, i.e. power flow). All three "
                 "components are recorded, so one monitor is enough — the "
@@ -1442,6 +1504,16 @@ if _GUI_AVAILABLE:
             )
             info.setWordWrap(True)
             layout.addRow(info)
+
+            # An electrostatic solve happens once, so a recording cadence has
+            # nothing to describe. Hidden rather than disabled: the value is
+            # still there, and still right, if the mode is switched back.
+            if self._electrostatic:
+                for widget in (self._interval, self._steps_label):
+                    widget.setVisible(False)
+                    row_label = layout.labelForField(widget)
+                    if row_label is not None:
+                        row_label.setVisible(False)
 
             self._plane.currentTextChanged.connect(self._update_offset_label)
             self._update_offset_label(self._plane.currentText())

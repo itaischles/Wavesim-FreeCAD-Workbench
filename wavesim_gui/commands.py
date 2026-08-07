@@ -131,6 +131,7 @@ class SimulationContainer:
             obj.SubpixelSmoothing = True
 
         _ensure_conformal_props(obj)
+        _ensure_solver_mode_props(obj)
 
     def onDocumentRestored(self, obj):
         # Re-assert the back-reference after a reload.
@@ -146,6 +147,7 @@ class SimulationContainer:
         # them (see :func:`_drop_mode_convergence_props`).
         _drop_mode_convergence_props(obj)
         _ensure_conformal_props(obj)
+        _ensure_solver_mode_props(obj)
         # Documents created before the Domain was ordered first still have it
         # after the child groups; hoist it so it sits directly under Simulation.
         _ensure_domain_first(obj)
@@ -308,6 +310,72 @@ def conformal_pec(sim):
 
 
 # --------------------------------------------------------------------------- #
+# Solver mode: full-wave FDTD vs. electrostatics
+# --------------------------------------------------------------------------- #
+
+# job.json ``mode`` tokens. Absent (or ``MODE_FDTD``) is the time-stepping path
+# every earlier session built, so a legacy document reads as full-wave and
+# nothing about it changes.
+MODE_FDTD = "fdtd"
+MODE_ELECTROSTATIC = "electrostatic"
+
+# What the property editor and the panel show, in enumeration order. The stored
+# value is the label -- a plain string a user can read in the property editor --
+# and :func:`solver_mode` is the one place it becomes a job token.
+MODE_LABELS = ["Full wave (FDTD)", "Electrostatic"]
+_MODE_TOKENS = dict(zip(MODE_LABELS, (MODE_FDTD, MODE_ELECTROSTATIC)))
+
+
+def _ensure_solver_mode_props(obj):
+    """Add the solver-mode properties to *obj* if it does not carry them.
+
+    Idempotent; called from ``__init__``, ``onDocumentRestored`` and the task
+    panel, so a document saved before electrostatics existed picks them up and
+    reads as full-wave -- which is what it was.
+    """
+    if not hasattr(obj, "SolverMode"):
+        obj.addProperty(
+            "App::PropertyEnumeration", "SolverMode", "Run",
+            "What to solve. 'Full wave (FDTD)' time-steps Maxwell's equations; "
+            "'Electrostatic' solves div(eps grad phi) = 0 once, with each PEC "
+            "body held at the potential set on it, and reports the fields, the "
+            "conductor charges and the capacitance matrix.",
+        )
+        obj.SolverMode = MODE_LABELS
+        obj.SolverMode = MODE_LABELS[0]
+    if not hasattr(obj, "ExtractCapacitance"):
+        obj.addProperty(
+            "App::PropertyBool", "ExtractCapacitance", "Run",
+            "Electrostatic mode only: extract the capacitance matrix by "
+            "energising each conductor in turn. Costs one extra solve per "
+            "conductor, so it is worth clearing for a large model whose "
+            "potentials are all that is wanted.",
+        )
+        obj.ExtractCapacitance = True
+
+
+def solver_mode(sim):
+    """``MODE_FDTD`` or ``MODE_ELECTROSTATIC`` for *sim*.
+
+    A document with no ``SolverMode`` (or an unrecognised one) is full-wave:
+    that is what every simulation was before the property existed.
+    """
+    if sim is None:
+        return MODE_FDTD
+    return _MODE_TOKENS.get(str(getattr(sim, "SolverMode", "")), MODE_FDTD)
+
+
+def is_electrostatic(sim):
+    """True when *sim* is set to solve electrostatics rather than time-step."""
+    return solver_mode(sim) == MODE_ELECTROSTATIC
+
+
+def extract_capacitance(sim):
+    """True when an electrostatic run should also extract the C matrix."""
+    return bool(getattr(sim, "ExtractCapacitance", True))
+
+
+# --------------------------------------------------------------------------- #
 # GUI: view provider + commands
 # --------------------------------------------------------------------------- #
 
@@ -423,6 +491,36 @@ if _GUI_AVAILABLE:
 
             self._steps = QtWidgets.QLabel()
 
+            # What to solve. Electrostatics reuses the same geometry, grid and
+            # materials but no time loop, so the rows that only describe a
+            # time-stepping run are hidden rather than left to mislead.
+            _ensure_solver_mode_props(obj)
+            self._mode = QtWidgets.QComboBox()
+            self._mode.addItems(MODE_LABELS)
+            self._mode.setCurrentText(
+                str(getattr(obj, "SolverMode", MODE_LABELS[0]))
+            )
+            self._mode.setToolTip(
+                "Full wave: time-step Maxwell's equations (sources, ports, "
+                "monitors).\n"
+                "Electrostatic: solve for the potential once, with each PEC "
+                "body held at the potential set on it. Sources, ports and "
+                "time-series monitors are ignored; a snapshot monitor draws "
+                "phi, E or D on its plane."
+            )
+
+            self._capacitance = QtWidgets.QCheckBox(
+                "Extract the capacitance matrix"
+            )
+            self._capacitance.setChecked(
+                bool(getattr(obj, "ExtractCapacitance", True))
+            )
+            self._capacitance.setToolTip(
+                "Energise each conductor in turn at 1 V with the rest grounded "
+                "and read a column of the Maxwell capacitance matrix off the "
+                "resulting charges. One extra solve per conductor."
+            )
+
             # Subpixel smoothing of dielectric interfaces (on by default). True
             # for legacy documents that predate the property.
             self._subpixel = QtWidgets.QCheckBox(
@@ -456,29 +554,67 @@ if _GUI_AVAILABLE:
                 "reports the clamp threshold it used in the run summary."
             )
 
+            layout.addRow("Solve:", self._mode)
             layout.addRow("Time unit:", self._time)
             layout.addRow("Frequency unit:", self._freq)
             layout.addRow("Max simulation time:", self._max_time)
             layout.addRow("Max frequency:", self._max_freq)
             layout.addRow("Time steps:", self._steps)
+            layout.addRow(self._capacitance)
             layout.addRow(self._subpixel)
             layout.addRow(self._conformal)
 
-            info = QtWidgets.QLabel(
-                "The simulation runs until the maximum time is reached. The "
-                "number of time steps is computed from the CFL time step (set by "
-                "the grid cell sizes). Units are display-only; values are "
-                "converted to seconds / hertz for the solver."
-            )
+            info = QtWidgets.QLabel("")
             info.setWordWrap(True)
             layout.addRow(info)
+            self._info = info
+            self._layout = layout
 
             self._time.currentTextChanged.connect(self._on_time_unit_changed)
             self._freq.currentTextChanged.connect(self._on_freq_unit_changed)
             self._max_time.valueChanged.connect(self._update_steps)
+            self._mode.currentTextChanged.connect(self._on_mode_changed)
             self._update_steps()
+            self._on_mode_changed(self._mode.currentText())
 
             self.form = form
+
+        def _set_row_visible(self, widget, visible):
+            """Show/hide a form row (its field widget and its label)."""
+            widget.setVisible(visible)
+            label = self._layout.labelForField(widget)
+            if label is not None:
+                label.setVisible(visible)
+
+        def _on_mode_changed(self, label):
+            """Show only the rows the chosen solver actually uses.
+
+            Max frequency stays visible in both modes: it is what the Domain
+            derives its default cell size from, so it is a meshing control here
+            even where there is no time axis to bound.
+            """
+            electrostatic = _MODE_TOKENS.get(str(label)) == MODE_ELECTROSTATIC
+            for widget in (self._time, self._max_time, self._steps):
+                self._set_row_visible(widget, not electrostatic)
+            self._set_row_visible(self._capacitance, electrostatic)
+            if electrostatic:
+                self._info.setText(
+                    "Electrostatic: solves div(eps grad phi) = 0 once on the "
+                    "same grid, holding every PEC body at the potential set on "
+                    "it (open a PEC material to set them). Sources, ports and "
+                    "time-series monitors are ignored; a snapshot monitor draws "
+                    "phi, E or D on its plane. Max frequency is kept because "
+                    "the Domain sizes its default cell from it. Boundary "
+                    "conditions are per-face on the Domain: Ground (phi = 0) or "
+                    "Symmetry (no normal field)."
+                )
+            else:
+                self._info.setText(
+                    "The simulation runs until the maximum time is reached. The "
+                    "number of time steps is computed from the CFL time step "
+                    "(set by the grid cell sizes). Units are display-only; "
+                    "values are converted to seconds / hertz for the solver."
+                )
 
         def _on_time_unit_changed(self, new_unit):
             """Re-express the max-time value when the time unit dropdown changes."""
@@ -529,6 +665,9 @@ if _GUI_AVAILABLE:
             self.obj.SubpixelSmoothing = self._subpixel.isChecked()
             _ensure_conformal_props(self.obj)
             self.obj.ConformalPEC = self._conformal.isChecked()
+            _ensure_solver_mode_props(self.obj)
+            self.obj.SolverMode = self._mode.currentText()
+            self.obj.ExtractCapacitance = self._capacitance.isChecked()
             _drop_mode_convergence_props(self.obj)
             new_max_freq = units.freq_to_si(self._max_freq.value(), self._freq_unit)
             self.obj.MaxFrequency = new_max_freq
@@ -708,9 +847,19 @@ if _GUI_AVAILABLE:
             FreeCAD.Console.PrintMessage(
                 "Wavesim: running job in {}\n".format(workdir)
             )
-            summary = run_mod.run_job(
-                workdir, spec["steps"], parent=Gui.getMainWindow()
-            )
+            # An electrostatic job has no step count to divide a bar by -- the
+            # potential solve and the capacitance extraction are each one opaque
+            # call into scipy -- so it runs the dialog indeterminate and lets the
+            # runner's STATUS lines say what stage it is at.
+            if spec.get("mode") == MODE_ELECTROSTATIC:
+                summary = run_mod.run_job(
+                    workdir, 0, parent=Gui.getMainWindow(), busy=True,
+                    message="Solving electrostatics...",
+                )
+            else:
+                summary = run_mod.run_job(
+                    workdir, spec["steps"], parent=Gui.getMainWindow()
+                )
             if summary is not None:
                 from wavesim_gui import results as results_mod
                 sim = active_simulation(doc)
@@ -728,17 +877,37 @@ if _GUI_AVAILABLE:
             from PySide import QtWidgets
         except ImportError:
             from PySide import QtGui as QtWidgets
-        lines = [
-            "Grid: {}x{}x{} cells".format(
-                summary.get("Nx", "?"), summary.get("Ny", "?"),
-                summary.get("Nz", "?"),
-            ),
-            "Time step dt: {:.4e} s".format(summary.get("dt", float("nan"))),
-            "Steps: {}  (sim time {:.3e} s)".format(
-                summary.get("steps", "?"), summary.get("sim_time_s", float("nan"))
-            ),
-            "Wall time: {:.2f} s".format(summary.get("wall_time_s", 0.0)),
-        ]
+        grid_line = "Grid: {}x{}x{} cells".format(
+            summary.get("Nx", "?"), summary.get("Ny", "?"), summary.get("Nz", "?"),
+        )
+        es = summary.get("electrostatic")
+        if es:
+            lines = [grid_line]
+            charges = es.get("charges") or {}
+            potentials = es.get("potentials") or {}
+            for name in sorted(set(charges) | set(potentials)):
+                lines.append("  {}: {:g} V, {:.4g} C".format(
+                    name, float(potentials.get(name, 0.0)),
+                    float(charges.get(name, 0.0))))
+            lines.append("Field energy: {:.6g} J".format(es.get("energy", 0.0)))
+            if es.get("capacitance"):
+                lines.append("Capacitance matrix: {} conductors".format(
+                    len(es["capacitance"].get("names", []))))
+            elif es.get("capacitance_skipped"):
+                lines.append("No capacitance matrix — {}".format(
+                    es["capacitance_skipped"]))
+            lines.append("Wall time: {:.2f} s".format(
+                summary.get("wall_time_s", 0.0)))
+        else:
+            lines = [
+                grid_line,
+                "Time step dt: {:.4e} s".format(summary.get("dt", float("nan"))),
+                "Steps: {}  (sim time {:.3e} s)".format(
+                    summary.get("steps", "?"),
+                    summary.get("sim_time_s", float("nan")),
+                ),
+                "Wall time: {:.2f} s".format(summary.get("wall_time_s", 0.0)),
+            ]
         if "dielectric_cells" in summary:
             lines.append("Dielectric cells: {}".format(summary["dielectric_cells"]))
         if "pec_cells" in summary:

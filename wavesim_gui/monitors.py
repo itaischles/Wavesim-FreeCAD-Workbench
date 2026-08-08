@@ -986,6 +986,8 @@ except Exception:  # console mode / no Qt
 
 if _GUI_AVAILABLE:
 
+    from wavesim_gui import visibility
+
     class ProbeViewProvider:
         """Coin view provider drawing a probe as an orange point marker."""
 
@@ -1250,12 +1252,24 @@ if _GUI_AVAILABLE:
         from wavesim_gui import domain as domain_mod
         domain_mod.notify_domain_inputs_changed(doc)
 
-    class PathMonitorViewProvider:
+    # A path monitor's eye drives the sketch nested under it, exactly as a
+    # Material's drives its bodies -- the monitor draws nothing itself, so
+    # without this its eye would be a flag that does nothing.
+    visibility.register_owner(
+        "path_monitor",
+        lambda obj: is_voltage_monitor(obj) or is_current_monitor(obj),
+        lambda mon: [getattr(mon, "Sketch", None)],
+    )
+    visibility.install()
+
+    class PathMonitorViewProvider(visibility.LinkedVisibilityMixin):
         """Tree view provider for voltage/current monitors.
 
         No 3D geometry of its own -- the linked sketch *is* the curve, and it is
         claimed as a tree child of the monitor. Assignment mirrors Materials:
-        drag a sketch onto the monitor to attach it, drag it off to detach.
+        drag a sketch onto the monitor to attach it, drag it off to detach --
+        and so does its eye, inherited from
+        :class:`visibility.LinkedVisibilityMixin`.
         """
 
         def __init__(self, vobj):
@@ -1264,6 +1278,7 @@ if _GUI_AVAILABLE:
         def attach(self, vobj):
             self.ViewObject = vobj
             self.Object = vobj.Object
+            self.attach_display_mode(vobj)
 
         def getIcon(self):
             obj = getattr(self, "Object", None)
@@ -1292,6 +1307,9 @@ if _GUI_AVAILABLE:
             if getattr(mon, "Sketch", None) is obj:
                 mon.Sketch = None
                 mon.Label = _path_monitor_label(mon)
+                # The eye stands for the sketch; with none there is nothing
+                # left for it to stand for.
+                visibility.sync_from_children(mon)
                 _after_path_changed(mon.Document)
 
         def canDropObjects(self):
@@ -1307,6 +1325,7 @@ if _GUI_AVAILABLE:
                 return
             mon.Sketch = obj
             mon.Label = _path_monitor_label(mon)
+            visibility.sync_from_children(mon)
             _after_path_changed(mon.Document)
 
         def dumps(self):

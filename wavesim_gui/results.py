@@ -368,6 +368,7 @@ def build_results(doc, sim, workdir, summary):
         grp.ResultsDir = workdir
         if grp.ViewObject is not None:
             ResultsViewProvider(grp.ViewObject)
+            grp.ViewObject.Visibility = True
         sim.addObject(grp)
 
         def _new_leaf(name, kind, data_key, component=""):
@@ -379,6 +380,11 @@ def build_results(doc, sim, workdir, summary):
             leaf.Component = component
             if leaf.ViewObject is not None:
                 ResultViewProvider(leaf.ViewObject)
+                # A result leaf exists or it does not -- there is no hidden
+                # state for it to be in, and a greyed row reads as "this run
+                # produced nothing". Its view provider declares a display mode
+                # for the same reason (see ResultViewProvider).
+                leaf.ViewObject.Visibility = True
             grp.addObject(leaf)
             return leaf
 
@@ -694,6 +700,8 @@ except Exception:  # console mode / no Qt
 
 if _GUI_AVAILABLE:
 
+    from wavesim_gui import visibility
+
     # Keep plot windows alive: a QDialog with no Python reference is garbage
     # collected and vanishes immediately. Pruned lazily of closed windows.
     _OPEN_WINDOWS = []
@@ -735,7 +743,7 @@ if _GUI_AVAILABLE:
         except ValueError:
             pass
 
-    class ResultsViewProvider:
+    class ResultsViewProvider(visibility.DisplayModeMixin):
         """Tree icon for the Results group (no 3D geometry, no editor)."""
 
         def __init__(self, vobj):
@@ -744,6 +752,7 @@ if _GUI_AVAILABLE:
         def attach(self, vobj):
             self.ViewObject = vobj
             self.Object = vobj.Object
+            self.attach_display_mode(vobj)
 
         def getIcon(self):
             return _RESULTS_ICON
@@ -757,8 +766,13 @@ if _GUI_AVAILABLE:
         __getstate__ = dumps
         __setstate__ = loads
 
-    class ResultViewProvider:
-        """Tree view provider for a result leaf; double-click opens its plot."""
+    class ResultViewProvider(visibility.DisplayModeMixin):
+        """Tree view provider for a result leaf; double-click opens its plot.
+
+        A leaf has nothing to show in 3D, but it is not *hidden* either -- it
+        either exists or the run did not produce it. The display mode is what
+        keeps the tree from greying the row (see visibility.DisplayModeMixin).
+        """
 
         def __init__(self, vobj):
             vobj.Proxy = self
@@ -766,6 +780,7 @@ if _GUI_AVAILABLE:
         def attach(self, vobj):
             self.ViewObject = vobj
             self.Object = vobj.Object
+            self.attach_display_mode(vobj)
 
         def getIcon(self):
             obj = getattr(self, "Object", None)

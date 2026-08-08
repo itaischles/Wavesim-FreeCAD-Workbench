@@ -505,13 +505,28 @@ except Exception:  # console mode / no Qt
 
 if _GUI_AVAILABLE:
 
+    from wavesim_gui import visibility
+
     def _after_bodies_changed(doc):
         """Recompute and re-size the domain after a material's bodies change."""
         from wavesim_gui import domain as domain_mod
         domain_mod.notify_materials_changed(doc)
 
-    class MaterialViewProvider:
-        """Tree view provider for a Material; double-click opens the editor."""
+    # A Material's eye drives the bodies nested under it: one click hides all
+    # the PEC, and hiding the bodies by hand settles the material's own eye.
+    # See wavesim_gui/visibility.py for why both directions are needed.
+    visibility.register_owner(
+        "material", is_material, lambda mat: getattr(mat, "Bodies", []) or [],
+    )
+    visibility.install()
+
+    class MaterialViewProvider(visibility.LinkedVisibilityMixin):
+        """Tree view provider for a Material; double-click opens the editor.
+
+        Visibility is inherited from
+        :class:`visibility.LinkedVisibilityMixin`: the material owns no geometry
+        of its own, so its eye stands for the bodies it holds.
+        """
 
         def __init__(self, vobj):
             vobj.Proxy = self
@@ -519,6 +534,7 @@ if _GUI_AVAILABLE:
         def attach(self, vobj):
             self.ViewObject = vobj
             self.Object = vobj.Object
+            self.attach_display_mode(vobj)
 
         def getIcon(self):
             return _MATERIAL_ICON
@@ -543,6 +559,8 @@ if _GUI_AVAILABLE:
             if obj in bodies:
                 mat.Bodies = [b for b in bodies if b is not obj]
                 _restore_body_color(obj)
+                # The eye stands for the bodies, so losing one can change it.
+                visibility.sync_from_children(mat)
                 _after_bodies_changed(mat.Document)
 
         def canDropObjects(self):
@@ -568,6 +586,7 @@ if _GUI_AVAILABLE:
                 # through the material panel.
                 ensure_potential_prop(obj)
             _set_body_color(obj, material_color(mat))
+            visibility.sync_from_children(mat)
             _after_bodies_changed(mat.Document)
 
         def setEdit(self, vobj, mode=0):

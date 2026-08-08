@@ -252,6 +252,79 @@ def _snapshot_extent(sim, name):
     return None
 
 
+def _geometry_outlines(obj, chord_mm):
+    """Material cross-sections on a snapshot leaf's plane, in the plot's frame.
+
+    Returns ``[(rgb, [polyline, ...]), ...]``: one entry per Material with
+    geometry on the plane, each polyline an ``(N, 2)`` array of millimetres in
+    the frame the snapshot is drawn in (world mm less the leaf's
+    ``XWorld``/``YWorld``). Empty when the leaf predates those properties, or
+    when the document no longer holds the simulation.
+
+    The outline is sectioned from the **live CAD**, not rebuilt from the voxel
+    arrays: those hold materials, not boundaries, so an outline derived from
+    them would draw the staircase instead of the shape it approximates. A body
+    moved since the run therefore draws where it is now -- the same deal the 3D
+    view offers.
+    """
+    import numpy as np
+    from wavesim_gui import materials as mat_mod
+    from wavesim_gui.commands import active_simulation
+
+    from wavesim_gui import domain as domain_mod
+
+    axes = _PLANE_AXES.get(str(getattr(obj, "Plane", "") or ""))
+    if axes is None:
+        return []
+    sim = active_simulation(obj.Document)
+    if sim is None:
+        return []
+    ax0, ax1 = axes
+    x0, y0 = getattr(obj, "XWorld", None), getattr(obj, "YWorld", None)
+    if x0 is None or y0 is None:
+        # A leaf built before the world frame was stored. The runner crops
+        # exactly the PML pad, so the drawn region is the domain interior and
+        # its low corner is the Domain's own DomainMin -- right unless the
+        # domain has been resized since the run, in which case a stored value
+        # would be stale too.
+        dom = domain_mod.find_domain(sim)
+        dmin = getattr(dom, "DomainMin", None) if dom is not None else None
+        if dmin is None:
+            return []
+        x0, y0 = getattr(dmin, ax0), getattr(dmin, ax1)
+    x0, y0 = float(x0), float(y0)
+    normal = ({"x", "y", "z"} - set(axes)).pop()
+    nvec = FreeCAD.Vector(*[1.0 if a == normal else 0.0 for a in ("x", "y", "z")])
+    offset = float(obj.Offset.Value) if hasattr(obj, "Offset") else 0.0
+
+    groups = []
+    for mat in mat_mod.find_materials(sim):
+        polys = []
+        for body in getattr(mat, "Bodies", []) or []:
+            shape = getattr(body, "Shape", None)
+            if shape is None:
+                continue
+            try:
+                wires = shape.slice(nvec, offset)
+            except Exception:
+                continue          # a plane that misses the solid, or a bad shape
+            for wire in wires or []:
+                try:
+                    verts = wire.discretize(Deflection=chord_mm)
+                except Exception:
+                    continue
+                if len(verts) < 2:
+                    continue
+                pts = np.array([(getattr(v, ax0) - x0, getattr(v, ax1) - y0)
+                                for v in verts], dtype=float)
+                if len(pts) > 2 and wire.isClosed():
+                    pts = np.vstack([pts, pts[:1]])   # discretize omits the seam
+                polys.append(pts)
+        if polys:
+            groups.append((mat_mod.material_color(mat), polys))
+    return groups
+
+
 def build_results(doc, sim, workdir, summary):
     """(Re)build the Results group under *sim* from a finished run.
 
@@ -376,6 +449,11 @@ def build_results(doc, sim, workdir, summary):
             if e0k in keys and e1k in keys:
                 _store_edges(leaf, "XEdges", npz[e0k])
                 _store_edges(leaf, "YEdges", npz[e1k])
+                if extent is not None:
+                    # ...and where that (relative) frame sits in the world, so
+                    # the plot can draw the CAD cross-section over it.
+                    _store_snapshot_world(leaf, sim, extent[2], extent[3],
+                                          npz[e0k][0], npz[e1k][0])
 
         # Electrostatics: one leaf for the scalar results. Created whenever the
         # run was electrostatic, even with no capacitance matrix -- the applied
@@ -464,6 +542,35 @@ def _store_snapshot_extent(leaf, width, height, axis_x, axis_y, plane, offset):
         )
         leaf.setEditorMode("Offset", 1)
     leaf.Offset = "{} mm".format(offset)
+
+
+def _store_snapshot_world(leaf, sim, axis_x, axis_y, first_x_m, first_y_m):
+    """Stash the world-mm position of the drawn slice's (0, 0) corner.
+
+    The stored edges are relative to the first *drawn* cell edge -- the
+    interior low corner, PML cropped -- while the CAD is in world millimetres.
+    This pair is the only thing that maps between them, and it is knowable only
+    here: the leaf has no idea where the grid origin was, and the Domain's node
+    arrays (which do, in world mm) may have moved by the time the plot opens.
+    """
+    from wavesim_gui import domain as domain_mod
+
+    dom = domain_mod.find_domain(sim)
+    if dom is None:
+        return
+    nodes = dict(zip(("x", "y", "z"), domain_mod.node_coords_mm(dom)))
+    origin_x, origin_y = nodes.get(axis_x) or [], nodes.get(axis_y) or []
+    if not origin_x or not origin_y:
+        return
+    for prop, value in (
+        ("XWorld", origin_x[0] + float(first_x_m) * _MM_PER_M),
+        ("YWorld", origin_y[0] + float(first_y_m) * _MM_PER_M),
+    ):
+        if not hasattr(leaf, prop):
+            leaf.addProperty("App::PropertyFloat", prop, "Snapshot",
+                             "World position (mm) of the drawn slice's origin")
+            leaf.setEditorMode(prop, 1)
+        setattr(leaf, prop, value)
 
 
 def _store_edges(leaf, prop, coords_m, relative=True, group="Snapshot"):
@@ -1179,6 +1286,50 @@ if _GUI_AVAILABLE:
 
         _make_image(image["smooth"])
 
+        # --- geometry outline overlay ------------------------------------- #
+        # The field alone does not say where the metal and the dielectric are,
+        # and on a slice through a coax that is most of the reading. Each
+        # material's cross-section is drawn in the material's own colour --
+        # the same one the body is tinted with in the 3D view, so the two
+        # pictures name their parts alike -- semi-transparent and under the
+        # arrows, since it is a reference layer and not the result.
+        outlines = []
+
+        def _build_outlines():
+            """Section the CAD on this leaf's plane; returns the added artists."""
+            from matplotlib.collections import LineCollection
+
+            # Chord tolerance for discretising curved edges: a fraction of the
+            # drawn extent, so a bore reads as a circle rather than a polygon
+            # and no CAD detail costs much more than a pixel.
+            spanx = ((float(xedges[-1]) - float(xedges[0])) if use_mesh
+                     else (float(size.x) if have_size else 0.0))
+            spany = ((float(yedges[-1]) - float(yedges[0])) if use_mesh
+                     else (float(size.y) if have_size else 0.0))
+            chord = max(spanx, spany) / 400.0
+            if chord <= 0.0:
+                return []
+            try:
+                groups = _geometry_outlines(obj, chord)
+            except Exception as exc:      # never let the CAD break the plot
+                FreeCAD.Console.PrintWarning(
+                    "Wavesim: could not section the geometry for {} ({})\n"
+                    .format(obj.Label, exc)
+                )
+                return []
+            arts = []
+            for rgb, polys in groups:
+                lc = LineCollection(
+                    polys, colors=[rgb], linewidths=1.4, alpha=0.65, zorder=2,
+                )
+                # No autolim: the axes are framed on the field, and a body
+                # running past the domain must not stretch them.
+                ax.add_collection(lc, autolim=False)
+                arts.append(lc)
+            return arts
+
+        outlines = _build_outlines()
+
         # --- in-plane vector overlay -------------------------------------- #
         # The two components lying in the slice plane form a vector the colour
         # map cannot show (it is one scalar at a time), so they are drawn as
@@ -1187,53 +1338,98 @@ if _GUI_AVAILABLE:
         inplane = [c for c in str(getattr(obj, "InPlane", "")).split(",") if c]
         can_quiver = len(inplane) == 2 and all(c in comps for c in inplane)
 
-        # One arrow per this many cells at most, so a fine grid stays readable.
-        _MAX_ARROWS = 24
+        # Arrows sit on a square lattice of fixed *physical* pitch over the
+        # visible axes, not on every k-th cell. Index striding puts the same
+        # arrow count on each axis, so a long thin slice (a coax down z) comes
+        # out dense across and sparse along it -- and on a graded grid the
+        # cells being strided are not even the same size. The pitch is one
+        # number, set by the longer visible axis and used for *both*, so the
+        # lattice stays square whatever the slice's aspect ratio: the short
+        # axis gets however many rows fit at that pitch, centred, rather than
+        # its own extent divided into the same count. Sites are recomputed on
+        # zoom, and arrow length is measured in axes width rather than data
+        # units, so zooming in yields its own arrows at the same on-screen size
+        # instead of a handful of giant ones.
+        _ARROWS_ACROSS = 28     # arrows along the longer visible axis
+        _ARROW_SPAN = 1.6       # longest arrow, in arrow pitches
+
+        def _nearest(coords, vals):
+            """Index of the sample in *coords* nearest each of *vals*."""
+            n = len(coords)
+            if n < 2:
+                return np.zeros(np.shape(vals), dtype=int)
+            j = np.clip(np.searchsorted(coords, vals), 1, n - 1)
+            return np.where(vals - coords[j - 1] <= coords[j] - vals, j - 1, j)
+
+        def _arrow_sites(cx, cy):
+            """Square-lattice arrow sites over the visible axes.
+
+            Returns ``(px, py, ix, iy)``: flat site coordinates plus the
+            nearest-cell indices to read the field at, or ``None`` if the view
+            and the data do not overlap.
+            """
+            xlo, xhi = sorted(ax.get_xlim())
+            ylo, yhi = sorted(ax.get_ylim())
+            x0, x1 = max(xlo, cx[0]), min(xhi, cx[-1])
+            y0, y1 = max(ylo, cy[0]), min(yhi, cy[-1])
+            if x1 <= x0 or y1 <= y0:
+                return None
+            # One pitch for both axes -- the lattice is square by construction.
+            pitch = max(x1 - x0, y1 - y0) / float(_ARROWS_ACROSS)
+            nx = max(1, int(round((x1 - x0) / pitch)))
+            ny = max(1, int(round((y1 - y0) / pitch)))
+            # Centred, so the leftover strip on the short axis is split evenly
+            # rather than piling up at one edge.
+            gx = x0 + 0.5 * ((x1 - x0) - (nx - 1) * pitch) + np.arange(nx) * pitch
+            gy = y0 + 0.5 * ((y1 - y0) - (ny - 1) * pitch) + np.arange(ny) * pitch
+            px, py = np.meshgrid(gx, gy)
+            px = np.clip(px, cx[0], cx[-1]).ravel()
+            py = np.clip(py, cy[0], cy[-1]).ravel()
+            return px, py, _nearest(cx, px), _nearest(cy, py)
 
         def _build_quiver():
             """Create the arrow overlay, or ``None`` if its components are gone.
 
-            Sized once for the whole run so arrow length stays comparable between
-            frames instead of rescaling per frame.
+            Scaled once for the whole run so arrow length stays comparable
+            between frames -- and between zoom levels -- instead of rescaling.
             """
             stacks = [_frames(c) for c in inplane]
             if any(s is None or len(s) == 0 for s in stacks):
                 return None
             n0, n1 = stacks[0].shape[1], stacks[0].shape[2]
-            s0 = max(1, int(np.ceil(n0 / float(_MAX_ARROWS))))
-            s1 = max(1, int(np.ceil(n1 / float(_MAX_ARROWS))))
-            cx = _centres(xedges, n0, size.x if have_size else 0.0)[::s0]
-            cy = _centres(yedges, n1, size.y if have_size else 0.0)[::s1]
-            gx, gy = np.meshgrid(cx, cy)
+            cx = _centres(xedges, n0, size.x if have_size else 0.0)
+            cy = _centres(yedges, n1, size.y if have_size else 0.0)
+            sites = _arrow_sites(cx, cy)
+            if sites is None:
+                return None
+            px, py, ix, iy = sites
 
-            # Subsample first, then cast: a CUDA run's stacks are float32 and
-            # casting the whole thing would transiently double the run's frames
-            # in memory for arrows that use a fraction of them.
-            a0 = np.asarray(stacks[0][:, ::s0, ::s1], dtype=float)
-            a1 = np.asarray(stacks[1][:, ::s0, ::s1], dtype=float)
-            mags = np.sqrt(a0 ** 2 + a1 ** 2)
-            nonzero = mags[mags > 0]
             # Reference magnitude drawn at full arrow length. A *percentile*, not
             # the peak: a source cell or a conductor edge is often orders of
             # magnitude above the propagating field, and scaling on it collapses
             # every other arrow to nothing (unlike the colour map, a too-short
             # arrow is invisible rather than merely faint). Longer vectors are
-            # clipped to full length, keeping their exact direction.
-            ref = float(np.percentile(nonzero, 99.0)) if nonzero.size else 0.0
-            if ref <= 0.0:
-                ref = float(mags.max()) or 1.0
-            # Longest arrow spans about one arrow spacing.
-            span = min(np.min(np.diff(cx)) if len(cx) > 1 else 1.0,
-                       np.min(np.diff(cy)) if len(cy) > 1 else 1.0)
-            if span <= 0:
-                span = 1.0
+            # clipped to full length, keeping their exact direction. Taken over
+            # the whole run once and cached, so a rebuild after a zoom cannot
+            # silently change what an arrow length means; strided (and cast
+            # only then, since a CUDA run's stacks are float32 and casting all
+            # of them would transiently double the run's frames in memory).
+            if quiver["ref"] is None:
+                s0, s1 = max(1, n0 // 64), max(1, n1 // 64)
+                mags = np.sqrt(
+                    np.asarray(stacks[0][:, ::s0, ::s1], dtype=float) ** 2
+                    + np.asarray(stacks[1][:, ::s0, ::s1], dtype=float) ** 2
+                )
+                nonzero = mags[mags > 0]
+                ref = float(np.percentile(nonzero, 99.0)) if nonzero.size else 0.0
+                quiver["ref"] = ref or float(mags.max()) or 1.0
+            ref = quiver["ref"]
             linthresh = ref / 1e3
 
             def _uv(idx):
-                # Transposed to the (y, x) orientation the axes are drawn in,
-                # matching the frame's own .T above.
-                u = a0[idx].T.copy()
-                v = a1[idx].T.copy()
+                # One frame, read at the arrow sites (nearest cell).
+                u = np.asarray(stacks[0][idx][ix, iy], dtype=float)
+                v = np.asarray(stacks[1][idx][ix, iy], dtype=float)
                 m = np.sqrt(u ** 2 + v ** 2)
                 with np.errstate(divide="ignore", invalid="ignore"):
                     if log_check.isChecked():
@@ -1248,9 +1444,14 @@ if _GUI_AVAILABLE:
 
             u0, v0 = _uv(slider.value())
             art = ax.quiver(
-                gx, gy, u0, v0, angles="xy", scale_units="xy",
-                scale=ref / span, color=_arrow_color(view["comp"]),
-                width=0.004, pivot="mid", zorder=3,
+                px, py, u0, v0, angles="xy",
+                # Length in axes width, not data units: that is what makes the
+                # arrows keep their size (and the `ref` arrow keep spanning
+                # _ARROW_SPAN pitches) as the view zooms.
+                scale_units="width", scale=ref * _ARROWS_ACROSS / _ARROW_SPAN,
+                color=_arrow_color(view["comp"]), width=0.005,
+                headwidth=3.5, headlength=4.5, headaxislength=4.0,
+                pivot="mid", zorder=3,
             )
             quiver["art"], quiver["uv"] = art, _uv
             return art
@@ -1259,7 +1460,27 @@ if _GUI_AVAILABLE:
             """Arrow colour that reads against the current colour map."""
             return "white" if _one_sided(choice) else "black"
 
-        quiver = {"art": None, "uv": None}
+        quiver = {"art": None, "uv": None, "ref": None, "busy": False}
+
+        def _resite(*_args):
+            """Re-place the arrows for the current view (zoom or pan).
+
+            A rebuild rather than a move: the site count follows the view, and
+            ``Quiver`` fixes its arrow count at construction.
+            """
+            if quiver["art"] is None or quiver["busy"]:
+                return
+            quiver["busy"] = True
+            try:
+                visible = quiver["art"].get_visible()
+                quiver["art"].remove()
+                quiver["art"] = None
+                art = _build_quiver()
+                if art is not None:
+                    art.set_visible(visible)
+            finally:
+                quiver["busy"] = False
+            dialog._canvas.draw_idle()
 
         def _set_frame_data(idx):
             data2d = np.asarray(view["frames"][idx]).T
@@ -1369,6 +1590,16 @@ if _GUI_AVAILABLE:
             "see the actual cells, or to speed up playback on a fine grid."
         )
         controls.addWidget(smooth_check)
+        geom_check = None
+        if outlines:
+            geom_check = QtWidgets.QCheckBox("Geometry")
+            geom_check.setChecked(True)
+            geom_check.setToolTip(
+                "Outline each material's cross-section on this plane, in the\n"
+                "material's own colour. Sectioned from the CAD as it is now,\n"
+                "not from the voxels the run used."
+            )
+            controls.addWidget(geom_check)
         vector_check = None
         if can_quiver:
             vector_check = QtWidgets.QCheckBox("Vectors")
@@ -1447,8 +1678,21 @@ if _GUI_AVAILABLE:
                 quiver["art"].set_visible(bool(checked))
                 dialog._canvas.draw_idle()
 
+        def on_geometry(checked):
+            for art in outlines:
+                art.set_visible(bool(checked))
+            dialog._canvas.draw_idle()
+
+        if geom_check is not None:
+            geom_check.toggled.connect(on_geometry)
+
         if vector_check is not None:
             vector_check.toggled.connect(on_vectors)
+            # Zoom/pan re-places the arrows, so a zoomed-in view gets its own
+            # sites at the same density instead of the two that happened to
+            # fall inside it. No-op until the overlay exists.
+            ax.callbacks.connect("xlim_changed", _resite)
+            ax.callbacks.connect("ylim_changed", _resite)
 
         timer = _QtCore.QTimer(dialog)
         timer.setInterval(100)  # ms between frames

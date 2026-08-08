@@ -72,9 +72,9 @@ Workflow
 
 Rendering
 ---------
-The port draws as a translucent teal plane on the chosen face spanning the
+The port draws as a translucent amber plane on the chosen face spanning the
 domain box (mirroring the snapshot monitor's plane), so the port plane is visible
-and the standard "eye" toggle shows/hides it. A matching teal arrow, anchored to
+and the standard "eye" toggle shows/hides it. A matching amber arrow, anchored to
 a plane corner and kept at a fixed on-screen size, shows the direction of energy
 flow -- always *into* the simulation domain.
 
@@ -165,8 +165,9 @@ _MODE_FROM_LABEL = {label: mode for mode, label in _MODE_LABELS.items()}
 # face BC at all -- it *is* the boundary, see ``domain.modal_port_faces``.
 _SPICE_PORT_BC = "PML"
 
-# Translucent teal plane, distinct from the orange monitor / green point source.
-_PORT_COLOR = (0.0, 0.80, 0.80)
+# Translucent amber plane: the deep end of the source/port group's icon
+# palette (#c9741a), against the teal a monitor draws in.
+_PORT_COLOR = (0.788, 0.455, 0.102)
 _PORT_TRANSPARENCY = 0.6
 
 # Energy-flow arrow: kept at a fixed on-screen length (pixels) regardless of zoom.
@@ -647,7 +648,7 @@ if _GUI_AVAILABLE:
         return sep
 
     class ModalPortViewProvider:
-        """Coin view provider drawing the port as a translucent teal plane."""
+        """Coin view provider drawing the port as a translucent amber plane."""
 
         def __init__(self, vobj):
             vobj.Proxy = self

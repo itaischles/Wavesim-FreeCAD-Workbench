@@ -70,8 +70,10 @@ _AXIS_IDX = {"x": 0, "y": 1, "z": 2}
 # Boundary condition forced on a TEM port's launch face (absorbing port).
 _PORT_BC = "PML"
 
-# Line-port drawing: a magenta segment with pixel-sized end markers.
-_LINE_COLOR = (0.85, 0.10, 0.85)
+# Line-port drawing: an amber segment (the source/port group's darkest icon
+# shade, #a75f13) with pixel-sized end markers. The markers stay green/red:
+# they mean polarity, not family.
+_LINE_COLOR = (0.655, 0.373, 0.075)
 _PLUS_COLOR = (0.10, 0.80, 0.10)
 _MINUS_COLOR = (0.90, 0.20, 0.20)
 
@@ -487,7 +489,7 @@ if _GUI_AVAILABLE:
         return bool(getattr(shape, "Edges", None))
 
     # ------------------------------------------------------------------ #
-    # Line port view provider (magenta segment + / - end markers)
+    # Line port view provider (amber segment + / - end markers)
     # ------------------------------------------------------------------ #
 
     class SpiceLinePortViewProvider:
@@ -631,7 +633,7 @@ if _GUI_AVAILABLE:
         __setstate__ = loads
 
     class SpiceTEMPortViewProvider(modal_mod.ModalPortViewProvider):
-        """Teal launch plane (reused from the TEM source), editing this port."""
+        """Amber launch plane (reused from the TEM source), editing this port."""
 
         def getIcon(self):
             return _SPICE_TEM_PORT_ICON

@@ -18,7 +18,7 @@ now reads the first Source under the simulation when building the job.
 
 Rendering
 ---------
-The source draws as a single green point marker in the 3D view at its world
+The source draws as a single amber point marker in the 3D view at its world
 position. Like every scripted ViewProvider it carries the standard ``Visibility``
 property, so the tree's "eye" toggle shows/hides it. Double-clicking the source
 in the tree (or Edit) opens a Task-tab panel to change its component, position
@@ -69,8 +69,9 @@ _COMPONENTS = ["Ex", "Ey", "Ez", "Hx", "Hy", "Hz"]
 # glue live in the shared workbench-side catalogue :mod:`wavesim_gui.excitation`.
 _EXCITATIONS = exc.EXCITATION_LABELS
 
-# Green point marker colour.
-_SOURCE_COLOR = (0.10, 0.90, 0.20)
+# Amber point marker, matching the source/port group in Resources/icons
+# (#e0912f) -- the toolbar and the 3D view name a thing the same way.
+_SOURCE_COLOR = (0.878, 0.569, 0.184)
 
 _MM_PER_M = 1000.0
 
@@ -491,7 +492,7 @@ if _GUI_AVAILABLE:
             exc.sync_visibility(obj)
 
     class SourceViewProvider:
-        """Coin view provider drawing the source as a green point marker.
+        """Coin view provider drawing the source as an amber point marker.
 
         The standard ``Visibility`` property (tree "eye") shows/hides the marker.
         Double-clicking (or Edit) opens the source task panel.

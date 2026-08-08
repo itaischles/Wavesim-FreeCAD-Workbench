@@ -6,12 +6,12 @@ simulation's "Monitors" child group, each mapping onto one of the solver's
 monitor dataclasses (:mod:`wavesim.monitors`):
 
 * **Probe** (``FieldProbe``) -- records a single field component (or ``|E|`` /
-  ``|H|`` magnitude) at one point over time. Drawn as an orange point marker.
+  ``|H|`` magnitude) at one point over time. Drawn as a teal point marker.
 * **Snapshot** (``SnapshotMonitor``) -- captures a 2D slice of a whole field
   (``E`` or ``H``) every *N* steps. The user picks the field, not a component:
   the runner puts one solver monitor on each of its three components and the
   results window offers Ex/Ey/Ez/|E| (magnitude derived from the components), so
-  one monitor covers what used to take three. Drawn as a semi-transparent orange
+  one monitor covers what used to take three. Drawn as a semi-transparent teal
   plane on the chosen slice plane, offset along that plane's normal axis.
 * **Energy** (``EnergyMonitor``) -- the total-energy diagnostic. It has no
   location, so it is a tree-only object with no 3D representation; its panel
@@ -167,8 +167,9 @@ _PLANE_NORMAL = {"XY": "z", "YZ": "x", "XZ": "y"}
 # Which world-axis the slice offset is measured along, per plane (== the normal).
 _PLANE_OFFSET_AXIS = {"XY": "z", "YZ": "x", "XZ": "y"}
 
-# Orange marker / plane colour, distinct from the green source marker.
-_MONITOR_COLOR = (1.0, 0.55, 0.0)
+# Teal marker / plane colour, matching the monitor group in Resources/icons
+# (#2f9a86) and set against the amber a source or port draws in.
+_MONITOR_COLOR = (0.184, 0.604, 0.525)
 # Transparency of the snapshot plane (0 opaque .. 1 invisible).
 _SNAPSHOT_TRANSPARENCY = 0.65
 
@@ -989,7 +990,7 @@ if _GUI_AVAILABLE:
     from wavesim_gui import visibility
 
     class ProbeViewProvider:
-        """Coin view provider drawing a probe as an orange point marker."""
+        """Coin view provider drawing a probe as a teal point marker."""
 
         def __init__(self, vobj):
             vobj.Proxy = self
@@ -1058,7 +1059,7 @@ if _GUI_AVAILABLE:
         __setstate__ = loads
 
     class SnapshotViewProvider:
-        """Coin view provider drawing a snapshot as a translucent orange plane."""
+        """Coin view provider drawing a snapshot as a translucent teal plane."""
 
         def __init__(self, vobj):
             vobj.Proxy = self
@@ -1086,7 +1087,7 @@ if _GUI_AVAILABLE:
             self._face = coin.SoFaceSet()
             root.addChild(self._face)
 
-            # An opaque orange border to make the plane edges read clearly.
+            # An opaque teal border to make the plane edges read clearly.
             border = coin.SoSeparator()
             bcolor = coin.SoBaseColor()
             bcolor.rgb.setValue(*_MONITOR_COLOR)

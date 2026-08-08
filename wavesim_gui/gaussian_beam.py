@@ -50,8 +50,8 @@ Rendering
 ---------
 Like the TEM source, the beam draws as a translucent plane on the chosen face
 spanning the domain box, with an arrow (kept at a fixed on-screen size) pointing
-into the domain along the propagation direction. A distinct violet colour tells
-it apart from the teal TEM port and green point source.
+into the domain along the propagation direction. It shares the amber of the
+other launch faces, a lighter shade than the modal port's.
 
 Units: FreeCAD geometry/properties are in millimetres; the solver works in SI.
 :func:`gaussian_beam_spec` emits the face, the polarization angle (degrees), the
@@ -115,8 +115,9 @@ _EXCITATIONS = exc.EXCITATION_LABELS
 # Boundary condition forced on the launch face (clean directional launch).
 _PORT_BC = "PML"
 
-# Translucent violet plane, distinct from the teal TEM port / green point source.
-_BEAM_COLOR = (0.62, 0.32, 0.92)
+# Translucent amber plane: the light end of the source/port group's icon
+# palette (#f0b46b), so it reads as a launch face but not as the modal port.
+_BEAM_COLOR = (0.941, 0.706, 0.420)
 _BEAM_TRANSPARENCY = 0.6
 
 _MM_PER_M = 1000.0
@@ -391,7 +392,7 @@ if _GUI_AVAILABLE:
         """Coin view provider drawing the beam's launch plane, translucent.
 
         Mirrors the TEM source's plane + fixed-pixel propagation arrow, in a
-        distinct violet, so a launch face reads the same way for both.
+        lighter amber, so a launch face reads the same way for both.
         """
 
         def __init__(self, vobj):

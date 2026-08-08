@@ -1059,23 +1059,125 @@ if _GUI_AVAILABLE:
         _QtCore, QtWidgets = _qt()
 
         ax = figure.add_subplot(111)
+
+        def _centres(edges, n, length):
+            """Cell-centre coordinates along an axis, in the drawn axis units."""
+            e = np.asarray(edges, dtype=float)
+            if len(e) >= n + 1:
+                return 0.5 * (e[:n] + e[1:n + 1])
+            if length:
+                return (np.arange(n) + 0.5) * (float(length) / n)
+            return np.arange(n, dtype=float)   # cell indices
+
         # frames[f] has shape (axis1, axis2); show axis1 horizontal, axis2
         # vertical with a lower-left origin. Equal aspect so a square physical
         # extent renders square rather than stretched to fill the axes.
-        if use_mesh:
-            # pcolormesh honours non-uniform edge spacing; C is (Ny, Nx) so pass
-            # the transposed frame against (xedges, yedges).
-            artist = ax.pcolormesh(
-                np.asarray(xedges), np.asarray(yedges),
-                np.asarray(frames[0]).T, cmap=_cmap_for(comp),
-                norm=_make_norm(False),
+        #
+        # Smoothing interpolates between neighbouring *cell centres* instead of
+        # painting one flat rectangle per cell, which is what makes a coarse
+        # grid read as pixels. It is honest about the data rather than a
+        # cosmetic blur: the frames are point samples at cell centres (see
+        # ARCHITECTURE's collocation note), so interpolating between them is a
+        # plain reading of the same numbers -- but it does hide the cells,
+        # which is why it is a toggle. Off shows exactly the grid the solver
+        # stepped (staircasing at a conductor, a mesh that is too coarse).
+        #
+        # Gouraud shading was the obvious route and is not enough: it is
+        # piecewise *linear*, so a coarse grid trades pixels for visible facets
+        # and diamond seams. Instead the frame is resampled onto a fine uniform
+        # lattice with a separable Catmull-Rom cubic (C1, passes through every
+        # sample) and drawn with `imshow`, which is both smoother and faster to
+        # redraw than a large QuadMesh. The interpolation runs in *index* space
+        # with the coordinate -> index map carrying the geometry, so it is
+        # correct on a graded grid. A cubic can overshoot at a sharp edge (a
+        # conductor); the colour norm clips it, and the flat view is a tick
+        # away. The artist kind differs per mode, so the toggle rebuilds it.
+        image = {"art": None, "smooth": True, "warp": None}
+
+        # ~4x upsampling, capped so a fine grid does not blow up the redraw.
+        _SMOOTH_TARGET, _SMOOTH_MAX = 4, 900
+
+        def _cubic_weights(src, n_out):
+            """Catmull-Rom taps resampling *src* samples onto `n_out` uniform ones.
+
+            Returns ``(idx, w)`` with ``idx`` four index arrays into the sample
+            axis and ``w`` their four weights, so the interpolation is four
+            gathers and a dot product per frame.
+            """
+            n = len(src)
+            pos = np.interp(
+                np.linspace(src[0], src[-1], n_out), src, np.arange(n, dtype=float)
             )
-            ax.set_aspect("equal")
-        else:
-            artist = ax.imshow(
-                np.asarray(frames[0]).T, origin="lower", extent=extent,
-                cmap=_cmap_for(comp), norm=_make_norm(False), aspect="equal",
-            )
+            i1 = np.clip(np.floor(pos).astype(int), 0, n - 1)
+            t = (pos - i1)[:, None] ** np.arange(4)   # [1, t, t^2, t^3]
+            idx = [np.clip(i1 + k, 0, n - 1) for k in (-1, 0, 1, 2)]
+            # Catmull-Rom basis, as polynomials in t.
+            basis = np.array([
+                [0.0, -0.5, 1.0, -0.5],
+                [1.0, 0.0, -2.5, 1.5],
+                [0.0, 0.5, 2.0, -1.5],
+                [0.0, 0.0, -0.5, 0.5],
+            ])
+            return idx, t @ basis.T                   # (n_out, 4)
+
+        def _make_warp(nx, ny):
+            """Build the resampler for an (ny, nx) frame, plus its imshow extent."""
+            cx = _centres(xedges, nx, size.x if have_size else 0.0)
+            cy = _centres(yedges, ny, size.y if have_size else 0.0)
+            nfx = int(min(max(nx, nx * _SMOOTH_TARGET), _SMOOTH_MAX))
+            nfy = int(min(max(ny, ny * _SMOOTH_TARGET), _SMOOTH_MAX))
+            ix, wx = _cubic_weights(cx, nfx)
+            iy, wy = _cubic_weights(cy, nfy)
+
+            def warp(data2d):
+                # Columns (x) first, then rows (y); each pass is 4 gathers.
+                a = sum(data2d[:, ix[k]] * wx[:, k] for k in range(4))
+                return sum(a[iy[k], :] * wy[:, k][:, None] for k in range(4))
+
+            extent = [float(cx[0]), float(cx[-1]), float(cy[0]), float(cy[-1])]
+            return warp, extent
+
+        def _make_image(smooth, idx=0, log=False):
+            """(Re)create the field map artist, smoothed or flat."""
+            if image["art"] is not None:
+                image["art"].remove()
+            data2d = np.asarray(view["frames"][idx]).T
+            cmap, norm = _cmap_for(view["comp"]), _make_norm(log)
+            image["warp"] = None
+            if use_mesh:
+                if smooth:
+                    warp, box = _make_warp(data2d.shape[1], data2d.shape[0])
+                    image["warp"] = warp
+                    art = ax.imshow(
+                        warp(np.asarray(data2d, dtype=float)), origin="lower",
+                        extent=box, cmap=cmap, norm=norm, aspect="equal",
+                        interpolation="bilinear",
+                    )
+                else:
+                    # pcolormesh honours non-uniform edge spacing; C is
+                    # (Ny, Nx) so pass the transposed frame against
+                    # (xedges, yedges).
+                    art = ax.pcolormesh(
+                        np.asarray(xedges), np.asarray(yedges),
+                        data2d, cmap=cmap, norm=norm,
+                    )
+                # Frame the full cell-edge extent either way, so the axes box is
+                # the physical slice and toggling smooth does not shift the
+                # picture (the smoothed image stops at the outer cell centres,
+                # and a removed artist's data limits would otherwise linger).
+                ax.set_xlim(float(xedges[0]), float(xedges[-1]))
+                ax.set_ylim(float(yedges[0]), float(yedges[-1]))
+                ax.set_aspect("equal")
+            else:
+                art = ax.imshow(
+                    data2d, origin="lower", extent=extent, cmap=cmap,
+                    norm=norm, aspect="equal",
+                    interpolation="bilinear" if smooth else "nearest",
+                )
+            image["art"], image["smooth"] = art, bool(smooth)
+            return art
+
+        _make_image(image["smooth"])
 
         # --- in-plane vector overlay -------------------------------------- #
         # The two components lying in the slice plane form a vector the colour
@@ -1087,15 +1189,6 @@ if _GUI_AVAILABLE:
 
         # One arrow per this many cells at most, so a fine grid stays readable.
         _MAX_ARROWS = 24
-
-        def _centres(edges, n, length):
-            """Cell-centre coordinates along an axis, in the drawn axis units."""
-            e = np.asarray(edges, dtype=float)
-            if len(e) >= n + 1:
-                return 0.5 * (e[:n] + e[1:n + 1])
-            if length:
-                return (np.arange(n) + 0.5) * (float(length) / n)
-            return np.arange(n, dtype=float)   # cell indices
 
         def _build_quiver():
             """Create the arrow overlay, or ``None`` if its components are gone.
@@ -1170,10 +1263,12 @@ if _GUI_AVAILABLE:
 
         def _set_frame_data(idx):
             data2d = np.asarray(view["frames"][idx]).T
-            if use_mesh:
-                artist.set_array(data2d.ravel())
+            if image["warp"] is not None:
+                image["art"].set_data(image["warp"](np.asarray(data2d, dtype=float)))
+            elif use_mesh:
+                image["art"].set_array(data2d)
             else:
-                artist.set_data(data2d)
+                image["art"].set_data(data2d)
             if quiver["art"] is not None:
                 quiver["art"].set_UVC(*quiver["uv"](idx))
 
@@ -1191,10 +1286,15 @@ if _GUI_AVAILABLE:
             ext = _extend_for(choice)
             if cbar["art"] is not None:
                 if cbar["extend"] == ext:
+                    # Re-point it: toggling smooth replaces the artist, and a
+                    # bar left on the removed one stops tracking the norm.
+                    cbar["art"].update_normal(image["art"])
                     cbar["art"].set_label(choice)
                     return
                 cbar["art"].remove()
-            cbar["art"] = figure.colorbar(artist, ax=ax, label=choice, extend=ext)
+            cbar["art"] = figure.colorbar(
+                image["art"], ax=ax, label=choice, extend=ext,
+            )
             cbar["extend"] = ext
 
         _make_cbar(comp)
@@ -1260,6 +1360,15 @@ if _GUI_AVAILABLE:
         controls.addWidget(QtWidgets.QLabel("Clip:"))
         controls.addWidget(clip)
         controls.addWidget(log_check)
+        smooth_check = QtWidgets.QCheckBox("Smooth")
+        smooth_check.setChecked(image["smooth"])
+        smooth_check.setToolTip(
+            "Shade between neighbouring cell centres instead of painting each\n"
+            "cell flat. The frames are point samples at cell centres, so this\n"
+            "adds no data -- it interpolates the same numbers. Turn it off to\n"
+            "see the actual cells, or to speed up playback on a fine grid."
+        )
+        controls.addWidget(smooth_check)
         vector_check = None
         if can_quiver:
             vector_check = QtWidgets.QCheckBox("Vectors")
@@ -1272,7 +1381,7 @@ if _GUI_AVAILABLE:
         def on_log(checked):
             # Log spans the full range on its own, so the clip has nothing to do.
             clip.setEnabled(not checked)
-            artist.set_norm(_make_norm(bool(checked)))
+            image["art"].set_norm(_make_norm(bool(checked)))
             if quiver["art"] is not None:
                 # Arrow lengths follow the same compression as the colour map.
                 quiver["art"].set_UVC(*quiver["uv"](slider.value()))
@@ -1282,10 +1391,20 @@ if _GUI_AVAILABLE:
 
         def on_clip(idx):
             view["clip"] = float(clip.itemData(idx))
-            artist.set_norm(_make_norm(log_check.isChecked()))
+            image["art"].set_norm(_make_norm(log_check.isChecked()))
             dialog._canvas.draw_idle()
 
         clip.currentIndexChanged.connect(on_clip)
+
+        def on_smooth(checked):
+            # Shading is set when the mesh is built, so this rebuilds the
+            # artist on the frame and scale currently shown. The quiver keeps
+            # its own zorder above it and is untouched.
+            _make_image(bool(checked), slider.value(), log_check.isChecked())
+            _make_cbar(view["comp"])
+            dialog._canvas.draw_idle()
+
+        smooth_check.toggled.connect(on_smooth)
 
         def show_frame(idx):
             idx = max(0, min(int(idx), len(view["frames"]) - 1))
@@ -1307,8 +1426,8 @@ if _GUI_AVAILABLE:
                 component.blockSignals(False)
                 return
             view["comp"], view["frames"] = choice, stack
-            artist.set_cmap(_cmap_for(choice))
-            artist.set_norm(_make_norm(log_check.isChecked()))
+            image["art"].set_cmap(_cmap_for(choice))
+            image["art"].set_norm(_make_norm(log_check.isChecked()))
             _make_cbar(choice)
             if quiver["art"] is not None:
                 # The vector is the same; only its contrast with the map changes.

@@ -318,6 +318,52 @@ def _section_nudge(body_shape, sub_mm):
     return min(_SLICE_DEAD_BAND * extent, 0.25 * sub_mm)
 
 
+# Chord tolerance for the coarse (cell-centre) sweep's section polygons, as a
+# fraction of the smallest in-plane cell.
+#
+# This decides ``pec_mask`` and the dielectric snap, so the polygon's radial
+# error is a *whole cell* of mask error wherever a cell centre falls inside it.
+# Two things follow, and the second is the reason this is 0.0025 and not the
+# 0.25 it was until 2026-08-08:
+#
+# * **Systematic.** ``discretize`` inscribes, so every curved conductor comes out
+#   undersized by the deflection. At 0.25 the reference coax's r = 9 mm shield
+#   became a 22-gon of inscribed radius 8.909 mm -- 0.091 mm, 23% of a 0.4 mm
+#   cell -- and the shield ate 2.8% more cells than it owns.
+# * **Asymmetric.** ``Wire.discretize`` walks from the wire's seam, so the
+#   polygon is not mirror-symmetric: measured on that shield, the boundary sits
+#   at r = 9.00000 along +x against 8.98214 along -x. Cell centres landing in
+#   that 0.018 mm window get opposite answers on the two sides, which put 4
+#   stray cells per cross-section into the mask -- and a mask with a dipole
+#   moment scatters TEM into a mode the modal port cannot absorb, leaving a
+#   static m = 1 pile at both port planes (-31 dB) and a DC current the current
+#   monitor reads forever. Tightening is the only lever: the error is bounded by
+#   the deflection but *not* monotone in it (0.05 measured worse than 0.25), so
+#   there is no safety factor to reason about, only "small enough that no sample
+#   point lands in the window".
+#
+# Measured on that coax (48x48x252 graded, 0.4 mm cells), mask asymmetry against
+# wall time -- the mirror mismatch vanishes at 0.01 and the cost does not move,
+# because OCC sectioning dominates every mode and the scanline is linear in
+# vertices off a small base:
+#
+#     fraction   deflection   verts   x-asym cells   plain   subpixel   conformal
+#     0.25       0.100 mm       23        1008       3.88 s   10.71 s    46.78 s
+#     0.05       0.020 mm       51        1512(!)      --        --         --
+#     0.01       0.004 mm      113           0         --        --         --
+#     0.0025     0.001 mm      222           0       4.03 s   10.24 s    45.76 s
+#
+# (those wall times isolate *this* fraction; tightening all three costs ~10%.)
+#
+# 0.0025 is 4x inside the measured threshold. **This deliberately re-baselines
+# every staircase result** -- ``pec_mask`` moves by 2.8% of the metal on that
+# model -- which is why it was not done as part of the conformal work (plan W2
+# scoped itself to the conformal sampler to keep that promise, and
+# CONFORMAL_PEC_PLAN.md W2 records why that scoping was wrong).
+# ``tools/check_mask_symmetry.py`` is the gate.
+COARSE_CHORD_FRACTION = 0.0025
+
+
 def _section_polygons(body_shape, z_axis, z, deflection, nudge=0.0):
     """Cross-section of *body_shape* at height *z* as a list of XY polygons.
 
@@ -445,6 +491,23 @@ def _cell_span(nodes_mm, lo, hi, margin=1):
     return a, b
 
 
+# Chord tolerance for the subpixel smoother's fine section polygons, as a
+# fraction of the finest sub-cell width. Same story as
+# :data:`COARSE_CHORD_FRACTION` one level down: the smoother's samples are
+# sub-cell centres, and a polygon that is not mirror-symmetric hands mirror
+# partners different ``inside`` answers, which Kottke then bakes into an
+# asymmetric ``eps_*``. Measured on ``tools/check_mask_symmetry.py``'s graded
+# coax, worst mirror mismatch in ``eps_x`` against the fraction:
+#
+#     0.25 -> 0.0945      0.05 -> 4.4e-16      0.01 -> 4.4e-16     0.0025 -> 4.4e-16
+#
+# i.e. it collapses to round-off (2 ULP of the Kottke reduction, the floor for a
+# float array) by 0.05. 0.0025 keeps 20x margin for a body whose surface happens
+# to sit closer to the sub-cell ruler than this coax's does; it costs ~12% of a
+# smoothed run's voxelisation time (10.7 -> 12.0 s on the 0.6M-cell coax).
+_SUBPIXEL_CHORD_FRACTION = 0.0025
+
+
 def _smooth_dielectric_body(arrays, body_shape, eps_r, mu_r,
                             nodes_mm, span, oversample, on_layer=None,
                             sigma_r=0.0):
@@ -479,14 +542,14 @@ def _smooth_dielectric_body(arrays, body_shape, eps_r, mu_r,
     yf = sp.fine_axis(ny_mm, oy, ja, jb)
     zf = sp.fine_axis(nz_mm, oz, ka, kb)
 
-    # Chord tolerance for the fine section polygons: a quarter of the smallest
-    # fine sub-cell width, so curves are tracked well below sub-cell resolution.
+    # Chord tolerance for the fine section polygons, as a fraction of the
+    # smallest fine sub-cell width (:data:`_SUBPIXEL_CHORD_FRACTION`).
     def _min_sub(nodes, o, a, b):
         w = np.diff(nodes[a:b + 1])
         return (float(w.min()) / o) if w.size else 1.0
 
     df = min(_min_sub(nx_mm, ox, ia, ib), _min_sub(ny_mm, oy, ja, jb))
-    deflection = max(0.25 * df, df * 1.0e-6)
+    deflection = max(_SUBPIXEL_CHORD_FRACTION * df, df * 1.0e-6)
 
     Z_AXIS = FreeCAD.Vector(0.0, 0.0, 1.0)
     inside_fine = np.zeros((xf.size, yf.size, zf.size), dtype=bool)
@@ -576,15 +639,28 @@ CONFORMAL_KEYS = (
 CONFORMAL_OVERSAMPLE = 8
 
 # Chord tolerance for the conformal sampler's section polygons, as a fraction of
-# the finest sub-cell width. Much tighter than the coarse sweep's 0.25*cell,
-# which turns a 3 mm conductor into a ~10-gon (inscribed radius 2.853 mm) -- an
-# error that would sit straight on top of the fractions and cap the accuracy
-# conformal PEC buys. Deliberately *not* applied to the coarse sweep: that would
-# move the binary pec_mask and break the "conformal off is bit-identical"
-# guarantee. A polygon's radius error is its deflection, so this is ~0.6% of a
-# coarse cell; tightening further costs polygon vertices, and matplotlib's
-# point-in-polygon is linear in them.
-_CONFORMAL_CHORD_FRACTION = 0.05
+# the finest **sub-cell** width -- so with :data:`CONFORMAL_OVERSAMPLE` = 8 it is
+# ~0.6% of a coarse cell. It exists because a polygon's radius error would
+# otherwise sit straight on top of the fractions and cap the accuracy conformal
+# PEC buys.
+#
+# Tightened from 0.05 for the same mirror-symmetry reason as
+# :data:`COARSE_CHORD_FRACTION` -- averaging over ``oversample`` samples softens
+# a polygon slip but does not cancel it, and a fraction array with a dipole
+# moment feeds the mode solver and the H update directly. Measured on
+# ``tools/check_mask_symmetry.py``'s graded coax, worst mirror mismatch across
+# the six arrays:
+#
+#     0.05 -> 0.125 (one whole sample in 8, on pec_edge_open_x)
+#     0.01 -> 0      0.0025 -> 0      0.0005 -> 0
+#
+# A uniform grid can hide this completely: on the 1 mm coax of the port
+# investigation all six arrays were symmetric at 0.05, and only the graded case
+# exposed it. Costs ~9% of a conformal run's voxelisation time (46.8 -> 51.0 s on
+# the 0.6M-cell coax) and slightly *improves* the fractions against the closed
+# form (``tools/check_conformal_fractions.py``: max edge error 0.0666 -> 0.0613,
+# all-six rms 0.0181 -> 0.0180 at oversample 8).
+_CONFORMAL_CHORD_FRACTION = 0.0025
 
 
 def _interleaved_block(nodes_mm, os_, a, b):
@@ -1106,10 +1182,10 @@ def voxelize_materials(materials, cell_size_m,
 
     Z_AXIS = FreeCAD.Vector(0.0, 0.0, 1.0)
     tol = min(dx_mm, dy_mm, dz_mm) * 1.0e-6
-    # Chord tolerance for turning curved section edges into polygons: a quarter
-    # of the smallest in-plane cell, so the polygon tracks curves to well below
-    # cell resolution (never below the geometric tolerance).
-    deflection = max(min(dx_mm, dy_mm) * 0.25, tol)
+    # Chord tolerance for turning curved section edges into polygons
+    # (:data:`COARSE_CHORD_FRACTION` of the smallest in-plane cell, never below
+    # the geometric tolerance).
+    deflection = max(min(dx_mm, dy_mm) * COARSE_CHORD_FRACTION, tol)
 
     # Cell-centre world coordinates (mm) along each axis, from the node arrays.
     # On a uniform grid this is exactly ``ox + (arange(N) + 0.5) * d``.

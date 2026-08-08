@@ -44,6 +44,17 @@ import Part
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+# ``freecadcmd`` ships a stub ``FreeCADGui`` that satisfies every gui module's
+# ``try: import FreeCADGui`` guard but has no ``addCommand``, so importing
+# anything under ``wavesim_gui`` raises on the command registration. Give it the
+# one attribute the guards need; nothing here goes near a real command.
+try:                                                           # noqa: E402
+    import FreeCADGui
+    if not hasattr(FreeCADGui, "addCommand"):
+        FreeCADGui.addCommand = lambda *a, **k: None
+except ImportError:
+    pass
+
 from wavesim_gui import voxelize as vox                        # noqa: E402
 
 A_MM, B_MM, OUT_MM = 3.0, 9.0, 15.0

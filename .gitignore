@@ -17,6 +17,9 @@ wavesim_results/
 # Report written by tools/check_conformal_fractions.py
 tools/conformal_fractions.txt
 
+# Report written by tools/check_mask_symmetry.py
+tools/mask_symmetry.txt
+
 # Unused image assets
 Resources/Gemini_Generated_Image_.png
 Resources/excitation.png

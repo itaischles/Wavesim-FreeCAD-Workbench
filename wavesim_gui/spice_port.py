@@ -49,7 +49,10 @@ from wavesim_gui import modal_port as modal_mod
 
 _WB_DIR = os.path.join(FreeCAD.getUserAppDataDir(), "Mod", "wavesim-workbench")
 _RESOURCES_DIR = os.path.join(_WB_DIR, "Resources")
-_SPICE_LINE_PORT_ICON = os.path.join(_RESOURCES_DIR, "spice_line_port.png")
+# The 24x24 SVG icon set (grouped by colour: blue setup, amber sources,
+# teal monitors). The retired PNGs are still in Resources/ alongside it.
+_ICONS_DIR = os.path.join(_RESOURCES_DIR, "icons")
+_SPICE_LINE_PORT_ICON = os.path.join(_ICONS_DIR, "port_spice.svg")
 # The dedicated SPICE-TEM artwork was retired; legacy SPICE TEM ports (now a
 # drive mode of the TEM source) reuse the shared SPICE port icon.
 _SPICE_TEM_PORT_ICON = _SPICE_LINE_PORT_ICON

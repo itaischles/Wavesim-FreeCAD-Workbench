@@ -1,0 +1,21 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24">
+  <defs>
+    <linearGradient id="solid" x1="3" y1="7" x2="14" y2="20" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#63a1dc"/><stop offset="1" stop-color="#1f5892"/>
+    </linearGradient>
+    <radialGradient id="ball" cx="16" cy="13.4" r="5.4" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#eaf4fc"/><stop offset="1" stop-color="#86bbe6"/>
+    </radialGradient>
+    <linearGradient id="slab" x1="14" y1="3" x2="22" y2="8" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#a8cdea"/><stop offset="1" stop-color="#6ea8d8"/>
+    </linearGradient>
+  </defs>
+  <rect x="1" y="1.8" width="22" height="20.4" rx="2.6" fill="none"
+        stroke="#7fb2e0" stroke-width="1.6"/>
+  <rect x="3.4" y="8.2" width="9.8" height="10.4" rx="1.6" fill="url(#solid)"/>
+  <path d="M3.4 12.4 h9.8" fill="none" stroke="#ffffff" stroke-width="1"
+        stroke-opacity="0.45"/>
+  <circle cx="16.4" cy="13.8" r="4.4" fill="url(#ball)" stroke="#3179bd" stroke-width="1.5"/>
+  <rect x="13.8" y="4" width="7" height="3.8" rx="1.3" fill="url(#slab)"
+        stroke="#5f9fd6" stroke-width="1.1"/>
+</svg>

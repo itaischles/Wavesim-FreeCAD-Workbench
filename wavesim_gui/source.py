@@ -47,7 +47,10 @@ from wavesim_gui import excitation as exc
 
 _WB_DIR = os.path.join(FreeCAD.getUserAppDataDir(), "Mod", "wavesim-workbench")
 _RESOURCES_DIR = os.path.join(_WB_DIR, "Resources")
-_POINT_SOURCE_ICON = os.path.join(_RESOURCES_DIR, "point_source.png")
+# The 24x24 SVG icon set (grouped by colour: blue setup, amber sources,
+# teal monitors). The retired PNGs are still in Resources/ alongside it.
+_ICONS_DIR = os.path.join(_RESOURCES_DIR, "icons")
+_POINT_SOURCE_ICON = os.path.join(_ICONS_DIR, "source_point.svg")
 # Tree/view-provider icon for a point source (the toolbar command uses the same).
 _SOURCE_ICON = _POINT_SOURCE_ICON
 

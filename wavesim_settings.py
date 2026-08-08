@@ -193,7 +193,7 @@ if _GUI_AVAILABLE:
     _WB_DIR = os.path.join(
         FreeCAD.getUserAppDataDir(), "Mod", "wavesim-workbench"
     )
-    _SETTINGS_ICON = os.path.join(_WB_DIR, "Resources", "settings.png")
+    _SETTINGS_ICON = os.path.join(_WB_DIR, "Resources", "icons", "settings.svg")
 
     # (stored value, display label) for the backend combo. 'auto' first so it is
     # the default selection; the GPU is only usable when a CUDA card + toolkit

@@ -1,0 +1,13 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24">
+  <defs>
+    <radialGradient id="wire" cx="10.4" cy="10.4" r="6.4" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#a8e2d5"/><stop offset="1" stop-color="#2f9a86"/>
+    </radialGradient>
+  </defs>
+  <circle cx="12" cy="12" r="10.2" fill="none" stroke="#157a68" stroke-width="1.9"
+          stroke-dasharray="3.2 2.8"/>
+  <path d="M9.4 0.4 L13.6 2.4 L9.6 4.8" fill="none" stroke="#157a68"
+        stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+  <circle cx="12" cy="12" r="5.4" fill="url(#wire)" stroke="#12695a" stroke-width="1.6"/>
+  <circle cx="12" cy="12" r="1.8" fill="#0f4d43"/>
+</svg>

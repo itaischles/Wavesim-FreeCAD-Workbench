@@ -63,15 +63,17 @@ from wavesim_gui.commands import active_simulation
 
 _WB_DIR = os.path.join(FreeCAD.getUserAppDataDir(), "Mod", "wavesim-workbench")
 _RESOURCES_DIR = os.path.join(_WB_DIR, "Resources")
+# The 24x24 SVG icon set (grouped by colour: blue setup, amber sources,
+# teal monitors). The retired PNGs are still in Resources/ alongside it.
+_ICONS_DIR = os.path.join(_RESOURCES_DIR, "icons")
 # Generic monitor icon (placeholder; specific monitors set their own below).
-_MONITOR_ICON = os.path.join(_RESOURCES_DIR, "default.png")
-_SNAPSHOT_MONITOR_ICON = os.path.join(_RESOURCES_DIR, "snapshot_monitor.png")
-_VOLTAGE_MONITOR_ICON = os.path.join(_RESOURCES_DIR, "voltage_monitor.png")
-_CURRENT_MONITOR_ICON = os.path.join(_RESOURCES_DIR, "current_monitor.png")
-_FIELD_PROBE_ICON = os.path.join(_RESOURCES_DIR, "field_probe.png")
-_ENERGY_MONITOR_ICON = os.path.join(_RESOURCES_DIR, "energy_monitor.png")
-_DISSIPATION_MONITOR_ICON = os.path.join(_RESOURCES_DIR,
-                                         "dissipation_monitor.png")
+_MONITOR_ICON = os.path.join(_ICONS_DIR, "monitor.svg")
+_SNAPSHOT_MONITOR_ICON = os.path.join(_ICONS_DIR, "snapshot.svg")
+_VOLTAGE_MONITOR_ICON = os.path.join(_ICONS_DIR, "voltage.svg")
+_CURRENT_MONITOR_ICON = os.path.join(_ICONS_DIR, "current.svg")
+_FIELD_PROBE_ICON = os.path.join(_ICONS_DIR, "probe.svg")
+_ENERGY_MONITOR_ICON = os.path.join(_ICONS_DIR, "energy.svg")
+_DISSIPATION_MONITOR_ICON = os.path.join(_ICONS_DIR, "dissipation.svg")
 
 # Marker property, mirroring the other entities' identity scheme so the object is
 # recognisable before its Python proxy is re-attached on reload.

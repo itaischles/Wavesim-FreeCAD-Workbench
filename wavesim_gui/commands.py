@@ -31,11 +31,14 @@ from wavesim_gui import units
 # ``__file__`` here, so build resource paths from the user app-data directory.
 _WB_DIR = os.path.join(FreeCAD.getUserAppDataDir(), "Mod", "wavesim-workbench")
 _RESOURCES_DIR = os.path.join(_WB_DIR, "Resources")
-_SIM_ICON = os.path.join(_RESOURCES_DIR, "sim.png")
+# The 24x24 SVG icon set (grouped by colour: blue setup, amber sources,
+# teal monitors). The retired PNGs are still in Resources/ alongside it.
+_ICONS_DIR = os.path.join(_RESOURCES_DIR, "icons")
+_SIM_ICON = os.path.join(_ICONS_DIR, "sim_new.svg")
 # Tree/view-provider icon for the Simulation object (the "New Simulation"
 # toolbar command keeps _SIM_ICON).
-_SIM_TREE_ICON = os.path.join(_RESOURCES_DIR, "wave.png")
-_RUN_ICON = os.path.join(_RESOURCES_DIR, "run.png")
+_SIM_TREE_ICON = os.path.join(_ICONS_DIR, "simulation.svg")
+_RUN_ICON = os.path.join(_ICONS_DIR, "run.svg")
 
 # Marker property stamped on the container. Identifying the simulation by a
 # stored property (rather than by ``Proxy`` type) keeps :func:`active_simulation`

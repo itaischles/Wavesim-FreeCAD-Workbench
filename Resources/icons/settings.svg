@@ -1,0 +1,20 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24">
+  <defs>
+    <linearGradient id="metal" x1="2" y1="2" x2="22" y2="22" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#8a94a0"/><stop offset="1" stop-color="#49535f"/>
+    </linearGradient>
+  </defs>
+  <g fill="url(#metal)">
+    <rect x="10.4" y="0.4" width="3.2" height="5.6" rx="1"/>
+    <rect x="10.4" y="0.4" width="3.2" height="5.6" rx="1" transform="rotate(45 12 12)"/>
+    <rect x="10.4" y="0.4" width="3.2" height="5.6" rx="1" transform="rotate(90 12 12)"/>
+    <rect x="10.4" y="0.4" width="3.2" height="5.6" rx="1" transform="rotate(135 12 12)"/>
+    <rect x="10.4" y="0.4" width="3.2" height="5.6" rx="1" transform="rotate(180 12 12)"/>
+    <rect x="10.4" y="0.4" width="3.2" height="5.6" rx="1" transform="rotate(225 12 12)"/>
+    <rect x="10.4" y="0.4" width="3.2" height="5.6" rx="1" transform="rotate(270 12 12)"/>
+    <rect x="10.4" y="0.4" width="3.2" height="5.6" rx="1" transform="rotate(315 12 12)"/>
+  </g>
+  <circle cx="12" cy="12" r="8.4" fill="url(#metal)"/>
+  <circle cx="12" cy="12" r="5.6" fill="#eef1f4"/>
+  <circle cx="12" cy="12" r="2.8" fill="url(#metal)"/>
+</svg>

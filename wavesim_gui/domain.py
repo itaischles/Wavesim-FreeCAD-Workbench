@@ -44,7 +44,10 @@ import FreeCAD
 
 _WB_DIR = os.path.join(FreeCAD.getUserAppDataDir(), "Mod", "wavesim-workbench")
 _RESOURCES_DIR = os.path.join(_WB_DIR, "Resources")
-_DOMAIN_ICON = os.path.join(_RESOURCES_DIR, "domain.png")
+# The 24x24 SVG icon set (grouped by colour: blue setup, amber sources,
+# teal monitors). The retired PNGs are still in Resources/ alongside it.
+_ICONS_DIR = os.path.join(_RESOURCES_DIR, "icons")
+_DOMAIN_ICON = os.path.join(_ICONS_DIR, "domain.svg")
 
 _TYPE_PROP = "WavesimType"
 _DOMAIN_TYPE = "Domain"

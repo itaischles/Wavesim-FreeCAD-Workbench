@@ -36,7 +36,10 @@ from wavesim_gui.commands import active_simulation
 
 _WB_DIR = os.path.join(FreeCAD.getUserAppDataDir(), "Mod", "wavesim-workbench")
 _RESOURCES_DIR = os.path.join(_WB_DIR, "Resources")
-_MATERIAL_ICON = os.path.join(_RESOURCES_DIR, "material.png")
+# The 24x24 SVG icon set (grouped by colour: blue setup, amber sources,
+# teal monitors). The retired PNGs are still in Resources/ alongside it.
+_ICONS_DIR = os.path.join(_RESOURCES_DIR, "icons")
+_MATERIAL_ICON = os.path.join(_ICONS_DIR, "material.svg")
 
 # Marker property, mirroring the Simulation container's identity scheme so the
 # object is recognisable before its Python proxy is re-attached on reload.

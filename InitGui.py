@@ -20,8 +20,9 @@ import FreeCADGui as Gui
 WB_DIR = os.path.join(FreeCAD.getUserAppDataDir(), "Mod", "wavesim-workbench")
 RESOURCES_DIR = os.path.join(WB_DIR, "Resources")
 
-# Placeholder workbench icon — swap for the final artwork later.
-WB_ICON = os.path.join(RESOURCES_DIR, "wavesim_workbench.svg")
+# Workbench icon, from the 24x24 SVG set in Resources/icons (the retired PNGs
+# and the old placeholder wavesim_workbench.svg are still in Resources/).
+WB_ICON = os.path.join(RESOURCES_DIR, "icons", "wavesim.svg")
 
 
 class WavesimWorkbench(Gui.Workbench):
@@ -42,29 +43,59 @@ class WavesimWorkbench(Gui.Workbench):
         """
         self.command_list = []
 
-        # Core simulation commands. Importing the package registers them with
-        # Gui.addCommand; the import is guarded so a failure is reported rather
-        # than aborting Initialize and leaving the workbench commandless.
+        def add_group(*command_ids):
+            """Append a group of commands, divided from the ones before it.
+
+            The literal id ``"Separator"`` is what FreeCAD turns into a toolbar
+            divider and a menu separator, so grouping is expressed here as the
+            call boundary rather than as separators sprinkled through one flat
+            list. Nothing is added for an empty group, and a divider is only
+            emitted when there is something to divide from -- so a group whose
+            import failed cannot leave a stray separator behind.
+            """
+            ids = [cid for cid in command_ids if cid]
+            if not ids:
+                return
+            if self.command_list:
+                self.command_list.append("Separator")
+            self.command_list.extend(ids)
+
+        # Core simulation commands, in toolbar/menu order: set up the model,
+        # then drive it, then measure it, then run it. Importing the package
+        # registers them with Gui.addCommand; the import is guarded so a failure
+        # is reported rather than aborting Initialize and leaving the workbench
+        # commandless.
         try:
             from wavesim_gui import commands  # noqa: F401  (registers commands)
-            self.command_list.append("Wavesim_NewSimulation")
-            self.command_list.append("Wavesim_AssignMaterial")
-            self.command_list.append("Wavesim_AddSource")
-            self.command_list.append("Wavesim_AddModalPort")
-            self.command_list.append("Wavesim_AddGaussianBeam")
-            self.command_list.append("Wavesim_AddSpiceLinePort")
-            # SPICE TEM ports are a drive mode of the Modal Port
+
+            # Model setup: the container and what the geometry is made of.
+            add_group(
+                "Wavesim_NewSimulation",
+                "Wavesim_AssignMaterial",
+            )
+            # Sources and ports: everything that puts energy into the domain or
+            # terminates it. SPICE TEM ports are a drive mode of the Modal Port
             # (Wavesim_AddModalPort), so no separate toolbar button. The
             # Wavesim_AddSpiceTEMPort command stays registered for backward
             # compatibility with documents that still hold legacy SpiceTEMPort
             # objects, as does the old Wavesim_AddTEMSource id.
-            self.command_list.append("Wavesim_AddProbe")
-            self.command_list.append("Wavesim_AddSnapshot")
-            self.command_list.append("Wavesim_AddEnergyMonitor")
-            self.command_list.append("Wavesim_AddDissipationMonitor")
-            self.command_list.append("Wavesim_AddVoltageMonitor")
-            self.command_list.append("Wavesim_AddCurrentMonitor")
-            self.command_list.append("Wavesim_Run")
+            add_group(
+                "Wavesim_AddSource",
+                "Wavesim_AddModalPort",
+                "Wavesim_AddGaussianBeam",
+                "Wavesim_AddSpiceLinePort",
+            )
+            # Monitors: everything that records, point to whole-domain.
+            add_group(
+                "Wavesim_AddProbe",
+                "Wavesim_AddSnapshot",
+                "Wavesim_AddEnergyMonitor",
+                "Wavesim_AddDissipationMonitor",
+                "Wavesim_AddVoltageMonitor",
+                "Wavesim_AddCurrentMonitor",
+            )
+            # The solve itself, alone: it is the one button that costs minutes.
+            add_group("Wavesim_Run")
         except Exception as exc:
             FreeCAD.Console.PrintError(
                 "Wavesim: failed to load commands module ({}: {})\n".format(
@@ -78,7 +109,7 @@ class WavesimWorkbench(Gui.Workbench):
         # Import failures are reported rather than silently aborting Initialize.
         try:
             import wavesim_settings  # noqa: F401  (registers Gui.addCommand)
-            self.command_list.append("Wavesim_Settings")
+            add_group("Wavesim_Settings")
         except Exception as exc:
             FreeCAD.Console.PrintError(
                 "Wavesim: failed to load settings module ({}: {})\n".format(

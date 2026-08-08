@@ -1,0 +1,18 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24">
+  <defs>
+    <linearGradient id="pml" x1="0" y1="1" x2="0" y2="23" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#7fb2e0" stop-opacity="0.34"/>
+      <stop offset="1" stop-color="#7fb2e0" stop-opacity="0.12"/>
+    </linearGradient>
+  </defs>
+  <rect x="0.9" y="0.9" width="22.2" height="22.2" rx="2.2" fill="url(#pml)"
+        stroke="#7fb2e0" stroke-width="1.6" stroke-dasharray="2.6 2.4"/>
+  <rect x="4.6" y="4.6" width="14.8" height="14.8" fill="#ffffff" fill-opacity="0.5"
+        stroke="#3179bd" stroke-width="2"/>
+  <path d="M9.5 4.6 v14.8 M14.5 4.6 v14.8 M4.6 9.5 h14.8 M4.6 14.5 h14.8"
+        fill="none" stroke="#3179bd" stroke-width="1.05" stroke-opacity="0.55"/>
+  <g fill="#3179bd">
+    <circle cx="9.5" cy="9.5" r="1.05"/><circle cx="14.5" cy="9.5" r="1.05"/>
+    <circle cx="9.5" cy="14.5" r="1.05"/><circle cx="14.5" cy="14.5" r="1.05"/>
+  </g>
+</svg>

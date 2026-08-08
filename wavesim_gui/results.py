@@ -43,12 +43,17 @@ from wavesim_gui.commands import active_simulation
 
 _WB_DIR = os.path.join(FreeCAD.getUserAppDataDir(), "Mod", "wavesim-workbench")
 _RESOURCES_DIR = os.path.join(_WB_DIR, "Resources")
-_RESULTS_ICON = os.path.join(_RESOURCES_DIR, "run.png")
-_RESULT_ICON = os.path.join(_RESOURCES_DIR, "default.png")
+# The 24x24 SVG icon set (grouped by colour: blue setup, amber sources,
+# teal monitors). The retired PNGs are still in Resources/ alongside it.
+_ICONS_DIR = os.path.join(_RESOURCES_DIR, "icons")
 
 
 def _icon(name):
-    return os.path.join(_RESOURCES_DIR, name)
+    return os.path.join(_ICONS_DIR, name)
+
+
+_RESULTS_ICON = _icon("results.svg")
+_RESULT_ICON = _icon("result.svg")
 
 _TYPE_PROP = "WavesimType"
 _RESULTS_TYPE = "Results"   # the container group
@@ -72,16 +77,18 @@ _KIND_CAPACITANCE = "capacitance"
 
 # Each result leaf shows the toolbar icon of the monitor/port that produced it.
 _KIND_ICONS = {
-    _KIND_ENERGY: _icon("energy_monitor.png"),
-    _KIND_DISSIPATION: _icon("dissipation_monitor.png"),
-    _KIND_PROBE: _icon("field_probe.png"),
-    _KIND_SNAPSHOT: _icon("snapshot_monitor.png"),
-    _KIND_MODE: _icon("tem_port.png"),
-    _KIND_VOLTAGE: _icon("voltage_monitor.png"),
-    _KIND_CURRENT: _icon("current_monitor.png"),
-    _KIND_SPICE_V: _icon("spice_line_port.png"),
-    _KIND_SPICE_I: _icon("spice_line_port.png"),
-    _KIND_CAPACITANCE: _icon("energy_monitor.png"),
+    _KIND_ENERGY: _icon("energy.svg"),
+    _KIND_DISSIPATION: _icon("dissipation.svg"),
+    _KIND_PROBE: _icon("probe.svg"),
+    _KIND_SNAPSHOT: _icon("snapshot.svg"),
+    _KIND_MODE: _icon("port_modal.svg"),
+    _KIND_VOLTAGE: _icon("voltage.svg"),
+    _KIND_CURRENT: _icon("current.svg"),
+    _KIND_SPICE_V: _icon("port_spice.svg"),
+    _KIND_SPICE_I: _icon("port_spice.svg"),
+    # Not the energy icon: the electrostatic leaf's headline is the matrix, and
+    # two different answers sharing a picture is how a tree stops being read.
+    _KIND_CAPACITANCE: _icon("capacitance.svg"),
 }
 
 _RESULTS_GROUP = "Results"

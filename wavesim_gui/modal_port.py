@@ -109,7 +109,10 @@ from wavesim_gui import excitation as exc
 
 _WB_DIR = os.path.join(FreeCAD.getUserAppDataDir(), "Mod", "wavesim-workbench")
 _RESOURCES_DIR = os.path.join(_WB_DIR, "Resources")
-_MODAL_ICON = os.path.join(_RESOURCES_DIR, "tem_port.png")
+# The 24x24 SVG icon set (grouped by colour: blue setup, amber sources,
+# teal monitors). The retired PNGs are still in Resources/ alongside it.
+_ICONS_DIR = os.path.join(_RESOURCES_DIR, "icons")
+_MODAL_ICON = os.path.join(_ICONS_DIR, "port_modal.svg")
 
 _TYPE_PROP = "WavesimType"
 _MODAL_TYPE = "ModalPort"

@@ -229,6 +229,8 @@ class DomainObject:
             )
             obj.MinCellSize = "0 mm"
 
+        _ensure_grid_plane_props(obj)
+
         # Per-axis node-coordinate arrays (world mm, including the PML pad cells)
         # spanning the padded grid -- the geometric source of truth every
         # downstream consumer derives from. ``execute`` populates them: uniform
@@ -285,6 +287,7 @@ class DomainObject:
         self.Type = getattr(self, "Type", _DOMAIN_TYPE)
         self._migrate_spacing(obj)
         _ensure_es_bc_props(obj)
+        _ensure_grid_plane_props(obj)
 
     @staticmethod
     def _migrate_spacing(obj):
@@ -390,6 +393,11 @@ class DomainObject:
             obj.NodesY = [oy + i * dy for i in range(ny + 1)]
             obj.NodesZ = [oz + i * dz for i in range(nz + 1)]
             obj.Nx, obj.Ny, obj.Nz = nx, ny, nz
+
+        # First recompute with real bounds parks the grid planes on the min
+        # faces -- where they used to be nailed. Later recomputes leave them
+        # wherever the user put them (see place_grid_planes).
+        place_grid_planes(obj)
 
     def dumps(self):
         return {"Type": getattr(self, "Type", _DOMAIN_TYPE)}
@@ -708,6 +716,80 @@ def spacings_m(domain):
     return out
 
 
+# The three cell-grid planes drawn inside the domain box: property name, the
+# axis each one is normal to, and what it shows.
+_GRID_PLANE_PROPS = (
+    ("GridPlaneX", "x", "YZ"),
+    ("GridPlaneY", "y", "XZ"),
+    ("GridPlaneZ", "z", "XY"),
+)
+# Set once the planes have been parked on the min faces (see place_grid_planes).
+_GRID_PLANES_PLACED = "GridPlanesPlaced"
+
+
+def _ensure_grid_plane_props(obj):
+    """Add the three grid-plane positions, back-filling an older document.
+
+    Idempotent; called from ``__init__`` and ``onDocumentRestored``. A restored
+    domain gets them unplaced, so the next recompute parks them on the min faces
+    -- exactly where they used to be nailed.
+    """
+    for prop, axis, plane in _GRID_PLANE_PROPS:
+        if not hasattr(obj, prop):
+            obj.addProperty(
+                "App::PropertyDistance", prop, "Grid",
+                "World {} of the {} cell-grid plane. Move it through the "
+                "domain to read the mesh where the geometry is, instead of "
+                "only at the wall; clamped to the domain box when drawn"
+                .format(axis, plane),
+            )
+    if not hasattr(obj, _GRID_PLANES_PLACED):
+        obj.addProperty(
+            "App::PropertyBool", _GRID_PLANES_PLACED, "Grid",
+            "Whether the grid planes have been given their initial position",
+        )
+        obj.setEditorMode(_GRID_PLANES_PLACED, 2)   # hidden bookkeeping
+        setattr(obj, _GRID_PLANES_PLACED, False)
+
+
+def place_grid_planes(obj):
+    """Park the grid planes on the domain's min faces, once.
+
+    Only on the *first* recompute that gives the domain real bounds: after that
+    the stored positions are the user's, and a domain that grows later must not
+    drag their planes back to the wall.
+    """
+    if getattr(obj, _GRID_PLANES_PLACED, False):
+        return
+    mn = getattr(obj, "DomainMin", None)
+    mx = getattr(obj, "DomainMax", None)
+    if mn is None or mx is None or (mn - mx).Length < 1.0e-9:
+        return          # no geometry yet; try again on the next recompute
+    for prop, axis, _plane in _GRID_PLANE_PROPS:
+        setattr(obj, prop, "{} mm".format(getattr(mn, axis)))
+    setattr(obj, _GRID_PLANES_PLACED, True)
+
+
+def grid_plane_positions_mm(domain):
+    """The three drawn grid-plane positions as ``(x, y, z)`` in world mm.
+
+    Clamped into the domain box **here rather than in the property**: the stored
+    value is what the user asked for, and a box that shrinks for unrelated
+    reasons should not silently eat it. Falls back to the min face for a domain
+    that has no such property yet.
+    """
+    mn = getattr(domain, "DomainMin", None)
+    mx = getattr(domain, "DomainMax", None)
+    out = []
+    for prop, axis, _plane in _GRID_PLANE_PROPS:
+        lo = getattr(mn, axis) if mn is not None else 0.0
+        hi = getattr(mx, axis) if mx is not None else 0.0
+        value = getattr(domain, prop, None)
+        pos = float(value.Value) if value is not None else lo
+        out.append(min(max(pos, min(lo, hi)), max(lo, hi)))
+    return tuple(out)
+
+
 def _ensure_es_bc_props(obj):
     """Add the six electrostatic per-face boundary properties if absent.
 
@@ -1013,16 +1095,22 @@ if _GUI_AVAILABLE:
             self._fill(self._pml_coords, self._pml_lines,
                        obj.PmlMin, obj.PmlMax)
 
-        def _grid_segments(self, mn, mx, nodes_x, nodes_y, nodes_z):
-            """Line segments for the three orthogonal cell grids on the min faces.
+        def _grid_segments(self, mn, mx, nodes_x, nodes_y, nodes_z,
+                           plane=None):
+            """Line segments for the three orthogonal cell grids.
 
             Returns ``(points, indices)`` for an ``SoIndexedLineSet``: an XY grid
-            at ``z = mn.z``, a YZ grid at ``x = mn.x`` and an XZ grid at
-            ``y = mn.y``. Grid lines are placed at the explicit per-axis node
-            coordinates (``nodes_*``, world mm) clamped to the inner domain box,
-            so a non-uniform grid shows its real (graded) spacing. Line counts per
+            at ``z = plane[2]``, a YZ grid at ``x = plane[0]`` and an XZ grid at
+            ``y = plane[1]`` -- the Domain's ``GridPlaneX/Y/Z``, already clamped
+            into the box by :func:`grid_plane_positions_mm`, so a plane can be
+            walked through the model instead of sitting on the wall. *plane*
+            defaults to the min corner, which is where they used to be nailed.
+            Grid lines are placed at the explicit per-axis node coordinates
+            (``nodes_*``, world mm) clamped to the inner domain box, so a
+            non-uniform grid shows its real (graded) spacing. Line counts per
             axis are clamped to :data:`_MAX_GRID_LINES` by decimating.
             """
+            px, py, pz = plane if plane is not None else (mn.x, mn.y, mn.z)
             pts = []
             idx = []
 
@@ -1055,21 +1143,21 @@ if _GUI_AVAILABLE:
             ys = ticks(mn.y, mx.y, nodes_y)
             zs = ticks(mn.z, mx.z, nodes_z)
 
-            # XY grid at z = mn.z
+            # XY grid at z = pz
             for x in xs:
-                add_line((x, mn.y, mn.z), (x, mx.y, mn.z))
+                add_line((x, mn.y, pz), (x, mx.y, pz))
             for y in ys:
-                add_line((mn.x, y, mn.z), (mx.x, y, mn.z))
-            # YZ grid at x = mn.x
+                add_line((mn.x, y, pz), (mx.x, y, pz))
+            # YZ grid at x = px
             for y in ys:
-                add_line((mn.x, y, mn.z), (mn.x, y, mx.z))
+                add_line((px, y, mn.z), (px, y, mx.z))
             for z in zs:
-                add_line((mn.x, mn.y, z), (mn.x, mx.y, z))
-            # XZ grid at y = mn.y
+                add_line((px, mn.y, z), (px, mx.y, z))
+            # XZ grid at y = py
             for x in xs:
-                add_line((x, mn.y, mn.z), (x, mn.y, mx.z))
+                add_line((x, py, mn.z), (x, py, mx.z))
             for z in zs:
-                add_line((mn.x, mn.y, z), (mx.x, mn.y, z))
+                add_line((mn.x, py, z), (mx.x, py, z))
             return pts, idx
 
         def _rebuild_grid(self):
@@ -1098,7 +1186,10 @@ if _GUI_AVAILABLE:
             if not nodes_z:
                 nodes_z = [mn.z + i * float(obj.Dz.Value)
                            for i in range(int((mx.z - mn.z) / max(float(obj.Dz.Value), 1e-9)) + 1)]
-            pts, idx = self._grid_segments(mn, mx, nodes_x, nodes_y, nodes_z)
+            pts, idx = self._grid_segments(
+                mn, mx, nodes_x, nodes_y, nodes_z,
+                plane=grid_plane_positions_mm(obj),
+            )
             coords.point.setValues(0, len(pts), pts)
             if coords.point.getNum() > len(pts):
                 coords.point.deleteValues(len(pts))
@@ -1110,7 +1201,8 @@ if _GUI_AVAILABLE:
             if prop in ("DomainMin", "DomainMax", "PmlMin", "PmlMax"):
                 self._rebuild()
             if prop in ("DomainMin", "DomainMax", "Dx", "Dy", "Dz",
-                        "NodesX", "NodesY", "NodesZ"):
+                        "NodesX", "NodesY", "NodesZ",
+                        "GridPlaneX", "GridPlaneY", "GridPlaneZ"):
                 self._rebuild_grid()
 
         def getDisplayModes(self, vobj):

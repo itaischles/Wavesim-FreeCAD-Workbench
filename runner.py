@@ -216,6 +216,20 @@ mode's 2D field profiles into ``results.npz`` (keys ``mode_<si>_<mi>_phi`` /
 ``_pec`` / ``_E_<comp>``) with its per-unit-length parameters under
 ``summary["modes"]``.
 
+Each port also **records its own V(t) and I(t)**, saved as ``port_<si>v_times`` /
+``_values`` and ``port_<si>i_*`` with the port named under ``summary["ports"]``
+(``si`` is the same plane index the ``mode_<si>_<mi>`` arrays carry, which is
+what ties a port's series to its mode shapes). Both come from
+:class:`wavesim.sources.ModalPort`'s own record and are co-timed at step ``n``:
+``V`` is the eps-weighted modal projection of the plane E, ``I`` the Poynting-
+paired modal projection of the H plane one cell inside the sheet, signed
+**positive into the domain** so ``V*I`` is the power the port delivers inward.
+The summary entry also carries the port's ``reference_impedance``
+``Z_ref = 1/(s*G)`` -- the impedance that ``(V, I)`` pair is self-consistent
+against, so ``a = (V + Z_ref*I)/2`` and ``b = (V - Z_ref*I)/2`` are the incident
+and outgoing wave amplitudes (it equals Z0 whenever the admittance scale was
+derived rather than overridden).
+
 A ``ModalPort`` is an **impedance sheet on the face**, not a source on an
 interior plane: each step it writes the ghost tangential H just outside the face
 to ``±s·(V̄ − 2a)·(n̂ × ê)``, which in one expression radiates a forward wave of
@@ -732,8 +746,12 @@ def _solve_all_modes(ws, np, grid, job):
 
     Returns ``(modal_ports, spice_modes, mode_arrays, mode_meta)``:
 
-    * ``modal_ports`` — one :class:`wavesim.sources.ModalPort` boundary per
-      ``modal_ports`` entry (:func:`_build_modal_port`, driving the chosen mode);
+    * ``modal_ports`` — one ``(plane_index, name, port)`` triple per
+      ``modal_ports`` entry, the port a :class:`wavesim.sources.ModalPort`
+      boundary driving the chosen mode (:func:`_build_modal_port`). The plane
+      index is the one the ``mode_<si>_<mi>`` arrays are keyed by, so the port's
+      recorded V(t)/I(t) can be saved against the same ``si`` as its mode
+      shapes;
       empty when ``mode_only``.
     * ``spice_modes`` — ``{job_spice_index: TEMMode}`` giving the chosen mode for
       each ``kind:"tem"`` SPICE port, consumed by :func:`_build_spice_ports`;
@@ -894,7 +912,8 @@ def _solve_all_modes(ws, np, grid, job):
         face = t.get("face") or "{}{}".format(
             normal, "0" if float(t.get("direction", 1.0)) >= 0 else "1")
         modal_ports.append(
-            _build_modal_port(ws, chosen, waveform, grid, str(face), name))
+            (si, name,
+             _build_modal_port(ws, chosen, waveform, grid, str(face), name)))
 
     return modal_ports, spice_modes, mode_arrays, mode_meta
 
@@ -1420,9 +1439,10 @@ def run_job(workdir):
     # loaded (the mode solve reads the grid's own eps/mu/PEC) and before the FDTD
     # setup, so the modal-port boundaries exist for the Simulation below and a
     # mode-only request can return without building the time loop.
-    modal_boundaries, spice_modes, mode_arrays, mode_meta = _solve_all_modes(
+    modal_ports, spice_modes, mode_arrays, mode_meta = _solve_all_modes(
         ws, np, grid, job
     )
+    modal_boundaries = [port for _si, _name, port in modal_ports]
 
     if job.get("mode_only", False):
         _emit_status("Saving mode results...")
@@ -1723,6 +1743,31 @@ def run_job(workdir):
         result_arrays["current_{}_values".format(idx)] = np.asarray(mon.values)
         current_meta.append({"name": name})
 
+    # Modal ports: the V(t)/I(t) each ModalPort recorded at its own sheet, saved
+    # in the same two-``_times``/``_values``-pairs shape as a SPICE port so the
+    # results tree reuses the shared 1-D plotter. Keyed by the port's *plane*
+    # index, which is what ``mode_<si>_<mi>`` uses -- that is the only link
+    # between a port's series and its mode shapes.
+    #
+    # Both series are the port's own record and are co-timed at step n: V is the
+    # eps-weighted modal projection of the plane E, I the Poynting-paired
+    # projection of the H plane one cell inside the sheet, positive *into* the
+    # domain. ``reference_impedance`` (= 1/(s*G), the impedance that pair is
+    # self-consistent against, so a = (V + Z_ref*I)/2 is the incident wave) is
+    # set when the port compiles, hence always present here.
+    port_meta = []
+    for si, name, port in modal_ports:
+        times = np.asarray(port.times)
+        result_arrays["port_{}v_times".format(si)] = times
+        result_arrays["port_{}v_values".format(si)] = np.asarray(port.voltages)
+        result_arrays["port_{}i_times".format(si)] = times
+        result_arrays["port_{}i_values".format(si)] = np.asarray(port.currents)
+        port_meta.append({
+            "name": name, "source_index": si, "kind": "modal",
+            "reference_impedance": _f(getattr(port, "reference_impedance", None)),
+            "modal_conductance": _f(getattr(port, "modal_conductance", None)),
+        })
+
     # SPICE ports: the co-simulated port V(t)/I(t) recorded by each SpicePort,
     # saved as two ``_times``/``_values`` series (voltage 'v', current 'i') so the
     # results tree can reuse the shared 1-D plotter. Then tear down ngspice.
@@ -1787,6 +1832,8 @@ def run_job(workdir):
         summary["currents"] = current_meta
     if spice_meta:
         summary["spice_ports"] = spice_meta
+    if port_meta:
+        summary["ports"] = port_meta
     if mode_meta:
         summary["modes"] = mode_meta
     with open(os.path.join(workdir, "summary.json"), "w", encoding="utf-8") as handle:

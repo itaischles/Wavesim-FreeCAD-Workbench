@@ -13,6 +13,13 @@ Simulation tree holding one leaf object per monitor that produced data:
   choosing the component to view (Ex/Ey/Ez, plus the |E| magnitude derived from
   them) — one monitor, every component.
 
+A port that solves a mode (a Modal Port, or a SPICE port driving a TEM mode) gets
+a **group node of its own** under Results, holding everything that port produced:
+its mode shape(s) and its V(t)/I(t) series. Those three are one measurement of
+one plane -- the V and I are projections onto the very mode the shape draws, and
+the reference impedance tying them together is the mode's -- so the tree nests
+them rather than scattering three unrelated-looking leaves among the monitors.
+
 Each leaf is self-contained: it stores the run's output directory and the key
 of its array inside ``results.npz``, so double-clicking it reopens the plot even
 after the document has been saved and reloaded (the run output is kept on disk).
@@ -58,6 +65,7 @@ _RESULT_ICON = _icon("result.svg")
 _TYPE_PROP = "WavesimType"
 _RESULTS_TYPE = "Results"   # the container group
 _RESULT_TYPE = "Result"     # a single result leaf
+_PORT_TYPE = "ResultPort"   # a per-port group holding one port's leaves
 
 # Result kinds (stored on each leaf's ResultKind property).
 _KIND_ENERGY = "energy"
@@ -69,6 +77,12 @@ _KIND_VOLTAGE = "voltage"
 _KIND_CURRENT = "current"
 _KIND_SPICE_V = "spice_v"   # SPICE co-simulation port voltage V(t)
 _KIND_SPICE_I = "spice_i"   # SPICE co-simulation port current I(t)
+# A modal port's own V(t)/I(t), recorded at its impedance sheet. Distinct kinds
+# from the line-integral monitors above because they are a different measurement:
+# a projection onto the port's mode rather than an integral along a user curve,
+# referenced to the port's own Z_ref -- which the plot says out loud.
+_KIND_PORT_V = "port_v"
+_KIND_PORT_I = "port_i"
 # The electrostatic run's scalar results: applied potentials, per-conductor
 # charge, field energy and the capacitance matrix. One leaf, because they are one
 # answer -- the charges are the matrix's raw material and the energy is the same
@@ -86,6 +100,10 @@ _KIND_ICONS = {
     _KIND_CURRENT: _icon("current.svg"),
     _KIND_SPICE_V: _icon("port_spice.svg"),
     _KIND_SPICE_I: _icon("port_spice.svg"),
+    # The monitor icons, not the port's: these rows say "voltage" / "current",
+    # and the group they sit in already says which port they belong to.
+    _KIND_PORT_V: _icon("voltage.svg"),
+    _KIND_PORT_I: _icon("current.svg"),
     # Not the energy icon: the electrostatic leaf's headline is the matrix, and
     # two different answers sharing a picture is how a tree stops being read.
     _KIND_CAPACITANCE: _icon("capacitance.svg"),
@@ -142,6 +160,47 @@ class ResultsContainer:
     def loads(self, state):
         if isinstance(state, dict):
             self.Type = state.get("Type", _RESULTS_TYPE)
+        return None
+
+    __getstate__ = dumps
+    __setstate__ = loads
+
+
+class PortResultContainer:
+    """``Proxy`` for one port's group of result leaves under "Results".
+
+    Holds everything a mode-solving port produced -- its mode shape(s) and its
+    V(t)/I(t) series -- and carries the port's own scalars, which belong to the
+    port rather than to any one of those leaves: ``PortName``, ``PortKind``
+    (``modal``/``spice``) and, for a modal port, ``ReferenceImpedance``.
+    """
+
+    def __init__(self, obj, kind="modal"):
+        self.Type = _PORT_TYPE
+        obj.Proxy = self
+        _add_type_marker(obj, _PORT_TYPE)
+        for prop, ptype, value in (
+            ("PortName", "App::PropertyString", ""),
+            ("PortKind", "App::PropertyString", str(kind)),
+        ):
+            if not hasattr(obj, prop):
+                obj.addProperty(ptype, prop, "Port", "")
+                setattr(obj, prop, value)
+                obj.setEditorMode(prop, 1)
+
+    def onDocumentRestored(self, obj):
+        obj.Proxy = self
+        self.Type = getattr(self, "Type", _PORT_TYPE)
+
+    def execute(self, obj):
+        pass
+
+    def dumps(self):
+        return {"Type": getattr(self, "Type", _PORT_TYPE)}
+
+    def loads(self, state):
+        if isinstance(state, dict):
+            self.Type = state.get("Type", _PORT_TYPE)
         return None
 
     __getstate__ = dumps
@@ -229,13 +288,23 @@ def find_results(sim):
 
 
 def _remove_results(doc, sim):
-    """Delete any existing Results group (and its leaves) under *sim*."""
+    """Delete any existing Results group (and its leaves) under *sim*.
+
+    Walks the tree rather than one level: a port's leaves live in that port's
+    own group, and removing the group alone would leave them behind at the
+    document root -- visible, undeletable-looking and pointing at a run that has
+    just been replaced.
+    """
     grp = find_results(sim)
     if grp is None:
         return
-    for child in list(grp.Group):
-        doc.removeObject(child.Name)
-    doc.removeObject(grp.Name)
+
+    def _purge(node):
+        for child in list(getattr(node, "Group", []) or []):
+            _purge(child)
+        doc.removeObject(node.Name)
+
+    _purge(grp)
 
 
 def _snapshot_extent(sim, name):
@@ -371,7 +440,7 @@ def build_results(doc, sim, workdir, summary):
             grp.ViewObject.Visibility = True
         sim.addObject(grp)
 
-        def _new_leaf(name, kind, data_key, component=""):
+        def _new_leaf(name, kind, data_key, component="", parent=None):
             leaf = doc.addObject("App::FeaturePython", "Result")
             ResultObject(leaf, kind)
             leaf.Label = name
@@ -385,8 +454,38 @@ def build_results(doc, sim, workdir, summary):
                 # produced nothing". Its view provider declares a display mode
                 # for the same reason (see ResultViewProvider).
                 leaf.ViewObject.Visibility = True
-            grp.addObject(leaf)
+            (parent if parent is not None else grp).addObject(leaf)
             return leaf
+
+        # One group node per mode-solving port, holding that port's own leaves.
+        # Built here, before any of them, so each loop below can drop its leaf
+        # straight into the right group; they are attached to Results at the end
+        # so the familiar monitor order is left alone and the ports follow it.
+        #
+        # A modal port is listed in summary["ports"]; a SPICE port is one only if
+        # it solved a mode (kind "tem"), which summary["modes"] is what knows --
+        # a SPICE *line* port has no plane and stays flat.
+        port_groups = {}     # port name -> group object
+
+        def _port_group(name, kind):
+            group = port_groups.get(name)
+            if group is None:
+                group = doc.addObject("App::DocumentObjectGroupPython", "Port")
+                PortResultContainer(group, kind)
+                group.Label = name
+                group.PortName = name
+                if group.ViewObject is not None:
+                    PortResultViewProvider(group.ViewObject)
+                    group.ViewObject.Visibility = True
+                port_groups[name] = group
+            return group
+
+        for meta in summary.get("ports", []):
+            group = _port_group(str(meta.get("name") or "Port"), "modal")
+            _store_port_meta(group, meta)
+        for meta in summary.get("modes", []):
+            if meta.get("spice"):
+                _port_group(str(meta.get("name") or "Port"), "spice")
 
         # Energy: one leaf per region the run recorded (the whole grid, the
         # PML-free interior, or both as two independent series).
@@ -422,14 +521,36 @@ def build_results(doc, sim, workdir, summary):
                 _new_leaf(name, kind, "{}_{}".format(prefix, idx))
 
         # SPICE co-simulation ports: a voltage and a current time series each.
+        # A TEM port's pair goes under its port group (next to the mode it
+        # drives); a line port has no mode and stays a flat pair of leaves.
         for idx, meta in enumerate(summary.get("spice_ports", [])):
             name = meta.get("name") or "SPICE Port {}".format(idx)
+            parent = port_groups.get(name)
             if "spice_{}v_values".format(idx) in keys:
                 _new_leaf("{} voltage".format(name), _KIND_SPICE_V,
-                          "spice_{}v".format(idx))
+                          "spice_{}v".format(idx), parent=parent)
             if "spice_{}i_values".format(idx) in keys:
                 _new_leaf("{} current".format(name), _KIND_SPICE_I,
-                          "spice_{}i".format(idx))
+                          "spice_{}i".format(idx), parent=parent)
+
+        # Modal ports: the V(t)/I(t) the port's own impedance sheet recorded --
+        # V the modal projection of the plane E, I the Poynting-paired
+        # projection of the H one cell inside it, positive into the domain. Both
+        # keyed by the port's plane index, the same one its mode shapes carry.
+        for meta in summary.get("ports", []):
+            name = str(meta.get("name") or "Port")
+            si = int(meta.get("source_index", 0))
+            parent = port_groups.get(name)
+            for kind, suffix, label in ((_KIND_PORT_V, "v", "voltage"),
+                                        (_KIND_PORT_I, "i", "current")):
+                key = "port_{}{}".format(si, suffix)
+                if key + "_values" not in keys:
+                    continue
+                leaf = _new_leaf("{} {}".format(name, label), kind, key,
+                                 parent=parent)
+                # The plot annotates Z_ref, so the leaf carries it too rather
+                # than reaching back into its group at draw time.
+                _store_port_meta(leaf, meta)
 
         # Snapshots (frame stacks). Capture the slice's physical extent from the
         # producing monitor so the animation can be drawn in millimetres.
@@ -490,10 +611,10 @@ def build_results(doc, sim, workdir, summary):
             if key + "_phi" not in keys:
                 continue
             cond = meta.get("conductor_id", "?")
-            name = "{} mode (conductor {})".format(
-                meta.get("name", "port"), cond
-            )
-            leaf = _new_leaf(name, _KIND_MODE, key, "")
+            port_name = str(meta.get("name", "port"))
+            name = "{} mode (conductor {})".format(port_name, cond)
+            leaf = _new_leaf(name, _KIND_MODE, key, "",
+                             parent=port_groups.get(port_name))
             _store_mode_meta(leaf, meta)
             # Transverse cell-centre coordinates (metres, solver frame) from the
             # runner: stored as absolute mm so the plot draws the mode on the
@@ -504,6 +625,16 @@ def build_results(doc, sim, workdir, summary):
                              group="Mode")
                 _store_edges(leaf, "CoordsB", npz[cbk], relative=False,
                              group="Mode")
+
+        # The port groups join Results last, so they follow the monitor leaves
+        # in the tree instead of pushing them down. A group that ended up empty
+        # (a port whose arrays are all missing) is dropped rather than shown as
+        # an empty folder.
+        for group in port_groups.values():
+            if group.Group:
+                grp.addObject(group)
+            else:
+                doc.removeObject(group.Name)
     except Exception:
         doc.abortTransaction()
         raise
@@ -645,6 +776,32 @@ def _store_mode_meta(leaf, meta):
     _add("Fields", "App::PropertyString", str(meta.get("fields", "")))
 
 
+def _store_port_meta(obj, meta):
+    """Stash a modal port's own scalars on its group node / V-I leaves.
+
+    ``ReferenceImpedance`` is ``Z_ref = 1/(s·G)`` -- the impedance the port's
+    (V, I) pair is self-consistent against, so ``a = (V + Z_ref·I)/2`` and
+    ``b = (V − Z_ref·I)/2`` are the incident and outgoing wave amplitudes. It is
+    the mode's Z₀ whenever the solver derived the admittance scale (it always
+    does here), but it is *this* number the two series are referenced to, so
+    this is the one stored beside them. NaN when the run predates it.
+    """
+    def _add(prop, kind, value, group="Port"):
+        if not hasattr(obj, prop):
+            obj.addProperty(kind, prop, group, "")
+            obj.setEditorMode(prop, 1)
+        setattr(obj, prop, value)
+
+    def _num(value):
+        return float("nan") if value is None else float(value)
+
+    _add("PortName", "App::PropertyString", str(meta.get("name", "")))
+    _add("ReferenceImpedance", "App::PropertyFloat",
+         _num(meta.get("reference_impedance")))
+    _add("ModalConductance", "App::PropertyFloat",
+         _num(meta.get("modal_conductance")))
+
+
 def _store_electrostatic_meta(leaf, meta):
     """Stash an electrostatic run's scalar results on its leaf.
 
@@ -756,6 +913,37 @@ if _GUI_AVAILABLE:
 
         def getIcon(self):
             return _RESULTS_ICON
+
+        def dumps(self):
+            return None
+
+        def loads(self, state):
+            return None
+
+        __getstate__ = dumps
+        __setstate__ = loads
+
+    class PortResultViewProvider(visibility.DisplayModeMixin):
+        """Tree icon for a port's result group -- its own toolbar icon.
+
+        The group is a folder, so it has no plot of its own: what it offers is
+        the port's scalars in the property editor (Z_ref) and its leaves under
+        it. The icon says which kind of port produced them.
+        """
+
+        def __init__(self, vobj):
+            vobj.Proxy = self
+
+        def attach(self, vobj):
+            self.ViewObject = vobj
+            self.Object = vobj.Object
+            self.attach_display_mode(vobj)
+
+        def getIcon(self):
+            obj = getattr(self, "Object", None)
+            kind = str(getattr(obj, "PortKind", "modal"))
+            return _icon("port_spice.svg" if kind == "spice"
+                         else "port_modal.svg")
 
         def dumps(self):
             return None
@@ -903,6 +1091,10 @@ if _GUI_AVAILABLE:
                 _plot_spice_voltage(obj)
             elif kind == _KIND_SPICE_I:
                 _plot_spice_current(obj)
+            elif kind == _KIND_PORT_V:
+                _plot_port_voltage(obj)
+            elif kind == _KIND_PORT_I:
+                _plot_port_current(obj)
             elif kind == _KIND_SNAPSHOT:
                 _plot_snapshot(obj)
             elif kind == _KIND_MODE:
@@ -1016,6 +1208,44 @@ if _GUI_AVAILABLE:
     def _plot_spice_current(obj):
         _plot_series(
             obj, "current (A)", "SPICE port current vs. time", "#9467bd"
+        )
+
+    def _zref_note(obj):
+        """Annotate a modal port's V/I plot with the impedance it is referenced
+        to, or ``None`` when the leaf carries none (a run predating it).
+
+        Worth the corner of the figure: the pair is only half the story on its
+        own -- Z_ref is what turns it into incident/outgoing wave amplitudes
+        ``(V ± Z_ref·I)/2``, and it is a property of this port's own discrete
+        mode, not a number to look up elsewhere.
+        """
+        z_ref = getattr(obj, "ReferenceImpedance", None)
+        if z_ref is None or z_ref != z_ref or z_ref <= 0.0:   # None / NaN
+            return None
+
+        def _note(ax, _times, _values):
+            ax.text(0.98, 0.95, "Z$_{{ref}}$ = {:.4g} Ω".format(float(z_ref)),
+                    transform=ax.transAxes, ha="right", va="top", fontsize=9,
+                    bbox=dict(boxstyle="round", fc="white", ec="0.7",
+                              alpha=0.85))
+
+        return _note
+
+    def _plot_port_voltage(obj):
+        # The modal projection of the plane E, not a line integral -- said in
+        # the title so it is not read as an ∫E·dl monitor that happens to sit
+        # on the port plane.
+        _plot_series(
+            obj, "voltage (V)", "Modal port voltage vs. time", "#2ca02c",
+            annotate=_zref_note(obj),
+        )
+
+    def _plot_port_current(obj):
+        # Positive *into* the domain (the solver signs it that way), so V·I is
+        # the power the port delivers inward.
+        _plot_series(
+            obj, "current (A)", "Modal port current vs. time (into the domain)",
+            "#9467bd", annotate=_zref_note(obj),
         )
 
     # Colour-scale clip percentiles offered for snapshot maps, strongest first.

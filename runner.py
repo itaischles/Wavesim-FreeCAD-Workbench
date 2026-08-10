@@ -228,7 +228,13 @@ The summary entry also carries the port's ``reference_impedance``
 ``Z_ref = 1/(s*G)`` -- the impedance that ``(V, I)`` pair is self-consistent
 against, so ``a = (V + Z_ref*I)/2`` and ``b = (V - Z_ref*I)/2`` are the incident
 and outgoing wave amplitudes (it equals Z0 whenever the admittance scale was
-derived rather than overridden).
+derived rather than overridden) -- and ``sheet_divergence``, the port's own
+health check: the transverse divergence of the injected sheet at the *free*
+nodes of its plane, which must be at round-off (~1e-14) because the ghost plane
+runs open loop and anything left over integrates into a static field on both
+port planes. Above the solver's threshold the runner also says so as a status
+line, since the solver's own ``warnings.warn`` goes to stderr and the workbench
+only surfaces that when a run fails.
 
 A ``ModalPort`` is an **impedance sheet on the face**, not a source on an
 interior plane: each step it writes the ghost tangential H just outside the face
@@ -1375,7 +1381,14 @@ def run_job(workdir):
         )
         if pec_mask is not None:
             voxel_summary["pec_cells"] = int(np.count_nonzero(pec_mask))
-        voxel_summary["dielectric_cells"] = int(np.count_nonzero(data["eps_x"] != 1.0))
+        # Conductor cells are excluded: on a conformal run the voxeliser fills
+        # them with the material of the medium beside them (so the live edges
+        # hugging the surface read the right eps), and counting those as
+        # dielectric would inflate this by the whole volume of every conductor.
+        dielectric = data["eps_x"] != 1.0
+        if pec_mask is not None:
+            dielectric = dielectric & ~pec_mask
+        voxel_summary["dielectric_cells"] = int(np.count_nonzero(dielectric))
         if sigma_arrays:
             voxel_summary["lossy_cells"] = int(
                 np.count_nonzero(data["sigma_x"] > 0.0))
@@ -1616,7 +1629,7 @@ def run_job(workdir):
             voxel_summary["clamped_faces"] = int(
                 ws.conformal_geometry(grid).n_clamped)
             _emit_status(
-                "Conformal PEC: clamp threshold raised {:.2f} -> {:.2f} — the "
+                "Conformal PEC: clamp threshold raised {:.2f} -> {:.2f} - the "
                 "run diverges at {:.2f}. {:,} faces are now clamped, which "
                 "costs accuracy.".format(requested, used, requested,
                                          voxel_summary["clamped_faces"]))
@@ -1755,6 +1768,21 @@ def run_job(workdir):
     # domain. ``reference_impedance`` (= 1/(s*G), the impedance that pair is
     # self-consistent against, so a = (V + Z_ref*I)/2 is the incident wave) is
     # set when the port compiles, hence always present here.
+    #
+    # ``sheet_divergence`` is the port's own health check, and the one number
+    # that says whether the run behind it can be trusted at all: the injected
+    # sheet must have zero transverse divergence at the plane's *free* nodes,
+    # because the ghost plane runs open loop and anything left over integrates
+    # into a static field on both port planes rather than radiating away. The
+    # solver measures it when the port compiles and warns on its own — but a
+    # Python warning goes to stderr, which the workbench only surfaces when a run
+    # fails, so it is echoed here as a status line and stored in the summary.
+    # Round-off is ~1e-14 and a real failure ~1e-1, so the threshold is not a
+    # tuning knob; it comes from the solver so there is one owner of it.
+    try:
+        from wavesim.mode_solver import _SHEET_DIVERGENCE_TOL as _DIV_TOL
+    except ImportError:          # a solver predating the measurement
+        _DIV_TOL = None
     port_meta = []
     for si, name, port in modal_ports:
         times = np.asarray(port.times)
@@ -1762,11 +1790,22 @@ def run_job(workdir):
         result_arrays["port_{}v_values".format(si)] = np.asarray(port.voltages)
         result_arrays["port_{}i_times".format(si)] = times
         result_arrays["port_{}i_values".format(si)] = np.asarray(port.currents)
+        divergence = getattr(port, "sheet_divergence", None)
         port_meta.append({
             "name": name, "source_index": si, "kind": "modal",
             "reference_impedance": _f(getattr(port, "reference_impedance", None)),
             "modal_conductance": _f(getattr(port, "modal_conductance", None)),
+            "sheet_divergence": _f(divergence),
         })
+        if _DIV_TOL is not None and divergence is not None \
+                and divergence > _DIV_TOL:
+            _emit_status(
+                "Port '{}': the injected modal sheet has a transverse "
+                "divergence of {:.3g} (round-off is ~1e-14). It will pile a "
+                "static field onto both port planes instead of radiating. The "
+                "usual cause is a permittivity map that disagrees with its own "
+                "cut-cell geometry - check eps_x/eps_y/eps_z against "
+                "pec_edge_open_*.".format(name, divergence))
 
     # SPICE ports: the co-simulated port V(t)/I(t) recorded by each SpicePort,
     # saved as two ``_times``/``_values`` series (voltage 'v', current 'i') so the

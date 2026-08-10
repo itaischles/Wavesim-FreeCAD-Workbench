@@ -944,6 +944,104 @@ def conformal_layer_estimate(nk, os_):
     return (nk + 1) + nk * (1 + os_)
 
 
+# Face-neighbour directions, in the fixed order :func:`_fill_pec_materials`
+# consults them: ``(axis, step)``.
+_FILL_DIRS = ((0, -1), (0, +1), (1, -1), (1, +1), (2, -1), (2, +1))
+
+
+def _fill_pec_materials(arrays, pec_mask, keys):
+    """Give each conductor cell the material of the open medium beside it.
+
+    A PEC cell carries no meaningful eps/mu/sigma -- nothing propagates inside
+    metal -- so the sweep above simply leaves the *background* value there. On
+    the **staircase** path that is invisible: ``build_pec_edge_masks`` dilates,
+    holding every edge that touches a metal cell at zero, so no live edge ever
+    reads it.
+
+    Conformal PEC removes that dilation on purpose (plan S3): an edge is zeroed
+    by its **own** open length, so the edges running just outside a conductor
+    stay alive and carry the field. Each of them reads its material from the cell
+    it is *indexed* by -- and for an edge on the low-index side of a surface that
+    is the cell whose centre sits in the metal. The error is therefore one-sided:
+    on the reference coax the live edges hugging one side of each conductor read
+    eps_r = 1 while their mirror partners read the fill's 2.3.
+
+    That is enough to break the modal port. With eps non-uniform over the live
+    edge set the mode's e-hat stops being a null vector of the FDTD's own
+    transverse curl at the conductor-adjacent **free** nodes (measured: residual
+    0.46 of scale at 18 nodes, against 5e-15 when eps is uniform there), so the
+    port's impedance sheet deposits a static field on its own plane every step
+    with nothing to restore it. Measured end to end on
+    ``results/coaxial_line`` (19x19x101, eps_r = 2.3, Gaussian drive):
+
+    ======================================  ==============  ==============
+    conductor cells carry                   port residual   line DC current
+    ======================================  ==============  ==============
+    the background eps (before)              -8.6 dB         -26 dB
+    the surrounding medium (this function)  -104 dB         -158 dB
+    ======================================  ==============  ==============
+
+    Z0 and eps_eff do not move: the mode solver already applies this rule for
+    itself (solver S5c gives a face straddling the surface the eps of the face
+    *outward*), which is exactly why the port's Z0 was right while the run it
+    presented was not. Filling here makes the FDTD read the same material the
+    mode solve assumed, in the one place they disagreed.
+
+    The fill walks outward from the open medium one cell per pass and stops as
+    soon as every cell a live element can read from has been reached -- a PEC
+    cell that still owns an open Yee edge or face. Metal deeper than that keeps
+    the background value, because every one of its edges and faces is fully
+    covered and nothing reads it. On the reference coax that is 6 passes over
+    36k cells; the frontier shrinks every pass, so a thick conductor costs
+    roughly its own volume once, not its volume per pass.
+    Ties are broken by the fixed direction order of :data:`_FILL_DIRS` so the
+    result is deterministic; where two media meet on a conductor surface the
+    cell can only carry one of them, and either is a defensible answer for a
+    cell that is metal in the first place.
+
+    Returns the number of cells filled.
+    """
+    import numpy as np
+
+    open_any = np.zeros(pec_mask.shape, dtype=bool)
+    for key in CONFORMAL_KEYS:
+        open_any |= arrays[key] > 0.0
+    needed = pec_mask & open_any
+    if not needed.any():
+        return 0
+
+    unknown = pec_mask.copy()
+    filled = 0
+    while True:
+        known = ~unknown
+        took = np.zeros_like(unknown)
+        for axis, step in _FILL_DIRS:
+            dst = [slice(None)] * 3
+            src = [slice(None)] * 3
+            if step > 0:
+                dst[axis], src[axis] = slice(0, -1), slice(1, None)
+            else:
+                dst[axis], src[axis] = slice(1, None), slice(0, -1)
+            dst, src = tuple(dst), tuple(src)
+            # ``known`` is sampled once per pass, so a cell filled earlier in
+            # this same pass cannot donate -- which keeps the fill a proper
+            # breadth-first walk outward from the open medium.
+            take = unknown[dst] & known[src] & ~took[dst]
+            if not take.any():
+                continue
+            for key in keys:
+                a = arrays[key]
+                a[dst][take] = a[src][take]
+            took[dst] |= take
+        if not took.any():
+            break               # metal with no open medium anywhere beside it
+        unknown &= ~took
+        filled += int(np.count_nonzero(took))
+        if not (unknown & needed).any():
+            break
+    return filled
+
+
 def voxelize_materials(materials, cell_size_m,
                        spacing_lo_m=(0.0, 0.0, 0.0), spacing_hi_m=(0.0, 0.0, 0.0),
                        pad_lo=(8, 8, 8), pad_hi=(8, 8, 8),
@@ -1336,6 +1434,16 @@ def voxelize_materials(materials, cell_size_m,
         if cut:
             for key in CONFORMAL_KEYS:
                 arrays[key] = np.clip(1.0 - covered[key], 0.0, 1.0)
+            # Only now that the run is genuinely conformal do the conductor
+            # cells' eps/mu/sigma become readable -- see _fill_pec_materials for
+            # what goes wrong when they still carry the background. Gated on the
+            # same condition as the fractions themselves, so a staircase
+            # materials.npz stays bit-identical (V2).
+            mat_keys = ["eps_x", "eps_y", "eps_z", "mu_x", "mu_y", "mu_z"]
+            if lossy:
+                mat_keys.extend(SIGMA_KEYS)
+            counts["pec_material_cells"] = _fill_pec_materials(
+                arrays, pec_mask, mat_keys)
             open_faces = [f[f > 0.0] for f in faces]
             open_faces = [f for f in open_faces if f.size]
             counts["cut_faces"] = cut

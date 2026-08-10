@@ -186,6 +186,73 @@ def build(flush=False):
     return _Mat([_Body(inner), _Body(shield)], True)
 
 
+def check_pec_material_fill(cell, nodes_m, ovr):
+    """The conductor cells must carry the material of the medium beside them.
+
+    A PEC cell's eps/mu is meaningless -- nothing propagates inside metal -- so
+    the sweep leaves the *background* value there. The staircase path never reads
+    it, because ``pec.build_pec_edge_masks`` dilates and zeroes every edge that
+    touches a metal cell. Conformal PEC drops that dilation on purpose (plan S3),
+    so the edges running just outside a conductor stay alive and each one reads
+    its material from the cell it is **indexed** by -- which, on the low-index
+    side of a surface, is the cell whose centre sits in the metal.
+
+    Left alone that puts eps_r = 1 on the live edges hugging one side of each
+    conductor and the fill's eps_r on the other. The one-sidedness is the damage:
+    the mode's ê stops being a null vector of the FDTD's own transverse curl at
+    the conductor-adjacent free nodes, so a ``ModalPort``'s sheet deposits a
+    static field on its own plane every step. Measured on the workbench's
+    ``coaxial_line`` case, port-plane residual −8.6 dB of peak and a 1 mA DC
+    current down the line, against −104 dB and −158 dB once the conductor cells
+    carry the surrounding 2.3.
+
+    This is the air-filled coax of :func:`build` with a dielectric annulus added,
+    which is the smallest model that can show the defect at all (with an air fill
+    the background value *is* the right answer and the bug is invisible). Two
+    assertions, and the second is the regression pin:
+
+    * conformal **off** -- the conductor cells still read the background, so a
+      staircase ``materials.npz`` is what it always was (V2);
+    * conformal **on** -- every PEC cell that still owns an open Yee edge or face
+      reads the annulus permittivity.
+    """
+    eps_fill = 2.3
+    z0, h = 0.0, NZ * D_MM
+    base = FreeCAD.Vector(CX, CY, z0)
+    annulus = Part.makeCylinder(B_MM, h, base).cut(
+        Part.makeCylinder(A_MM, h + 2.0, FreeCAD.Vector(CX, CY, z0 - 1.0)))
+    diel = _Mat([_Body(annulus)], False)
+    diel.Eps = eps_fill
+    # The dielectric is listed first: a later body wins the overlap, and the
+    # conductors must keep the cells they share with the annulus.
+    mats = [diel, build(flush=True)]
+
+    off = vox.voxelize_materials(mats, cell, nodes_m=nodes_m, subpixel=False)
+    on = vox.voxelize_materials(mats, cell, nodes_m=nodes_m, subpixel=False,
+                                conformal=True, conformal_oversample=ovr)
+    a_off, a_on = off["arrays"], on["arrays"]
+    pec = a_on["pec_mask"]
+
+    emit()
+    emit("PEC cells carry the neighbouring medium (eps_r = %.1f annulus)" % eps_fill)
+    off_bg = bool(np.all(a_off["eps_x"][pec] == 1.0))
+    emit("  conformal off: conductor cells still read the background : %s"
+         % ("yes" if off_bg else "NO"))
+
+    readable = np.zeros(pec.shape, dtype=bool)
+    for key in vox.CONFORMAL_KEYS:
+        readable |= a_on[key] > 0.0
+    readable &= pec
+    ok_fill = True
+    for key in ("eps_x", "eps_y", "eps_z"):
+        bad = int(np.count_nonzero(a_on[key][readable] != eps_fill))
+        emit("  conformal on : %-6s wrong on %d of %d readable PEC cells"
+             % (key, bad, int(readable.sum())))
+        ok_fill = ok_fill and bad == 0
+    emit("  cells filled: %d" % on["counts"].get("pec_material_cells", 0))
+    return off_bg and ok_fill and int(readable.sum()) > 0
+
+
 # --------------------------------------------------------------------------- #
 
 def main(out_path):
@@ -308,6 +375,9 @@ def main(out_path):
         emit("%-18s flush ends, z-invariant: %s (max plane-to-plane %.4f)"
              % (key, "yes" if spread == 0.0 else "NO", spread))
         ok = ok and spread == 0.0
+
+    # -- conductor cells carry the medium beside them ------------------------
+    ok = check_pec_material_fill(cell, nodes_m, ovr) and ok
 
     emit()
     emit("RESULT: %s" % ("PASS" if ok else "FAIL"))

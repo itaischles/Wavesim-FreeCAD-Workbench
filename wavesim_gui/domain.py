@@ -1525,35 +1525,21 @@ if _GUI_AVAILABLE:
 
             self.form = form
 
-        def _counts_text(self, dims=None):
-            if dims is not None:
-                nx, ny, nz = dims["Nx"], dims["Ny"], dims["Nz"]
-            else:
-                nx = int(getattr(self.obj, "Nx", 0))
-                ny = int(getattr(self.obj, "Ny", 0))
-                nz = int(getattr(self.obj, "Nz", 0))
+        def _counts_text(self):
+            """The Domain's cell counts as recomputed by ``execute``.
+
+            Always read back from the object rather than re-derived from the
+            spin boxes: with the snapper on, only ``execute`` knows where the
+            grid lines actually land, and a second (uniform, bbox-only) estimate
+            here would disagree with it. Every edit path live-applies and
+            recomputes first, so this is current.
+            """
+            nx = int(getattr(self.obj, "Nx", 0))
+            ny = int(getattr(self.obj, "Ny", 0))
+            nz = int(getattr(self.obj, "Nz", 0))
             if nx and ny and nz:
                 return "{} x {} x {}  ({:,} cells)".format(nx, ny, nz, nx * ny * nz)
             return "(assign material geometry to size the grid)"
-
-        def _update_counts(self, *_):
-            """Recompute the derived cell counts from the spin-box cell sizes.
-
-            Mirrors what ``execute`` derives, but uses the (possibly uncommitted)
-            spin-box values so the count label tracks edits immediately. Falls
-            back to the stored counts if the cheap bbox derivation is unavailable.
-            """
-            from wavesim_gui.commands import active_simulation
-            from wavesim_gui import voxelize as vox
-
-            sim = active_simulation(self.obj.Document)
-            cell_m = (
-                self._dx.value() / _MM_PER_M,
-                self._dy.value() / _MM_PER_M,
-                self._dz.value() / _MM_PER_M,
-            )
-            dims = vox.derive_grid_dims(sim, cell_m) if sim else None
-            self._counts.setText(self._counts_text(dims))
 
         def _on_cubic(self, checked):
             if self._nonuniform.isChecked():
@@ -1777,7 +1763,7 @@ if _GUI_AVAILABLE:
                 )
                 return
             self._fill_cell_size(size_mm)
-            self._update_counts()
+            self._live_apply()
 
         def accept(self):
             # Values have been live-applied during editing; wrap a final write in

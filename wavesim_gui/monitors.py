@@ -53,6 +53,7 @@ import os
 
 import FreeCAD
 
+from wavesim_gui import labels as labels_mod
 from wavesim_gui import units
 from wavesim_gui.commands import active_simulation
 
@@ -1306,8 +1307,9 @@ if _GUI_AVAILABLE:
             """Detach the sketch when it is dragged off the monitor."""
             mon = vobj.Object
             if getattr(mon, "Sketch", None) is obj:
+                old_auto = _path_monitor_label(mon)
                 mon.Sketch = None
-                mon.Label = _path_monitor_label(mon)
+                labels_mod.retitle(mon, old_auto, _path_monitor_label(mon))
                 # The eye stands for the sketch; with none there is nothing
                 # left for it to stand for.
                 visibility.sync_from_children(mon)
@@ -1324,8 +1326,9 @@ if _GUI_AVAILABLE:
             mon = vobj.Object
             if not _is_curve_object(obj):
                 return
+            old_auto = _path_monitor_label(mon)
             mon.Sketch = obj
-            mon.Label = _path_monitor_label(mon)
+            labels_mod.retitle(mon, old_auto, _path_monitor_label(mon))
             visibility.sync_from_children(mon)
             _after_path_changed(mon.Document)
 
@@ -1418,12 +1421,15 @@ if _GUI_AVAILABLE:
             # Restore the original position first so the transaction captures the
             # full change (live edits already moved the object outside it).
             self.obj.Position = self._orig_position
+            # The label the object still carries if nobody renamed it -- read
+            # before the edits land. See wavesim_gui/labels.py.
+            old_auto = _probe_label(self.obj)
             doc.openTransaction("Wavesim: Edit Probe")
             self.obj.Component = self._component.currentText()
             self.obj.Position = FreeCAD.Vector(
                 self._x.value(), self._y.value(), self._z.value()
             )
-            self.obj.Label = _probe_label(self.obj)
+            labels_mod.retitle(self.obj, old_auto, _probe_label(self.obj))
             doc.commitTransaction()
             doc.recompute()
             Gui.Control.closeDialog()
@@ -1590,6 +1596,9 @@ if _GUI_AVAILABLE:
             # (live edits already modified the object outside it).
             self.obj.Offset = "{} mm".format(self._orig_offset)
             self.obj.Plane = self._orig_plane
+            # The label the object still carries if nobody renamed it -- read
+            # before the edits land. See wavesim_gui/labels.py.
+            old_auto = _snapshot_label(self.obj)
             doc.openTransaction("Wavesim: Edit Snapshot")
             self.obj.Field = self._field.currentText()
             self.obj.Plane = self._plane.currentText()
@@ -1601,7 +1610,7 @@ if _GUI_AVAILABLE:
             steps = steps_for_interval(interval_s, self._dt_s)
             if steps > 0:
                 self.obj.EveryNSteps = steps
-            self.obj.Label = _snapshot_label(self.obj)
+            labels_mod.retitle(self.obj, old_auto, _snapshot_label(self.obj))
             doc.commitTransaction()
             doc.recompute()
             # Enlarge the domain to include the slice if it now sits outside it.
@@ -1677,10 +1686,11 @@ if _GUI_AVAILABLE:
 
         def accept(self):
             doc = self.obj.Document
+            old_auto = _energy_label(self.obj)   # see wavesim_gui/labels.py
             doc.openTransaction("Wavesim: Edit Energy Monitor")
             self.obj.RecordInterior = self._interior.isChecked()
             self.obj.RecordFullDomain = self._full.isChecked()
-            self.obj.Label = _energy_label(self.obj)
+            labels_mod.retitle(self.obj, old_auto, _energy_label(self.obj))
             doc.commitTransaction()
             doc.recompute()
             Gui.Control.closeDialog()
@@ -1776,10 +1786,11 @@ if _GUI_AVAILABLE:
 
         def accept(self):
             doc = self.obj.Document
+            old_auto = _dissipation_label(self.obj)  # see wavesim_gui/labels.py
             doc.openTransaction("Wavesim: Edit Dissipation Monitor")
             self.obj.RecordInterior = self._interior.isChecked()
             self.obj.RecordFullDomain = self._full.isChecked()
-            self.obj.Label = _dissipation_label(self.obj)
+            labels_mod.retitle(self.obj, old_auto, _dissipation_label(self.obj))
             doc.commitTransaction()
             doc.recompute()
             Gui.Control.closeDialog()

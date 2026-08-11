@@ -71,6 +71,7 @@ import FreeCAD
 from wavesim_gui.commands import active_simulation
 from wavesim_gui import domain as domain_mod
 from wavesim_gui import excitation as exc
+from wavesim_gui import labels as labels_mod
 
 
 # --------------------------------------------------------------------------- #
@@ -730,6 +731,10 @@ if _GUI_AVAILABLE:
             # Restore the original face first so the transaction captures the full
             # change (the live edit already moved it outside the transaction).
             self.obj.Face = self._orig_face
+            # The label the object still carries if nobody renamed it -- read
+            # with the original properties in place, so labels.retitle can tell
+            # an auto label from a name typed in the tree.
+            old_auto = "Gaussian Beam ({})".format(_describe(self.obj))
             doc.openTransaction(title)
             face = self._selected_face()
             self.obj.Face = face
@@ -737,7 +742,10 @@ if _GUI_AVAILABLE:
             self.obj.Waist = float(self._waist.value())
             self.obj.Directional = bool(self._directional.isChecked())
             self.write_excitation(self.obj)
-            self.obj.Label = "Gaussian Beam ({})".format(_describe(self.obj))
+            labels_mod.retitle(
+                self.obj, old_auto,
+                "Gaussian Beam ({})".format(_describe(self.obj)),
+            )
             # Directional boundary launch: force the launch face to PML.
             domain_mod.set_face_bc(domain_mod.find_domain(active_simulation(doc)),
                                    face, _PORT_BC)

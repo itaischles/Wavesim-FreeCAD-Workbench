@@ -40,6 +40,7 @@ import FreeCAD
 
 from wavesim_gui.commands import active_simulation
 from wavesim_gui import domain as domain_mod
+from wavesim_gui import labels as labels_mod
 from wavesim_gui import modal_port as modal_mod
 
 
@@ -596,8 +597,12 @@ if _GUI_AVAILABLE:
         def dragObject(self, vobj, obj):
             port = vobj.Object
             if getattr(port, "Sketch", None) is obj:
+                old_auto = "SPICE Line Port ({})".format(_line_describe(port))
                 port.Sketch = None
-                port.Label = "SPICE Line Port ({})".format(_line_describe(port))
+                labels_mod.retitle(
+                    port, old_auto,
+                    "SPICE Line Port ({})".format(_line_describe(port)),
+                )
                 port.Document.recompute()
 
         def canDropObjects(self):
@@ -610,8 +615,12 @@ if _GUI_AVAILABLE:
             port = vobj.Object
             if not _is_curve_object(obj):
                 return
+            old_auto = "SPICE Line Port ({})".format(_line_describe(port))
             port.Sketch = obj
-            port.Label = "SPICE Line Port ({})".format(_line_describe(port))
+            labels_mod.retitle(
+                port, old_auto,
+                "SPICE Line Port ({})".format(_line_describe(port)),
+            )
             port.Document.recompute()
             domain_mod.notify_domain_inputs_changed(port.Document)
 
@@ -745,12 +754,16 @@ if _GUI_AVAILABLE:
 
         def accept(self):
             doc = self.obj.Document
+            # The label the object still carries if nobody renamed it -- read
+            # before the edits land. See wavesim_gui/labels.py.
+            old_auto = "SPICE Line Port ({})".format(_line_describe(self.obj))
             doc.openTransaction("Wavesim: Edit SPICE Line Port")
             name = self._curve.currentData()
             self.obj.Sketch = doc.getObject(name) if name else None
             self._write_spice(self.obj)
-            self.obj.Label = "SPICE Line Port ({})".format(
-                _line_describe(self.obj)
+            labels_mod.retitle(
+                self.obj, old_auto,
+                "SPICE Line Port ({})".format(_line_describe(self.obj)),
             )
             doc.commitTransaction()
             doc.recompute()
@@ -873,6 +886,9 @@ if _GUI_AVAILABLE:
             new_bounds = getattr(self.obj, "BoundsSel", None)
             self.obj.Face = self._orig_face
             self.obj.BoundsSel = self._orig_bounds
+            # The label the object still carries if nobody renamed it -- read
+            # with the original properties in place. See wavesim_gui/labels.py.
+            old_auto = "SPICE TEM Port ({})".format(_tem_describe(self.obj))
             doc.openTransaction(title)
             face = self._selected_face()
             self.obj.Face = face
@@ -880,8 +896,9 @@ if _GUI_AVAILABLE:
             self.obj.Fields = _FIELDS_TOKEN[self._fields.currentText()]
             self.obj.Conductor = int(self._conductor.value())
             self._write_spice(self.obj)
-            self.obj.Label = "SPICE TEM Port ({})".format(
-                _tem_describe(self.obj)
+            labels_mod.retitle(
+                self.obj, old_auto,
+                "SPICE TEM Port ({})".format(_tem_describe(self.obj)),
             )
             domain_mod.set_face_bc(
                 domain_mod.find_domain(active_simulation(doc)), face, _PORT_BC

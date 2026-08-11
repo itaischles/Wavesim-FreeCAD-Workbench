@@ -37,7 +37,7 @@ import os
 import FreeCAD
 
 from wavesim_gui.commands import active_simulation
-from wavesim_gui import units
+from wavesim_gui import expressions, labels as labels_mod, units
 from wavesim_gui import excitation as exc
 
 
@@ -457,6 +457,11 @@ if _GUI_AVAILABLE:
             for key, label, kind, _default in exc.PARAMS[self._current_type()]:
                 si_value = self._values.get(key, exc.ALL_PARAMS[key][1])
                 spin, to_si = self._make_param_spin(kind, si_value)
+                # A parameter bound to an expression in the property editor is
+                # re-evaluated on every recompute, so this row cannot own it.
+                expressions.lock_bound_widget(
+                    spin, self.obj, exc.PROP_FOR_KEY[key]
+                )
                 self._params_form.addRow(label + ":", spin)
                 self._param_spins[key] = (spin, to_si)
 
@@ -481,13 +486,16 @@ if _GUI_AVAILABLE:
             """Persist Excitation + every parameter from the widgets onto *obj*.
 
             Writes all waveforms' parameters (not just the active one), so values
-            entered under other waveforms are preserved. Call inside an open
+            entered under other waveforms are preserved -- except any the user
+            has bound to an expression, which owns its own value and would
+            overwrite this one at the next recompute anyway. Call inside an open
             transaction; refreshes the property-editor visibility afterwards.
             """
             self._save_param_values()
             obj.Excitation = self._excitation.currentText()
             for key, prop in exc.PROP_FOR_KEY.items():
-                if key in self._values and hasattr(obj, prop):
+                if key in self._values and hasattr(obj, prop) \
+                        and not expressions.is_bound(obj, prop):
                     setattr(obj, prop, float(self._values[key]))
             exc.sync_visibility(obj)
 
@@ -644,13 +652,19 @@ if _GUI_AVAILABLE:
             # Restore the original position first so the transaction captures the
             # full change (live edits already moved the object outside it).
             self.obj.Position = self._orig_position
+            # The label the object still carries if nobody renamed it -- read
+            # before the edits land, so labels.retitle can tell an auto label
+            # from a name the user typed in the tree. See wavesim_gui/labels.py.
+            old_auto = "Source ({})".format(_describe(self.obj))
             doc.openTransaction("Wavesim: Edit Source")
             self.obj.Component = self._component.currentText()
             self.obj.Position = FreeCAD.Vector(
                 self._x.value(), self._y.value(), self._z.value()
             )
             self.write_excitation(self.obj)
-            self.obj.Label = "Source ({})".format(_describe(self.obj))
+            labels_mod.retitle(
+                self.obj, old_auto, "Source ({})".format(_describe(self.obj))
+            )
             doc.commitTransaction()
             doc.recompute()
             # Enlarge the domain to include the source if it now sits outside it.

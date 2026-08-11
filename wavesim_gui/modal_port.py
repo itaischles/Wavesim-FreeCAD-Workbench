@@ -101,6 +101,7 @@ import FreeCAD
 from wavesim_gui.commands import active_simulation
 from wavesim_gui import domain as domain_mod
 from wavesim_gui import excitation as exc
+from wavesim_gui import labels as labels_mod
 
 
 # --------------------------------------------------------------------------- #
@@ -374,17 +375,20 @@ def _sync_mode_visibility(obj):
     Waveform mode hides the SPICE fields; SPICE mode hides the excitation enum
     and all waveform parameters. (In waveform mode the waveform parameters'
     visibility is already managed by :func:`excitation.sync_visibility`.)
+    The active mode's properties stay editable (mode 0) rather than read-only,
+    so the property editor lets an expression drive them -- see
+    :mod:`wavesim_gui.expressions`.
     """
     spice = excitation_mode(obj) == MODE_SPICE
     if hasattr(obj, "Excitation"):
-        obj.setEditorMode("Excitation", 2 if spice else 1)
+        obj.setEditorMode("Excitation", 2 if spice else 0)
     if spice:
         for _key, prop in exc.PROP_FOR_KEY.items():
             if hasattr(obj, prop):
                 obj.setEditorMode(prop, 2)  # hide all waveform params
     for prop in _SPICE_PROPS:
         if hasattr(obj, prop):
-            obj.setEditorMode(prop, 1 if spice else 2)  # read-only vs hidden
+            obj.setEditorMode(prop, 0 if spice else 2)  # editable vs hidden
 
 
 def _face_corners(mn, mx, face, rect=None):
@@ -1045,6 +1049,10 @@ if _GUI_AVAILABLE:
             new_bounds = getattr(self.obj, "BoundsSel", None)
             self.obj.Face = self._orig_face
             self.obj.BoundsSel = self._orig_bounds
+            # The label the object still carries if nobody renamed it -- read
+            # with the original properties in place, so labels.retitle can tell
+            # an auto label from a name typed in the tree.
+            old_auto = "Modal Port ({})".format(_describe(self.obj))
             doc.openTransaction(title)
             face = self._selected_face()
             self.obj.Face = face
@@ -1059,7 +1067,9 @@ if _GUI_AVAILABLE:
             self.obj.NodePlus = self._node_plus.text().strip() or "port1p"
             self.obj.NodeMinus = self._node_minus.text().strip() or "0"
             _sync_mode_visibility(self.obj)
-            self.obj.Label = "Modal Port ({})".format(_describe(self.obj))
+            labels_mod.retitle(
+                self.obj, old_auto, "Modal Port ({})".format(_describe(self.obj))
+            )
             if self._selected_mode() == MODE_SPICE:
                 # Lumped launch on an interior plane: the face behind it must
                 # absorb, so force PML (a waveform port terminates itself).

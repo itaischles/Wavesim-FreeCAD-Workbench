@@ -28,6 +28,7 @@ import os
 import FreeCAD
 
 from wavesim_gui.commands import active_simulation
+from wavesim_gui import expressions
 
 
 # --------------------------------------------------------------------------- #
@@ -48,6 +49,13 @@ _MATERIAL_TYPE = "Material"
 
 # Name of the child group (created by CommandNewSimulation) that holds materials.
 _MATERIALS_GROUP = "Materials"
+
+# Digits kept after the decimal point by the material panel's eps/mu/sigma spin
+# boxes. Six, because these are measured quantities: a spin box rounds a typed
+# value to its own precision on commit, so a box too short does not merely
+# display less -- it stores less. (The property editor's own precision is
+# FreeCAD-wide: Preferences -> General -> Units -> "Number of decimals".)
+_DECIMALS = 6
 
 # Default colour for a freshly-created material, and the colour a body is reset
 # to when it is detached from a material (FreeCAD's default light grey).
@@ -643,15 +651,20 @@ if _GUI_AVAILABLE:
             self._pec = QtWidgets.QCheckBox("Perfect electric conductor (PEC)")
             self._pec.setChecked(bool(getattr(obj, "Pec", False)))
 
+            # eps_r/mu_r/sigma are measured quantities, not round numbers: a
+            # datasheet gives 3.66, 2.2, 10.2, and a fitted Debye permittivity
+            # more digits than that. The boxes therefore keep _DECIMALS digits
+            # rather than the Qt default of 2, which would round a typed value
+            # on commit and quietly change the material.
             self._eps = QtWidgets.QDoubleSpinBox()
             self._eps.setRange(1.0, 1.0e6)
-            self._eps.setDecimals(4)
+            self._eps.setDecimals(_DECIMALS)
             self._eps.setSingleStep(0.1)
             self._eps.setValue(float(getattr(obj, "Eps", 1.0)))
 
             self._mu = QtWidgets.QDoubleSpinBox()
             self._mu.setRange(1.0e-6, 1.0e6)
-            self._mu.setDecimals(4)
+            self._mu.setDecimals(_DECIMALS)
             self._mu.setSingleStep(0.1)
             self._mu.setValue(float(getattr(obj, "Mu", 1.0)))
 
@@ -661,9 +674,17 @@ if _GUI_AVAILABLE:
             # metal -- which belongs in a PEC material, not here.
             self._sigma = QtWidgets.QDoubleSpinBox()
             self._sigma.setRange(0.0, 1.0e6)
-            self._sigma.setDecimals(6)
+            self._sigma.setDecimals(_DECIMALS)
             self._sigma.setSingleStep(0.01)
             self._sigma.setValue(float(getattr(obj, "Sigma", 0.0)))
+
+            # An expression bound in the property editor owns the value. Kept as
+            # a set because _on_pec re-enables these boxes and must not undo it.
+            self._bound = {
+                prop for prop, spin in (("Eps", self._eps), ("Mu", self._mu),
+                                        ("Sigma", self._sigma))
+                if expressions.lock_bound_widget(spin, obj, prop)
+            }
 
             self._loss_hint = QtWidgets.QLabel("")
             self._loss_hint.setWordWrap(True)
@@ -857,9 +878,10 @@ if _GUI_AVAILABLE:
         def _on_pec(self, checked):
             # eps/mu/sigma are meaningless for a PEC region: its E is zeroed
             # after every update, so a conductivity there could have no effect.
-            self._eps.setEnabled(not checked)
-            self._mu.setEnabled(not checked)
-            self._sigma.setEnabled(not checked)
+            # A box an expression drives stays locked either way.
+            for prop, spin in (("Eps", self._eps), ("Mu", self._mu),
+                               ("Sigma", self._sigma)):
+                spin.setEnabled(not checked and prop not in self._bound)
             self._set_potentials_visible(checked)
             self._update_loss_hint()
 
@@ -880,12 +902,24 @@ if _GUI_AVAILABLE:
                     materials_group(self.sim).addObject(mat)
                     self.obj = mat
                 self.obj.Pec = self._pec.isChecked()
-                self.obj.Eps = self._eps.value()
-                self.obj.Mu = self._mu.value()
-                self.obj.Sigma = self._sigma.value()
+                # Skip any parameter an expression drives: it owns its value and
+                # would overwrite this one on the next recompute regardless.
+                for prop, spin in (("Eps", self._eps), ("Mu", self._mu),
+                                   ("Sigma", self._sigma)):
+                    if not expressions.is_bound(self.obj, prop):
+                        setattr(self.obj, prop, spin.value())
                 self.obj.Color = self._color
+                # The Name field *is* the label editor, so what it holds is the
+                # name the user wants. An empty field on an existing material
+                # means "unchanged", not "generate one" -- regenerating would
+                # throw away a name typed in the tree and, on a collision with
+                # a sibling, come back numbered.
                 name = self._name.text().strip()
-                self.obj.Label = name or "Material ({})".format(_describe(self.obj))
+                if name:
+                    if name != self.obj.Label:
+                        self.obj.Label = name
+                elif new:
+                    self.obj.Label = "Material ({})".format(_describe(self.obj))
                 apply_material_color(self.obj)
                 # A body that has just become a conductor gains its potential
                 # property here, so the table the panel showed and the property

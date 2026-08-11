@@ -219,17 +219,19 @@ def ensure_object_props(obj):
 
 
 def sync_visibility(obj):
-    """Show (read-only) the parameters the active Excitation uses, hide the rest.
+    """Show the parameters the active Excitation uses, hide the rest.
 
-    All parameters are edited through the task panel in display units, so all are
-    read-only (mode 1) in the property editor; those irrelevant to the current
-    waveform are hidden (mode 2) to keep the editor uncluttered.
+    The parameters a waveform uses are editable (mode 0) so the property editor
+    offers them its ``f(x)`` button and a VarSet parameter can drive a bandwidth
+    or a carrier frequency; note they are stored in SI, while the task panel
+    shows them in the simulation's display units. Those irrelevant to the
+    current waveform are hidden (mode 2) to keep the editor uncluttered.
     """
     typ = type_for_label(str(getattr(obj, "Excitation", EXCITATION_LABELS[0])))
     used = set(param_keys(typ))
     for key, prop in PROP_FOR_KEY.items():
         if hasattr(obj, prop):
-            obj.setEditorMode(prop, 1 if key in used else 2)
+            obj.setEditorMode(prop, 0 if key in used else 2)
 
 
 def spec_from_object(obj):

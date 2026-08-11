@@ -20,7 +20,7 @@ import os
 
 import FreeCAD
 
-from wavesim_gui import units
+from wavesim_gui import expressions, units
 
 
 # --------------------------------------------------------------------------- #
@@ -95,30 +95,32 @@ class SimulationContainer:
             obj.FrequencyUnit = units.freq_unit_labels()
             obj.FrequencyUnit = units.DEFAULT_FREQ_UNIT
 
-        # Maximum simulation time, stored in SI seconds. Edited through the
-        # Simulation task panel in the display time unit; the number of time
-        # steps is derived from this and the CFL step (read-only in the editor).
+        # Maximum simulation time, stored in SI seconds. Normally edited through
+        # the Simulation task panel in the display time unit; the number of time
+        # steps is derived from this and the CFL step.
         if not hasattr(obj, "MaxTime"):
             obj.addProperty(
                 "App::PropertyFloat", "MaxTime", "Run",
-                "Maximum simulation time, in seconds (edit via the Simulation "
-                "panel in the display time unit)",
+                "Maximum simulation time, in SECONDS (the Simulation panel "
+                "shows it in the display time unit; an expression bound here "
+                "is evaluated in seconds)",
             )
             obj.MaxTime = 2.0e-9
-            obj.setEditorMode("MaxTime", 1)  # read-only; edit through the panel
 
         # Maximum frequency of interest, stored in SI hertz. Drives the default
         # grid cell size (c / (fmax * cells-per-wavelength * sqrt(eps*mu))).
-        # Edited through the panel in the display frequency unit.
         if not hasattr(obj, "MaxFrequency"):
             obj.addProperty(
                 "App::PropertyFloat", "MaxFrequency", "Run",
-                "Maximum frequency of interest, in hertz (edit via the "
-                "Simulation panel in the display frequency unit). Drives the "
-                "default cell size.",
+                "Maximum frequency of interest, in HERTZ (the Simulation panel "
+                "shows it in the display frequency unit; an expression bound "
+                "here is evaluated in hertz). Drives the default cell size.",
             )
             obj.MaxFrequency = 1.0e9  # 1 GHz
-            obj.setEditorMode("MaxFrequency", 1)  # read-only; edit through panel
+
+        # Both stay editable in the property editor so a VarSet parameter can
+        # drive them through an expression -- see wavesim_gui/expressions.py.
+        expressions.allow_expressions(obj, "MaxTime", "MaxFrequency")
 
         # Subpixel smoothing of dielectric interfaces: when on, the voxeliser
         # anti-staircases each dielectric body's boundary cells with an
@@ -140,12 +142,10 @@ class SimulationContainer:
         # Re-assert the back-reference after a reload.
         obj.Proxy = self
         self.Type = getattr(self, "Type", _SIM_TYPE)
-        # Editor modes are runtime-only; keep MaxTime/MaxFrequency edited through
-        # the panel.
-        if hasattr(obj, "MaxTime"):
-            obj.setEditorMode("MaxTime", 1)
-        if hasattr(obj, "MaxFrequency"):
-            obj.setEditorMode("MaxFrequency", 1)
+        # Documents saved while these were read-only come back locked (property
+        # status travels in the file), which would deny them the property
+        # editor's f(x) button. Open them up again.
+        expressions.allow_expressions(obj, "MaxTime", "MaxFrequency")
         # Drop the retired mode-convergence properties from documents that carry
         # them (see :func:`_drop_mode_convergence_props`).
         _drop_mode_convergence_props(obj)
@@ -557,6 +557,12 @@ if _GUI_AVAILABLE:
                 "reports the clamp threshold it used in the run summary."
             )
 
+            # A property driven by an expression is re-evaluated on every
+            # recompute, so anything typed here would be thrown away silently.
+            # Grey the row out and name the expression instead.
+            expressions.lock_bound_widget(self._max_time, obj, "MaxTime")
+            expressions.lock_bound_widget(self._max_freq, obj, "MaxFrequency")
+
             layout.addRow("Solve:", self._mode)
             layout.addRow("Time unit:", self._time)
             layout.addRow("Frequency unit:", self._freq)
@@ -655,9 +661,12 @@ if _GUI_AVAILABLE:
             doc.openTransaction("Wavesim: Edit Simulation")
             self.obj.TimeUnit = self._time.currentText()
             self.obj.FrequencyUnit = self._freq.currentText()
-            self.obj.MaxTime = units.time_to_si(
-                self._max_time.value(), self._time_unit
-            )
+            # An expression-driven property owns its own value; writing it here
+            # would be undone by the next recompute anyway (the row is greyed).
+            if not expressions.is_bound(self.obj, "MaxTime"):
+                self.obj.MaxTime = units.time_to_si(
+                    self._max_time.value(), self._time_unit
+                )
             if not hasattr(self.obj, "SubpixelSmoothing"):
                 self.obj.addProperty(
                     "App::PropertyBool", "SubpixelSmoothing", "Run",
@@ -672,8 +681,13 @@ if _GUI_AVAILABLE:
             self.obj.SolverMode = self._mode.currentText()
             self.obj.ExtractCapacitance = self._capacitance.isChecked()
             _drop_mode_convergence_props(self.obj)
-            new_max_freq = units.freq_to_si(self._max_freq.value(), self._freq_unit)
-            self.obj.MaxFrequency = new_max_freq
+            if expressions.is_bound(self.obj, "MaxFrequency"):
+                new_max_freq = float(getattr(self.obj, "MaxFrequency", 0.0))
+            else:
+                new_max_freq = units.freq_to_si(
+                    self._max_freq.value(), self._freq_unit
+                )
+                self.obj.MaxFrequency = new_max_freq
             # The max frequency drives the default cell size, so when it changes
             # re-derive the Domain's cell sizes from it and recompute -- the mesh
             # display and derived counts update immediately without opening the

@@ -331,11 +331,15 @@ def _snapshot_extent(sim, name):
 def _geometry_outlines(obj, chord_mm):
     """Material cross-sections on a snapshot leaf's plane, in the plot's frame.
 
-    Returns ``[(rgb, [polyline, ...]), ...]``: one entry per Material with
-    geometry on the plane, each polyline an ``(N, 2)`` array of millimetres in
-    the frame the snapshot is drawn in (world mm less the leaf's
+    Returns ``[(rgb, [polyline, ...], is_pec), ...]``: one entry per Material
+    with geometry on the plane, each polyline an ``(N, 2)`` array of
+    millimetres in the frame the snapshot is drawn in (world mm less the leaf's
     ``XWorld``/``YWorld``). Empty when the leaf predates those properties, or
     when the document no longer holds the simulation.
+
+    ``is_pec`` is carried because the two overlays built from this section want
+    different subsets of it -- every material is outlined, only conductors are
+    masked -- and sectioning twice would pay OCC twice for one answer.
 
     The outline is sectioned from the **live CAD**, not rebuilt from the voxel
     arrays: those hold materials, not boundaries, so an outline derived from
@@ -397,8 +401,198 @@ def _geometry_outlines(obj, chord_mm):
                     pts = np.vstack([pts, pts[:1]])   # discretize omits the seam
                 polys.append(pts)
         if polys:
-            groups.append((mat_mod.material_color(mat), polys))
+            groups.append((mat_mod.material_color(mat), polys,
+                           bool(getattr(mat, "Pec", False))))
     return groups
+
+
+def _pec_rings(groups):
+    """The closed conductor rings in a :func:`_geometry_outlines` section.
+
+    Only a **closed** polyline bounds an area, and that function repeats the
+    first vertex on a closed wire -- so an open section curve (a plane grazing
+    a face) is exactly what fails this test, and filling across its chord would
+    invent metal that is not there.
+
+    One helper for both consumers of a PEC section -- the drawn mask and the
+    interpolator's dead-cell test -- because the two must not disagree about
+    where the metal is: a cell the interpolator treats as dead but the mask
+    leaves uncovered shows an invented value, and one covered but left live
+    bleeds a zero under the patch.
+    """
+    import numpy as np
+
+    return [np.asarray(poly, dtype=float)
+            for _rgb, polys, is_pec in groups if is_pec
+            for poly in polys
+            if len(poly) >= 4 and np.allclose(poly[0], poly[-1])]
+
+
+def _filled_path(rings):
+    """One compound path filling *rings*, with nested ones cut out as holes.
+
+    A section through a coax yields two concentric rings and the bore must not
+    be filled, so each ring's nesting depth is counted and its winding set to
+    match: even depth (an outer boundary) counter-clockwise, odd (a hole)
+    clockwise. matplotlib fills by the nonzero winding rule, which is what
+    turns that pair into an annulus -- OCC's own wire orientation says nothing
+    about which ring is a hole, so it cannot be relied on here. For a validly
+    nested section that is the same region :func:`_dead_cells` gets from
+    even-odd, which is what keeps the drawn mask and the fill in agreement.
+
+    Returns ``None`` when *rings* is empty.
+    """
+    import numpy as np
+    from matplotlib.path import Path
+
+    if not rings:
+        return None
+
+    def _signed_area2(r):
+        x, y = r[:-1, 0], r[:-1, 1]
+        return float(np.dot(x, np.roll(y, -1)) - np.dot(y, np.roll(x, -1)))
+
+    paths = [Path(r) for r in rings]
+    verts, codes = [], []
+    for i, ring in enumerate(rings):
+        depth = sum(1 for j, other in enumerate(paths)
+                    if j != i and other.contains_point(ring[0]))
+        if (_signed_area2(ring) > 0.0) != (depth % 2 == 0):
+            ring = ring[::-1]
+        verts.append(ring)
+        codes.extend([Path.MOVETO] + [Path.LINETO] * (len(ring) - 2)
+                     + [Path.CLOSEPOLY])
+    return Path(np.vstack(verts), codes)
+
+
+# Half-width of the probe used to decide a sample lying *on* a conductor
+# surface, as a fraction of the finest sample spacing. See :func:`_dead_cells`.
+_BOUNDARY_PROBE_FRACTION = 1.0e-3
+
+
+def _dead_cells(rings, cx, cy):
+    """Which cell centres sit inside a conductor, in a frame's ``(ny, nx)`` layout.
+
+    *rings* are :func:`_pec_rings`' closed polylines and *cx*/*cy* the sample
+    coordinates of the drawn axes, in the same millimetre frame. Returns a bool
+    array shaped like the transposed frame, or ``None`` when nothing is inside.
+
+    XOR across the rings, which *is* the even-odd rule: it cuts a coax's bore
+    out of its shield for the same reason :func:`_filled_path`'s winding does,
+    and agrees with it on any validly nested section. ``scanline.lattice_inside``
+    is what makes this affordable -- the fine smoothing lattice would be a
+    million ``contains_points`` tests, but the sample coordinates are a lattice
+    and each polygon edge costs one ``searchsorted`` per row.
+
+    **The region is closed**: a sample lying exactly *on* a conductor surface
+    counts as dead. That is not a detail -- ``gridbuild`` snaps grid lines onto
+    every material bbox face, so on a typical model the surfaces land exactly on
+    sample coordinates and this case is the common one, not the corner one. A
+    single ``lattice_inside`` cannot decide it consistently: it reproduces
+    matplotlib's crossing rule, which is not symmetric between the axes for a
+    point on the boundary, and so called a capacitor plate's z-faces inside and
+    its x-faces outside -- one lump of metal masked on two sides and not the
+    other two. It also has to agree with the drawn patch, which fills the closed
+    ring: a sample left live under the patch bleeds its zero into the smoother
+    from beneath the very thing meant to hide it.
+
+    So the lattice is probed at four diagonal offsets of
+    :data:`_BOUNDARY_PROBE_FRACTION` of a sample spacing and the results OR-ed
+    (each offset composed across the rings first, so a sample on a *bore* wall
+    is caught by the probe that lands in the metal). A sample on any face has at
+    least one probe inside; the solid grows by a thousandth of a cell, which is
+    below anything the picture can show.
+    """
+    import numpy as np
+    from wavesim_gui import scanline
+
+    if not rings:
+        return None
+    cx = np.asarray(cx, dtype=float)
+    cy = np.asarray(cy, dtype=float)
+
+    def _probe(coords):
+        step = np.diff(coords)
+        step = step[step > 0.0]
+        return float(step.min()) * _BOUNDARY_PROBE_FRACTION if step.size else 0.0
+
+    ex, ey = _probe(cx), _probe(cy)
+    inside = None
+    for dx, dy in ((-ex, -ey), (-ex, ey), (ex, -ey), (ex, ey)):
+        probe = None
+        for ring in rings:
+            hit = scanline.lattice_inside(ring, cx + dx, cy + dy)   # (nx, ny)
+            probe = hit if probe is None else (probe ^ hit)
+        inside = probe if inside is None else (inside | probe)
+    if not inside.any():
+        return None
+    return inside.T
+
+
+# Samples the Catmull-Rom stencil reaches: an output point between source i and
+# i+1 gathers i-1 .. i+2, so two layers of fill is exactly enough to keep metal
+# out of every tap. Filling deeper would only rewrite cells that are hidden
+# under the mask and read by nothing.
+_DEAD_FILL_LAYERS = 2
+
+
+def _shift(arr, axis, step, fill):
+    """*arr* shifted by *step* along *axis*, vacated entries set to *fill*.
+
+    Not ``np.roll``: that wraps, which would let a conductor at one edge of the
+    slice donate its neighbours to the opposite edge.
+    """
+    import numpy as np
+
+    out = np.full_like(arr, fill)
+    src, dst = [slice(None)] * arr.ndim, [slice(None)] * arr.ndim
+    if step > 0:
+        dst[axis], src[axis] = slice(step, None), slice(None, -step)
+    else:
+        dst[axis], src[axis] = slice(None, step), slice(-step, None)
+    out[tuple(dst)] = arr[tuple(src)]
+    return out
+
+
+def _fill_dead(data, dead, layers=_DEAD_FILL_LAYERS):
+    """*data* with conductor samples replaced by their live neighbours' mean.
+
+    The smoother interpolates between cell centres, and a centre inside metal
+    holds a zero the solver put there -- so without this the 4-tap stencil
+    drags those zeros up to two cells *outside* the conductor and paints a
+    false dark fringe along it, in the staircase's own shape.
+
+    The replacement is a plain outward flood of the nearest live values, one
+    layer per pass. Deliberately not a fit to the boundary condition: the
+    component dropdown means one artist serves tangential E (which does vanish
+    at a PEC), normal E (which does not -- it is the surface charge, often the
+    largest thing in the picture), H, and the magnitudes. A rule that forced
+    zero at the wall would erase the corner concentration people open these
+    plots to see, so the fill invents no zeros and no peaks; its only job is to
+    keep the stencil reading physical numbers right up to the mask that hides
+    it. Cells the flood never reaches keep 0 -- they are deeper than the
+    stencil looks.
+    """
+    import numpy as np
+
+    val = np.where(dead, 0.0, np.asarray(data, dtype=float))
+    known = ~dead
+    for _ in range(layers):
+        if known.all():
+            break
+        total = np.zeros_like(val)
+        count = np.zeros(val.shape, dtype=np.int32)
+        contrib = np.where(known, val, 0.0)
+        for axis in (0, 1):
+            for step in (-1, 1):
+                total += _shift(contrib, axis, step, 0.0)
+                count += _shift(known.astype(np.int32), axis, step, 0)
+        new = ~known & (count > 0)
+        if not new.any():
+            break
+        val[new] = total[new] / count[new]
+        known = known | new
+    return val
 
 
 def build_results(doc, sim, workdir, summary):
@@ -1451,7 +1645,37 @@ if _GUI_AVAILABLE:
         # correct on a graded grid. A cubic can overshoot at a sharp edge (a
         # conductor); the colour norm clips it, and the flat view is a tick
         # away. The artist kind differs per mode, so the toggle rebuilds it.
-        image = {"art": None, "smooth": True, "warp": None}
+        # ``fill`` follows the Mask PEC checkbox: with the conductor blanked the
+        # smoother must not read the zeros inside it either, and with the mask
+        # off the picture has to be the run's own numbers everywhere -- filling
+        # under a lifted mask would show invented values as data.
+        image = {"art": None, "smooth": True, "warp": None, "fill": True}
+
+        def _section_groups():
+            """Section the CAD on this leaf's plane -- once, for every overlay."""
+            # Chord tolerance for discretising curved edges: a fraction of the
+            # drawn extent, so a bore reads as a circle rather than a polygon
+            # and no CAD detail costs much more than a pixel.
+            spanx = ((float(xedges[-1]) - float(xedges[0])) if use_mesh
+                     else (float(size.x) if have_size else 0.0))
+            spany = ((float(yedges[-1]) - float(yedges[0])) if use_mesh
+                     else (float(size.y) if have_size else 0.0))
+            chord = max(spanx, spany) / 400.0
+            if chord <= 0.0:
+                return []
+            try:
+                return _geometry_outlines(obj, chord)
+            except Exception as exc:      # never let the CAD break the plot
+                FreeCAD.Console.PrintWarning(
+                    "Wavesim: could not section the geometry for {} ({})\n"
+                    .format(obj.Label, exc)
+                )
+                return []
+
+        # Sectioned here rather than beside the overlays it also feeds, because
+        # the very first `_make_image` already needs the conductor rings.
+        groups = _section_groups()
+        pec_rings = _pec_rings(groups)
 
         # ~4x upsampling, capped so a fine grid does not blow up the redraw.
         _SMOOTH_TARGET, _SMOOTH_MAX = 4, 900
@@ -1487,8 +1711,15 @@ if _GUI_AVAILABLE:
             nfy = int(min(max(ny, ny * _SMOOTH_TARGET), _SMOOTH_MAX))
             ix, wx = _cubic_weights(cx, nfx)
             iy, wy = _cubic_weights(cy, nfy)
+            # Which of these samples are inside metal. Fixed for the run, so it
+            # is found once here and only the arithmetic repeats per frame --
+            # a handful of shifted adds on the coarse frame, against the eight
+            # gathers over the fine one that follow.
+            dead = _dead_cells(pec_rings, cx, cy) if pec_rings else None
 
             def warp(data2d):
+                if dead is not None and image["fill"]:
+                    data2d = _fill_dead(data2d, dead)
                 # Columns (x) first, then rows (y); each pass is 4 gathers.
                 a = sum(data2d[:, ix[k]] * wx[:, k] for k in range(4))
                 return sum(a[iy[k], :] * wy[:, k][:, None] for k in range(4))
@@ -1545,32 +1776,12 @@ if _GUI_AVAILABLE:
         # the same one the body is tinted with in the 3D view, so the two
         # pictures name their parts alike -- semi-transparent and under the
         # arrows, since it is a reference layer and not the result.
-        outlines = []
-
         def _build_outlines():
-            """Section the CAD on this leaf's plane; returns the added artists."""
+            """Draw each material's cross-section; returns the added artists."""
             from matplotlib.collections import LineCollection
 
-            # Chord tolerance for discretising curved edges: a fraction of the
-            # drawn extent, so a bore reads as a circle rather than a polygon
-            # and no CAD detail costs much more than a pixel.
-            spanx = ((float(xedges[-1]) - float(xedges[0])) if use_mesh
-                     else (float(size.x) if have_size else 0.0))
-            spany = ((float(yedges[-1]) - float(yedges[0])) if use_mesh
-                     else (float(size.y) if have_size else 0.0))
-            chord = max(spanx, spany) / 400.0
-            if chord <= 0.0:
-                return []
-            try:
-                groups = _geometry_outlines(obj, chord)
-            except Exception as exc:      # never let the CAD break the plot
-                FreeCAD.Console.PrintWarning(
-                    "Wavesim: could not section the geometry for {} ({})\n"
-                    .format(obj.Label, exc)
-                )
-                return []
             arts = []
-            for rgb, polys in groups:
+            for rgb, polys, _is_pec in groups:
                 lc = LineCollection(
                     polys, colors=[rgb], linewidths=1.4, alpha=0.65, zorder=2,
                 )
@@ -1581,6 +1792,39 @@ if _GUI_AVAILABLE:
             return arts
 
         outlines = _build_outlines()
+
+        # --- conductor mask ------------------------------------------------ #
+        # Nothing propagates in metal, so the field map has nothing to say
+        # there -- but it paints the interior all the same, and the visible
+        # edge of the field is then wherever the interpolated cell-centre
+        # zeros happen to fall: a staircase at grid resolution, disagreeing
+        # with the conformal outline drawn straight over it. Blanking the
+        # conductor in the axes' own background colour cuts that edge at the
+        # CAD surface instead, which is exact rather than sub-cell-accurate
+        # and needs no fraction arrays -- so it reads the same on a staircase
+        # run as on a conformal one. The patch only hides those zeros; keeping
+        # them out of the smoother, which reaches two cells past the surface,
+        # is `_fill_dead`'s job and rides the same checkbox.
+        #
+        # Added with ``add_artist``: ``add_patch`` would fold the patch into
+        # the data limits, and a body running past the domain must not stretch
+        # the axes (the same rule the outlines follow). zorder sits above the
+        # field map in either of its two artist kinds (imshow 0, QuadMesh 1)
+        # and below the outlines, so a masked conductor still keeps its own
+        # coloured boundary.
+        def _build_mask():
+            """Blank every PEC cross-section, or ``None`` if there is none."""
+            from matplotlib.patches import PathPatch
+
+            path = _filled_path(pec_rings)
+            if path is None:
+                return None
+            patch = PathPatch(path, facecolor=ax.get_facecolor(),
+                              edgecolor="none", zorder=1.8)
+            ax.add_artist(patch)
+            return patch
+
+        pec_mask = _build_mask()
 
         # --- in-plane vector overlay -------------------------------------- #
         # The two components lying in the slice plane form a vector the colour
@@ -1842,6 +2086,19 @@ if _GUI_AVAILABLE:
             "see the actual cells, or to speed up playback on a fine grid."
         )
         controls.addWidget(smooth_check)
+        mask_check = None
+        if pec_mask is not None:
+            mask_check = QtWidgets.QCheckBox("Mask PEC")
+            mask_check.setChecked(True)
+            mask_check.setToolTip(
+                "Treat conductors as holding no field: blank them, cut at the\n"
+                "CAD surface rather than at the cell boundaries the solver\n"
+                "stepped, and keep the zeros inside them out of the smoothing\n"
+                "(which would otherwise drag them two cells outside and paint\n"
+                "a false dark fringe along the metal).\n"
+                "Turn it off to see what the run actually holds in there."
+            )
+            controls.addWidget(mask_check)
         geom_check = None
         if outlines:
             geom_check = QtWidgets.QCheckBox("Geometry")
@@ -1929,6 +2186,19 @@ if _GUI_AVAILABLE:
             if quiver["art"] is not None:
                 quiver["art"].set_visible(bool(checked))
                 dialog._canvas.draw_idle()
+
+        def on_mask(checked):
+            # The patch and the smoother's dead-cell fill are one setting: with
+            # the mask lifted the picture must be the run's own numbers, and a
+            # filled cell showing under it would read as data.
+            pec_mask.set_visible(bool(checked))
+            image["fill"] = bool(checked)
+            if image["warp"] is not None:
+                _set_frame_data(slider.value())
+            dialog._canvas.draw_idle()
+
+        if mask_check is not None:
+            mask_check.toggled.connect(on_mask)
 
         def on_geometry(checked):
             for art in outlines:

@@ -22,6 +22,16 @@ The mesh is built per axis, independently:
   cells no larger than the coarse target (the Domain's ``Dx/Dy/Dz``, now the
   *background* resolution); a small gap gets fine cells and the size grows toward
   the interior by at most ``MaxGradingRatio`` per step (solver guidance ~1.5-2x).
+* **Grazing-surface refinement.** Where a curved face runs *tangent* to an axis's
+  node planes -- a sphere's pole, a cylinder's silhouette line, the crown of a
+  fillet -- the surface departs from that plane only as ``kappa * h_t^2 / 2`` per
+  transverse cell ``h_t``, so a whole disc of it can sit inside a single cell and
+  the curvature becomes invisible to the mesh. :func:`collect_curvature_sizes`
+  asks for a fine cell *at* such a line, and the graded fill spreads it back out
+  to the bulk. Note the size scales **inversely with curvature**: a tightly curved
+  body leaves its own tangent plane within a cell and needs nothing, a gently
+  curved one is the pathological case. Off by default (Domain's
+  ``CurvatureRefinement`` = 1).
 * **Material refinement.** Each dielectric body tightens the coarse target over
   the axis interval it spans to its own per-medium resolution
   ``c0 / (fmax * N_lambda * sqrt(eps_r * mu_r))`` (see
@@ -53,6 +63,20 @@ _MM_PER_M = 1000.0
 # over this is coarsened and retried rather than handed to the voxeliser (which
 # would reject it).
 _MAX_TOTAL_CELLS = 10_000_000
+
+# Parameter samples per direction when hunting a face's axis-tangent points, and
+# the ``|n . e_axis|`` above which a sample counts as grazing (~10 degrees). The
+# sweep only has to *bracket* each tangent point; :func:`_refine_graze` then
+# locates it, so this stays coarse and cheap.
+_CURVATURE_SAMPLES = 24
+_GRAZE_COS = 0.985
+
+# Halvings used to locate the tangent point once the sweep has bracketed it.
+# Each round halves the parameter step, so 16 takes a 0.27 rad sample step down
+# to 4e-6 rad -- on a 20 mm sphere that is 1e-10 mm of coordinate error, which is
+# the point: the coordinate has to agree with ``_exact_bbox``' line to far better
+# than the merge tolerance, not merely to within a cell.
+_GRAZE_REFINE_ROUNDS = 16
 
 
 # --------------------------------------------------------------------------- #
@@ -196,6 +220,208 @@ def collect_axis_snaps(materials):
         _add_cylinder_snaps(shape, axes)
         _add_planar_snaps(shape, axes)
     return axes
+
+
+def _sample_params(lo, hi, n):
+    """*n* samples spanning ``[lo, hi]``, both endpoints included."""
+    if hi - lo <= 0.0:
+        return [lo]
+    return [lo + (hi - lo) * i / (n - 1.0) for i in range(n)]
+
+
+def _graze_at(face, axis, u, v):
+    """``|n . e_axis|`` at ``(u, v)``, or -1 where the surface cannot be evaluated."""
+    try:
+        normal = face.normalAt(u, v)
+    except Exception:
+        return -1.0
+    return abs((normal.x, normal.y, normal.z)[axis])
+
+
+def _refine_graze(face, axis, u, v, du, dv, rng):
+    """Walk ``(u, v)`` onto the true tangent point by shrinking local search.
+
+    The sweep in :func:`_add_curvature_requests` can only report the best sample
+    it *took*, and the samples do not land on the tangent point -- worse, they
+    miss it by different amounts on opposite sides of a body. On a sphere sampled
+    over ``u`` in ``[0, 2*pi]``, ``u = 0`` is a sample and ``u = pi`` is not, so
+    the ``+x`` pole came out exact while ``-x`` came out 0.19 mm short. Any
+    tolerance downstream then treats the two sides differently: the near-side
+    request attaches to its bounding-box line, the far-side one lands far enough
+    away to spawn its own line or (on a finer grid, where the tolerances scale
+    with the cell) to be dropped entirely. **One side of the body gets refined
+    and the other does not** -- which is exactly how this was reported.
+
+    Maximising ``|n . e_axis|`` rather than the coordinate itself is what keeps
+    this valid for a concave tangency (a torus throat, a fillet's inner crown),
+    where the tangent point is a *minimum* of the coordinate rather than a
+    maximum, and no convexity assumption is available to tell the two apart.
+    """
+    u0, u1, v0, v1 = rng
+    best = _graze_at(face, axis, u, v)
+    for _ in range(_GRAZE_REFINE_ROUNDS):
+        du *= 0.5
+        dv *= 0.5
+        cu, cv = u, v
+        for su in (-1, 0, 1):
+            for sv in (-1, 0, 1):
+                if su == 0 and sv == 0:
+                    continue
+                uu = min(max(cu + su * du, u0), u1)
+                vv = min(max(cv + sv * dv, v0), v1)
+                graze = _graze_at(face, axis, uu, vv)
+                if graze > best:
+                    best, u, v = graze, uu, vv
+    return u, v
+
+
+def _curvature_at(face, u, v, du, dv):
+    """Largest principal curvature at ``(u, v)``, backing off if it is undefined.
+
+    A sphere's uv parametrisation is **singular at its poles**, and OCC raises
+    "curvature not defined" there -- at precisely the point this whole pass is
+    hunting for. Evaluating a hair off the pole gives the same answer on any
+    smooth surface (curvature is continuous even where the parametrisation is
+    not), so a failure backs off along each parameter rather than discarding the
+    tangent point. Discarding it is what put the z request 0.047 mm off both
+    sphere poles.
+
+    Returns 0.0 when no nearby evaluation succeeds, or on a locally flat patch --
+    either way there is no sag to resolve and the caller drops the request.
+    """
+    for su, sv in ((0, 0), (0, 1), (0, -1), (1, 0), (-1, 0)):
+        try:
+            k1, k2 = face.curvatureAt(u + su * du * 1.0e-3, v + sv * dv * 1.0e-3)
+        except Exception:
+            continue
+        kappa = max(abs(k1), abs(k2))
+        if kappa > 0.0:
+            return kappa
+    return 0.0
+
+
+def _add_curvature_requests(shape, coarse_mm, factor, min_cell, reqs):
+    """Append *shape*'s grazing-surface cell-size requests to *reqs* (mm).
+
+    A face **grazes** an axis where its normal turns parallel to that axis. There
+    the surface is tangent to the axis's node planes, and over a transverse cell
+    ``h_t`` it departs from the tangent plane by only the sag
+    ``kappa * h_t^2 / 2``. Unless the cells along the axis are that small, the
+    whole tangent disc -- radius ``sqrt(2 h_axis / kappa)``, which can be several
+    cells -- collapses onto one staircase step and the mesh sees a flat plateau
+    instead of a curve. Two 20 mm spheres facing each other across a 3 mm gap on a
+    1.5 mm grid are the worst case: the sag over one cell is 0.06 mm, so a 7.7 mm
+    disc of each pole lives inside a single cell.
+
+    The requested size is therefore ``kappa * h_t^2 / 2``, using the **smaller**
+    of the two transverse coarse sizes (the binding direction), and it grows with
+    curvature: a tightly curved body leaves its tangent plane inside one cell and
+    asks for nothing, while a gently curved one -- the "low curvature" case -- is
+    the one that needs the fine cells. Since that ratio is ``2/(kappa*h_t)`` and
+    so unbounded for any well-resolved round body, *factor* caps it: the request
+    never goes below ``coarse/factor``. Without that cap this rule would refine
+    every cylindrical conductor in every existing model by an order of magnitude.
+
+    Planar patches (``kappa == 0``) are skipped outright: a plane normal to an
+    axis grazes it everywhere, but it has no sag, so refining there would buy
+    nothing and the *factor* floor alone would have refined it.
+
+    One request per (axis, normal sign) per face -- the sample whose normal is
+    most nearly axis-parallel -- so a sphere contributes its two poles on each
+    axis rather than a smear of near-tangent lines.
+    """
+    try:
+        import Part
+    except Exception:
+        return
+    for face in getattr(shape, "Faces", []) or []:
+        # A plane grazes an axis over its whole area but has no sag, so every one
+        # of its samples would be discarded. Skipping it up front is what keeps
+        # this pass off the clock for the many models that are all boxes and
+        # slabs (an all-planar document costs nothing measurable).
+        if isinstance(getattr(face, "Surface", None), Part.Plane):
+            continue
+        try:
+            u0, u1, v0, v1 = face.ParameterRange
+        except Exception:
+            continue
+        us = _sample_params(u0, u1, _CURVATURE_SAMPLES)
+        vs = _sample_params(v0, v1, _CURVATURE_SAMPLES)
+        du = (u1 - u0) / max(len(us) - 1, 1)
+        dv = (v1 - v0) / max(len(vs) - 1, 1)
+        # The sweep only brackets each tangent point, so it asks for nothing but
+        # the normal. Curvature is looked up once per bracket afterwards, via
+        # ``_curvature_at`` -- reading it here instead would discard the sample
+        # sitting exactly on a parametrisation pole, which is the very sample
+        # worth keeping.
+        best = {}  # (axis, sign) -> (|n_axis|, u, v)
+        for u in us:
+            for v in vs:
+                try:
+                    if not face.isPartOfDomain(u, v):
+                        continue  # sample fell in a hole of a trimmed face
+                    normal = face.normalAt(u, v)
+                except Exception:
+                    continue
+                nc = (normal.x, normal.y, normal.z)
+                for a in range(3):
+                    graze = abs(nc[a])
+                    if graze < _GRAZE_COS:
+                        continue
+                    key = (a, 1 if nc[a] > 0.0 else -1)
+                    if key not in best or graze > best[key][0]:
+                        best[key] = (graze, u, v)
+        for (a, _sign), (_graze, u, v) in best.items():
+            u, v = _refine_graze(face, a, u, v, du, dv, (u0, u1, v0, v1))
+            # The larger principal curvature is what sets the plateau: a cylinder
+            # grazing on its side is flat along its axis (kappa2 = 0) but curved
+            # across it, and it is the curved direction that decides how far the
+            # staircase step runs.
+            kappa = _curvature_at(face, u, v, du, dv)
+            if kappa <= 0.0:
+                continue
+            try:
+                point = face.valueAt(u, v)
+            except Exception:
+                continue
+            coord = (point.x, point.y, point.z)[a]
+            h_t = min(coarse_mm[t] for t in range(3) if t != a)
+            size = max(kappa * h_t * h_t * 0.5, coarse_mm[a] / factor, min_cell)
+            if size < coarse_mm[a]:
+                reqs[a].append((coord, size))
+
+
+def collect_curvature_sizes(materials, snaps, coarse_mm, factor, min_cell=0.0):
+    """Per-axis grazing-surface size requests ``(coord_mm, size_mm)``.
+
+    Walks every material body's faces (:func:`_add_curvature_requests`) and, as a
+    side effect, appends to *snaps* the coordinate of any request that has no
+    forced line near it yet, so an **interior** tangency -- a torus throat, a
+    concave fillet, anything that never touches a bounding box -- still gets a
+    line to be fine at. ``factor <= 1`` disables the whole pass.
+
+    The "near" test is what keeps the sampling error harmless. A convex body's
+    grazing point *is* its bounding-box extreme, and :func:`_exact_bbox` already
+    put an exact line there; adding this pass's approximate coordinate as a second
+    snap would let :func:`_forced_lines` mean-merge the two and drag the exact
+    line off the geometry (or, past the merge tolerance, leave a sliver cell).
+    Requests within a quarter cell of an existing snap therefore add no line and
+    simply attach to the one that is already there -- which is the only reason the
+    sampling above can afford to be coarse.
+    """
+    from wavesim_gui import voxelize as vox
+
+    reqs = ([], [], [])
+    if factor <= 1.0:
+        return reqs
+    for shape, _eps, _mu, _pec, _sigma, _body in vox._gather(materials):
+        _add_curvature_requests(shape, coarse_mm, factor, min_cell, reqs)
+    for a in range(3):
+        near = 0.25 * coarse_mm[a]
+        for coord, _size in reqs[a]:
+            if all(abs(coord - s) > near for s in snaps[a]):
+                snaps[a].append(coord)
+    return reqs
 
 
 def collect_material_caps(sim, domain, materials):
@@ -363,7 +589,7 @@ def _graded_widths(w, hL, hR, H, r):
 
 
 def build_axis_nodes(snaps, lo, hi, coarse, ratio, pad_lo, pad_hi, min_cell=0.0,
-                     caps=()):
+                     caps=(), line_sizes=()):
     """Graded node coordinates (mm) for one axis, PML pad cells included.
 
     Parameters
@@ -387,6 +613,12 @@ def build_axis_nodes(snaps, lo, hi, coarse, ratio, pad_lo, pad_hi, min_cell=0.0,
         Material cell-size caps (:func:`collect_material_caps`): over each
         interval the coarse target is tightened to *target_mm* so a high-index
         body's band gets finer cells. Empty ⇒ uniform coarse target everywhere.
+    line_sizes : iterable of (coord_mm, size_mm)
+        Grazing-surface requests (:func:`collect_curvature_sizes`): the cell size
+        *at* a forced line, rather than over an interval. This is the natural
+        shape for the request -- the surface is only unresolved right at its
+        tangent plane, and the graded fill already knows how to spread a fine end
+        size back out to the bulk at *ratio*. Empty ⇒ no curvature refinement.
 
     Returns a strictly-increasing list of node coordinates. The inner region is
     tiled so every gap between forced lines is resolved with cells no larger than
@@ -423,6 +655,18 @@ def build_axis_nodes(snaps, lo, hi, coarse, ratio, pad_lo, pad_hi, min_cell=0.0,
         right = intrinsic[i] if i < len(intrinsic) else intrinsic[-1]
         end_size[i] = min(left, right)
 
+    # Grazing-surface requests pin the size at a line rather than across a gap,
+    # so they are applied after the gap-derived sizes and only tighten them. Each
+    # attaches to the nearest forced line within half a coarse cell: the request's
+    # own coordinate is sampled and approximate, while the line it belongs to was
+    # placed exactly (a bounding-box face, or the snap this pass contributed when
+    # there was none). A request with no line in range is dropped rather than
+    # allowed to refine the wrong one.
+    for coord, size in line_sizes:
+        i = min(range(n), key=lambda k: abs(forced[k] - coord))
+        if abs(forced[i] - coord) <= 0.5 * coarse:
+            end_size[i] = min(end_size[i], max(size, min_cell))
+
     nodes = [forced[0]]
     for k, g in enumerate(gaps):
         pos = nodes[-1]
@@ -455,8 +699,10 @@ def build_domain_nodes(sim, domain, force_pml_faces=(), modal_faces=()):
     when the face's stored property says otherwise. Each material
     body additionally refines its own band down to its per-medium resolution (see
     :func:`collect_material_caps`), so higher-index regions are meshed finer than
-    the void. Returns ``None`` when there is no geometry to bound (the caller
-    falls back to a uniform grid).
+    the void, and -- when the Domain's ``CurvatureRefinement`` factor is above 1 --
+    lines where a curved face grazes an axis are refined and graded back out (see
+    :func:`collect_curvature_sizes`). Returns ``None`` when there is no geometry
+    to bound (the caller falls back to a uniform grid).
 
     If the grid exceeds :data:`_MAX_TOTAL_CELLS`, the coarse target is scaled up
     and the whole mesh rebuilt until it fits (bounded number of attempts).
@@ -487,6 +733,11 @@ def build_domain_nodes(sim, domain, force_pml_faces=(), modal_faces=()):
     # cell-count guard below, so a grid that must be coarsened to fit coarsens
     # material regions and void together.
     caps = collect_material_caps(sim, domain, materials)
+    # Grazing-surface refinement. Collected after the snaps it attaches to, and
+    # allowed to extend them for tangencies no bounding box reaches.
+    curvature = float(getattr(domain, "CurvatureRefinement", 1.0))
+    line_sizes = collect_curvature_sizes(
+        materials, snaps, coarse_mm, curvature, min_cell_mm)
 
     nodes = None
     scale = 1.0
@@ -494,10 +745,18 @@ def build_domain_nodes(sim, domain, force_pml_faces=(), modal_faces=()):
         scaled_caps = tuple(
             [(lo, hi, t * scale) for lo, hi, t in caps[a]] for a in range(3)
         )
+        # Scaled alongside ``coarse`` for the same reason as the caps. The sag
+        # term really goes as ``scale**2`` (it is quadratic in the transverse
+        # cell), so this under-coarsens slightly -- acceptable in what is already
+        # an emergency coarsening path, and it errs toward the finer mesh.
+        scaled_sizes = tuple(
+            [(c, s * scale) for c, s in line_sizes[a]] for a in range(3)
+        )
         nodes = tuple(
             build_axis_nodes(
                 snaps[a], los[a], his[a], coarse_mm[a] * scale, ratio,
                 pad_lo[a], pad_hi[a], min_cell_mm, scaled_caps[a],
+                scaled_sizes[a],
             )
             for a in range(3)
         )

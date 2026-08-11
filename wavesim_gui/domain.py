@@ -228,6 +228,7 @@ class DomainObject:
                 "mesh (0 mm = no limit)",
             )
             obj.MinCellSize = "0 mm"
+        _ensure_curvature_prop(obj)
 
         _ensure_grid_plane_props(obj)
 
@@ -288,6 +289,7 @@ class DomainObject:
         self._migrate_spacing(obj)
         _ensure_es_bc_props(obj)
         _ensure_grid_plane_props(obj)
+        _ensure_curvature_prop(obj)
 
     @staticmethod
     def _migrate_spacing(obj):
@@ -531,6 +533,18 @@ def min_cell_size_m(obj):
     if q is None:
         return 0.0
     return float(q.Value) / _MM_PER_M
+
+
+def curvature_refinement(obj):
+    """Return the Domain's grazing-surface refinement factor (1 = off).
+
+    The snapper asks for a fine cell where a curved face is tangent to a grid
+    plane; the size it wants scales inversely with curvature and so is unbounded
+    for a gently curved body, which is what this caps -- the finest such cell is
+    ``coarse / factor``. Defaults to 1 (off) for documents predating the
+    property, so an existing model's mesh is unchanged until it is turned on.
+    """
+    return float(getattr(obj, "CurvatureRefinement", 1.0) or 1.0)
 
 
 def node_coords_mm(obj):
@@ -803,6 +817,27 @@ def _ensure_es_bc_props(obj):
             obj.addProperty("App::PropertyEnumeration", prop, "Boundary", doc)
             setattr(obj, prop, _ES_BC_CHOICES)
             setattr(obj, prop, _ES_BC_CHOICES[0])
+
+
+def _ensure_curvature_prop(obj):
+    """Add the grazing-surface refinement factor if absent.
+
+    Idempotent; called from ``__init__`` **and** ``onDocumentRestored``. The
+    second call is the load-bearing one: adding a property only in ``__init__``
+    means every document saved before it existed never gains it, and since the
+    panel writes it under a ``hasattr`` guard, its spin box then silently writes
+    nothing and the mesh never changes when you move it.
+    """
+    if not hasattr(obj, "CurvatureRefinement"):
+        obj.addProperty(
+            "App::PropertyFloat", "CurvatureRefinement", "Grid",
+            "How far the non-uniform snapper may refine below the coarse cell "
+            "size where a curved face runs tangent to a grid plane (a sphere's "
+            "pole, a cylinder's silhouette), so the curvature is not flattened "
+            "into one staircase step; the size asked for grows with curvature, "
+            "this bounds the cost (1 = off)",
+        )
+        obj.CurvatureRefinement = 1.0
 
 
 def electrostatic_boundary(domain):
@@ -1304,6 +1339,23 @@ if _GUI_AVAILABLE:
             self._min_cell.setValue(float(getattr(obj, "MinCellSize", 0.0).Value)
                                     if hasattr(obj, "MinCellSize") else 0.0)
 
+            # How far the snapper may refine at a surface tangent to a grid
+            # plane (1 = off). Bounds a request that is otherwise unbounded --
+            # see gridbuild.collect_curvature_sizes -- and every extra factor
+            # here costs cells on *whole planes* of the grid, so keep it modest.
+            self._curvature = QtWidgets.QDoubleSpinBox()
+            self._curvature.setRange(1.0, 64.0)
+            self._curvature.setDecimals(1)
+            self._curvature.setSingleStep(1.0)
+            self._curvature.setPrefix("up to ")
+            self._curvature.setSuffix("x finer")
+            # Re-run here for the same reason as _migrate_spacing below: a
+            # document whose Proxy failed to restore would otherwise reach the
+            # panel without the property, and _write_to_obj's hasattr guard would
+            # then drop every edit on the floor.
+            _ensure_curvature_prop(obj)
+            self._curvature.setValue(curvature_refinement(obj))
+
             self._counts = QtWidgets.QLabel(self._counts_text())
 
             # Per-face background spacing, built like the per-face BCs below: a
@@ -1373,6 +1425,7 @@ if _GUI_AVAILABLE:
             layout.addRow(self._nonuniform)
             layout.addRow("Max grading ratio:", self._ratio)
             layout.addRow("Min cell size:", self._min_cell)
+            layout.addRow("Refine at curved surfaces:", self._curvature)
             layout.addRow("Cell counts:", self._counts)
             # Per-face background spacing. Headed, because the six face rows here
             # and the six boundary-condition rows below carry the same labels.
@@ -1485,7 +1538,8 @@ if _GUI_AVAILABLE:
             self._dx.valueChanged.connect(self._mirror_cubic)
             # Live-apply: push edits onto the Domain and recompute so the derived
             # cell counts *and* the 3D mesh preview refresh immediately, before OK.
-            for w in (self._dx, self._dy, self._dz, self._ratio, self._min_cell):
+            for w in (self._dx, self._dy, self._dz, self._ratio, self._min_cell,
+                      self._curvature):
                 w.valueChanged.connect(self._live_apply)
             self._dpml.valueChanged.connect(self._live_apply)
             first_spacing = self._spacing_order[0]
@@ -1555,6 +1609,7 @@ if _GUI_AVAILABLE:
             # and the minimum cell size (both snapper-only).
             self._ratio.setEnabled(checked)
             self._min_cell.setEnabled(checked)
+            self._curvature.setEnabled(checked)
             self._cubic.setEnabled(not checked)
             self._dx.setEnabled(not checked)
             if checked:
@@ -1636,6 +1691,7 @@ if _GUI_AVAILABLE:
                 "MaxGradingRatio": float(getattr(obj, "MaxGradingRatio", 1.5)),
                 "MinCellSize": (float(obj.MinCellSize.Value)
                                 if hasattr(obj, "MinCellSize") else 0.0),
+                "CurvatureRefinement": curvature_refinement(obj),
                 "spacing": {p: getattr(obj, p).Value
                             for p in self._spacing_order},
                 "PMLThickness": int(getattr(obj, "PMLThickness", 8)),
@@ -1654,6 +1710,8 @@ if _GUI_AVAILABLE:
             obj.MaxGradingRatio = float(self._ratio.value())
             if hasattr(obj, "MinCellSize"):
                 obj.MinCellSize = "{} mm".format(self._min_cell.value())
+            if hasattr(obj, "CurvatureRefinement"):
+                obj.CurvatureRefinement = float(self._curvature.value())
             for prop, spin in self._spacings.items():
                 setattr(obj, prop, "{} mm".format(spin.value()))
             obj.PMLThickness = int(self._dpml.value())
@@ -1684,6 +1742,8 @@ if _GUI_AVAILABLE:
             obj.MaxGradingRatio = o["MaxGradingRatio"]
             if hasattr(obj, "MinCellSize"):
                 obj.MinCellSize = "{} mm".format(o["MinCellSize"])
+            if hasattr(obj, "CurvatureRefinement"):
+                obj.CurvatureRefinement = o["CurvatureRefinement"]
             for prop, val in o["spacing"].items():
                 setattr(obj, prop, "{} mm".format(val))
             obj.PMLThickness = o["PMLThickness"]

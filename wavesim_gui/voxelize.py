@@ -300,6 +300,25 @@ def derive_grid_dims(sim, cell_size_m, padding_cells=8):
 # the domain -- therefore sections as empty, which reads as "no metal here at
 # all" rather than as an error. This is what silently emptied the whole z = 0
 # node plane of the conformal fractions; see :func:`_section_nudge`.
+#
+# A plane *tangent* to a curved face is the same degeneracy with the opposite
+# symptom, and the more dangerous one because it produces geometry rather than
+# none: the section comes back as a single **open** wire that walks the outer
+# boundary and the inner one as one path. Discretised it is a polygon covering
+# the body's whole footprint, so the layer reads as solid metal from wall to
+# wall. Measured on a 250x320 mm casing with a 12.5 mm cable bore -- the plane
+# tangent to that bore, which is a *node* plane because ``gridbuild`` snaps one
+# onto the 12.5 mm jacket's bbox face:
+#
+#     z = -12.4999   2 wires, both closed   ->  23.1% of the plane inside
+#     z = -12.5000   1 wire,  open          ->  97.8% of the plane inside
+#
+# Both planes then carried a full sheet of zero open fractions (3564 of 3564
+# y-edges), the electrostatic solve took the two sheets for conductor and walled
+# the cable off from the rest of the box, and every field in the domain came out
+# identically zero. A solid's section is a set of *closed* curves, so an open
+# wire is never geometry: :func:`_section_polygons` treats a section carrying one
+# as degenerate and steps off the plane exactly as it does for an empty one.
 _SLICE_DEAD_BAND = 1.0e-5           # of the shape's own extent (~30x measured)
 
 
@@ -373,40 +392,63 @@ def _section_polygons(body_shape, z_axis, z, deflection, nudge=0.0):
     ``None`` when the plane misses the solid (no section wires, or none that
     close), so the caller can leave that whole layer empty.
 
-    *nudge* > 0 asks for one retry just off a plane that sectioned to nothing,
-    which is how a face-coincident plane is told apart from a genuine miss (see
-    :data:`_SLICE_DEAD_BAND`). ``+nudge`` is tried first, so a solid resting *on*
-    the plane reports the material it carries; ``-nudge`` then catches a top
-    face, where ``+`` is a real miss. An internal horizontal face gets the
-    material above it, which is the same tie-break the tangency cases already
-    take: a surface counts as covered. Defaults to 0 -- **only the conformal
-    sampler passes it**, so the coarse binary sweep and the dielectric smoother
-    are bit-identical, and with them ``pec_mask`` and V2.
+    *nudge* > 0 asks for one retry just off a plane whose section was
+    **degenerate** -- nothing at all, or a wire that does not close -- which is
+    how a face-coincident or curve-tangent plane is told apart from a genuine
+    miss (see :data:`_SLICE_DEAD_BAND`). ``+nudge`` is tried first, so a solid
+    resting *on* the plane reports the material it carries; ``-nudge`` then
+    catches a top face, where ``+`` is a real miss. An internal horizontal face
+    gets the material above it, which is the same tie-break the tangency cases
+    already take: a surface counts as covered. Defaults to 0 -- **only the
+    conformal sampler passes it**, so the coarse binary sweep and the dielectric
+    smoother stay on the plane they were asked for and take its closed wires
+    alone. Dropping the open one is not free for them either -- it moves a cell
+    whose centre the phantom polygon covered -- but it moves it off an answer
+    that was never the body's shape, and their planes are cell *centres*, where
+    a surface has no reason to land.
     """
     import numpy as np
 
     def _at(zz):
+        """``(polygons, clean)`` at *zz*: the closed wires, and whether all were.
+
+        An open wire is dropped rather than filled, because a polygon closed by
+        the drawing rule instead of by the geometry is the whole-footprint fill
+        :data:`_SLICE_DEAD_BAND` describes. ``clean`` is False when one was seen,
+        so the caller can prefer another plane over these polygons even though
+        they are not empty.
+        """
         try:
             wires = body_shape.slice(z_axis, zz)
         except Exception:
-            return None
+            return None, False
         if not wires:
-            return None
-        polys = []
+            return None, False
+        polys, clean = [], True
         for w in wires:
             try:
+                if not w.isClosed():
+                    clean = False
+                    continue
                 verts = w.discretize(Deflection=deflection)
             except Exception:
                 continue
             if len(verts) < 3:
                 continue
             polys.append(np.array([(v.x, v.y) for v in verts]))
-        return polys or None
+        return (polys or None), clean
 
-    polys = _at(z)
-    if polys is not None or not nudge:
+    polys, clean = _at(z)
+    if (polys is not None and clean) or not nudge:
         return polys
-    return _at(z + nudge) or _at(z - nudge)
+    for zz in (z + nudge, z - nudge):
+        retry, retry_clean = _at(zz)
+        if retry is not None and retry_clean:
+            return retry
+    # Neither neighbour is any better: the closed wires of the requested plane
+    # are still the best answer available, and are what this returned before the
+    # retry existed.
+    return polys
 
 
 def _layer_inside(body_shape, z_axis, z, pts, deflection, nudge=0.0):

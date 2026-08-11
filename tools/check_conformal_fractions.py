@@ -186,6 +186,94 @@ def build(flush=False):
     return _Mat([_Body(inner), _Body(shield)], True)
 
 
+TAN_BOX, TAN_WALL, TAN_R = 10.0, 1.5, 2.5
+TAN_CZ, TAN_CY = 5.0, 5.13      # bore axis: tangent in z on a node plane, and
+                                # off the lattice in y so no sample point sits
+                                # on the tangent line itself
+
+
+def check_tangent_plane():
+    """A node plane tangent to a curved face must section like its neighbours.
+
+    The mirror of the flush-ends case below, and the more dangerous half: a
+    plane inside OCC's tolerance band of a *planar* face sections to nothing,
+    which reads as "no metal", while a plane **tangent to a curved** one
+    sections to a single wire that does not close -- and an open wire
+    discretises to a polygon that matplotlib's fill rule closes for it, which is
+    geometry the body does not have.
+
+    This is not a corner case a model has to go looking for. ``gridbuild`` snaps
+    grid lines onto every material bbox face, so a jacket of radius r puts node
+    planes exactly at +-r, and any conductor sharing that radius -- the casing
+    bore the cable passes through -- is tangent to them by construction. On
+    ``floating_shield_on_unshielded_coax_in_a_box`` those two planes came out
+    97.8% and 98.5% "inside the casing" against 23% on the planes either side,
+    which zeroed 3564 of 3564 y-edge fractions on each, and the electrostatic
+    solve took the two sheets for conductor and walled the cable off from the
+    rest of the box: every field in the domain read identically zero.
+
+    A hollow box with a bore through one wall reproduces the open wire exactly.
+    The assertion needs no reference geometry and no tolerance: the section of a
+    solid varies continuously in z, so the layer at the tangent plane must equal
+    the layer a hair either side of it, point for point.
+    """
+    z = FreeCAD.Vector(0.0, 0.0, 1.0)
+    shell = Part.makeBox(TAN_BOX, TAN_BOX, TAN_BOX).cut(
+        Part.makeBox(TAN_BOX - 2 * TAN_WALL, TAN_BOX - 2 * TAN_WALL,
+                     TAN_BOX - 2 * TAN_WALL,
+                     FreeCAD.Vector(TAN_WALL, TAN_WALL, TAN_WALL)))
+    shape = shell.cut(Part.makeCylinder(
+        TAN_R, TAN_WALL + 1.0,
+        FreeCAD.Vector(-0.5, TAN_CY, TAN_CZ), FreeCAD.Vector(1, 0, 0)))
+
+    xs = np.arange(int(TAN_BOX / D_MM) + 1) * D_MM
+    sub = D_MM / vox.CONFORMAL_OVERSAMPLE
+    deflection = max(vox._CONFORMAL_CHORD_FRACTION * sub, sub * 1.0e-6)
+    nudge = vox._section_nudge(shape, sub)
+    eps = 1.0e-3                # a hair, but 5x the nudge and 1/500 of a cell
+
+    def layer(zz):
+        return vox._layer_inside_lattice(shape, z, zz, xs, xs, deflection,
+                                         nudge)
+
+    def as_drawn(zz):
+        """The layer with open wires filled -- what this did before the fix."""
+        from wavesim_gui.scanline import lattice_inside
+        out = np.zeros((xs.size, xs.size), dtype=bool)
+        n_open = 0
+        for w in shape.slice(z, zz):
+            if not w.isClosed():
+                n_open += 1
+            verts = w.discretize(Deflection=deflection)
+            if len(verts) >= 3:
+                out ^= lattice_inside(
+                    np.array([(v.x, v.y) for v in verts]), xs, xs)
+        return out, n_open
+
+    emit()
+    emit("node plane tangent to a curved face (bore r=%.1f, tangent at z=%.1f "
+         "and %.1f)" % (TAN_R, TAN_CZ - TAN_R, TAN_CZ + TAN_R))
+    ok = True
+    for zt in (TAN_CZ - TAN_R, TAN_CZ + TAN_R):
+        at, lo, hi = layer(zt), layer(zt - eps), layer(zt + eps)
+        drawn, n_open = as_drawn(zt)
+        differ = (0 if at is None or lo is None
+                  else int(np.count_nonzero(at != lo)))
+        differ += (0 if at is None or hi is None
+                   else int(np.count_nonzero(at != hi)))
+        # An OCC that stops returning the open wire would make this section pass
+        # without testing anything, so say which case actually ran.
+        emit("  z=%4.1f  open wires in the section: %d" % (zt, n_open))
+        emit("           samples differing from a hair either side: %d of %d"
+             % (differ, 2 * at.size if at is not None else 0))
+        emit("           filling the open wire instead: %d differ (%.1f%% of "
+             "the plane inside, against %.1f%%)"
+             % (int(np.count_nonzero(drawn != lo)), 100.0 * drawn.mean(),
+                100.0 * lo.mean()))
+        ok = ok and at is not None and differ == 0
+    return ok
+
+
 def check_pec_material_fill(cell, nodes_m, ovr):
     """The conductor cells must carry the material of the medium beside them.
 
@@ -375,6 +463,9 @@ def main(out_path):
         emit("%-18s flush ends, z-invariant: %s (max plane-to-plane %.4f)"
              % (key, "yes" if spread == 0.0 else "NO", spread))
         ok = ok and spread == 0.0
+
+    # -- a node plane tangent to a curved face --------------------------------
+    ok = check_tangent_plane() and ok
 
     # -- conductor cells carry the medium beside them ------------------------
     ok = check_pec_material_fill(cell, nodes_m, ovr) and ok

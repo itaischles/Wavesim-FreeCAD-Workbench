@@ -20,6 +20,9 @@ tools/conformal_fractions.txt
 # Report written by tools/check_mask_symmetry.py
 tools/mask_symmetry.txt
 
+# Report written by tools/check_circle_centres.py
+tools/circle_centres.txt
+
 # Unused image assets
 Resources/Gemini_Generated_Image_.png
 Resources/excitation.png

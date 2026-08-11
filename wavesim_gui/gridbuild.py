@@ -18,6 +18,14 @@ The mesh is built per axis, independently:
   a bounding box only describes a body's outer extent, so a slot, pocket, step or
   aperture cut into it -- geometry that never touches the box -- is snapped by its
   own faces or not at all.
+* **Circle centre lines.** A cylindrical face that closes a full turn -- a rod, a
+  bore, anything whose cross-section really is a *circle*, as opposed to the arc
+  of a fillet or blend -- also forces a line through its **centre**, so a node
+  lands on the axis where the port, probe or voltage path is, and a round feature
+  narrower than one cell gets an interior instead of being a single lump of
+  metal. It is added only where the graded fill below can absorb it for free
+  (:func:`_insert_centre_lines`): splitting a gap that spans an *odd* number of
+  coarse cells would cost one of them, and that circle keeps the mesh it had.
 * **Graded fill.** Between consecutive forced lines the interval is tiled with
   cells no larger than the coarse target (the Domain's ``Dx/Dy/Dz``, now the
   *background* resolution); a small gap gets fine cells and the size grows toward
@@ -78,6 +86,12 @@ _GRAZE_COS = 0.985
 # than the merge tolerance, not merely to within a cell.
 _GRAZE_REFINE_ROUNDS = 16
 
+# Angular span (rad) above which a cylindrical face counts as a whole circle and
+# so earns a centre line -- see :func:`_is_full_circle`. A hair under a full turn,
+# because OCC reports the seam range as exactly 2*pi but a trimmed-then-healed
+# face can come back a rounding short.
+_FULL_TURN_MIN = 2.0 * math.pi - 1.0e-6
+
 
 # --------------------------------------------------------------------------- #
 # Snap-coordinate collection
@@ -119,13 +133,40 @@ def _exact_bbox(shape):
         return shape.BoundBox
 
 
-def _add_cylinder_snaps(shape, axes):
+def _is_full_circle(face):
+    """True when *face* wraps a whole turn, so its cross-section is a circle.
+
+    A cylindrical surface is also what OCC hands back for a **fillet, a blend or
+    a boolean's leftover arc**, and those have no circle to speak of: their
+    centre is a construction point that need not lie on -- or even near -- the
+    body. Forcing a grid line through it would subdivide a gap (and, for a small
+    fillet, pull fine cells in with it) to resolve an interface that is not
+    there. The full-turn test is what separates "this face *is* a circle" from
+    "this face was cut from one", and it is deliberately the conservative side of
+    the trade: a hole that a boolean happened to split into two half-cylinders
+    loses its centre line and simply meshes as it did before.
+    """
+    try:
+        u0, u1, _v0, _v1 = face.ParameterRange
+    except Exception:
+        return False
+    return (u1 - u0) >= _FULL_TURN_MIN
+
+
+def _add_cylinder_snaps(shape, axes, centres=None):
     """Append every axis-aligned cylindrical face's snap lines to *axes* (mm).
 
     A z-axis cylinder contributes ``xc +/- r`` on x, ``yc +/- r`` on y and its z
     extent on z, so a round conductor gets grid lines on its tangent planes and
     end caps. Non-cylindrical or tilted faces are ignored (the body bbox covers
     them).
+
+    When *centres* is given, a face that closes the full turn
+    (:func:`_is_full_circle`) also **proposes** its centre coordinate on those
+    two transverse axes -- a grid line through the circle's axis. It is only a
+    proposal: whether it becomes a line is decided by
+    :func:`_insert_centre_lines`, once the rest of the forced set is known.
+    Everything appended to *axes* here is unconditional, as it always was.
     """
     try:
         import Part
@@ -140,6 +181,7 @@ def _add_cylinder_snaps(shape, axes):
             continue
         centre = (surf.Center.x, surf.Center.y, surf.Center.z)
         r = float(surf.Radius)
+        circle = centres is not None and _is_full_circle(face)
         # Plain BoundBox is safe for the *axial* extent (unlike the transverse
         # one -- see :func:`_exact_bbox`): the end circles' facet vertices sit
         # exactly on the cap planes, so faceting cannot shorten this axis.
@@ -148,8 +190,10 @@ def _add_cylinder_snaps(shape, axes):
         for t in range(3):
             if t == ai:
                 axes[t].extend(axial)
-            else:
-                axes[t].extend((centre[t] - r, centre[t] + r))
+                continue
+            axes[t].extend((centre[t] - r, centre[t] + r))
+            if circle:
+                centres[t].append(centre[t])
 
 
 def _add_planar_snaps(shape, axes):
@@ -196,7 +240,7 @@ def _add_planar_snaps(shape, axes):
         axes[ai].append((pos.x, pos.y, pos.z)[ai])
 
 
-def collect_axis_snaps(materials):
+def collect_axis_snaps(materials, centres=None):
     """Per-axis forced grid-line coordinates (world mm) from material geometry.
 
     Returns ``(xs, ys, zs)`` lists (unsorted, with duplicates -- deduping is
@@ -208,6 +252,13 @@ def collect_axis_snaps(materials):
     features *inside* a body. The box comes from :func:`_exact_bbox`, so a curved
     body's box agrees with its own analytic silhouette instead of landing a
     sliver away from it.
+
+    *centres*, when given, is a per-axis triple of lists that collects each full
+    **circle's** centre coordinate as a *candidate* line
+    (:func:`_insert_centre_lines` decides). It is a separate channel rather than
+    more snaps because the two are not the same kind of thing: a snap is an
+    interface the mesh must land on, while a centre line is wanted only where it
+    is free, and that is not knowable per body.
     """
     from wavesim_gui import voxelize as vox
 
@@ -217,7 +268,7 @@ def collect_axis_snaps(materials):
         axes[0].extend((bb.XMin, bb.XMax))
         axes[1].extend((bb.YMin, bb.YMax))
         axes[2].extend((bb.ZMin, bb.ZMax))
-        _add_cylinder_snaps(shape, axes)
+        _add_cylinder_snaps(shape, axes, centres)
         _add_planar_snaps(shape, axes)
     return axes
 
@@ -482,6 +533,31 @@ def _gap_coarse(a, b, coarse, caps):
 # Per-axis graded meshing
 # --------------------------------------------------------------------------- #
 
+def _cluster_means(values, tol):
+    """Single-linkage clusters of sorted *values* closer than *tol*, each meaned.
+
+    The one merge rule in this module, shared by :func:`_forced_lines` and
+    :func:`_insert_centre_lines` so a coordinate cannot be collapsed one way in
+    one place and another way in the other. Both halves are **mirror-invariant**:
+    the gaps between consecutive sorted values mirror, so the clustering does,
+    and a cluster's mean mirrors to the mirrored cluster's mean. That is the
+    whole point -- see :func:`_forced_lines` for the m=1 coax residual that
+    "keep the first of a close pair" produced.
+    """
+    clusters = []
+    for v in values:
+        if clusters and v - clusters[-1][-1] <= tol:
+            clusters[-1].append(v)
+        else:
+            clusters.append([v])
+    return [math.fsum(c) / len(c) for c in clusters]
+
+
+def merge_tolerance(coarse, min_cell=0.0):
+    """Separation (mm) below which two forced lines are one line on this axis."""
+    return max(float(coarse) * 1.0e-3, 1.0e-6, float(min_cell))
+
+
 def _forced_lines(snaps, lo, hi, coarse, min_cell=0.0):
     """Sorted, deduped forced grid lines spanning ``[lo, hi]`` (mm).
 
@@ -510,23 +586,13 @@ def _forced_lines(snaps, lo, hi, coarse, min_cell=0.0):
     they are the domain bounds the PML pads are measured from, so a cluster
     within *tol* of either is dropped rather than allowed to drag the edge.
     """
-    tol = max(coarse * 1.0e-3, 1.0e-6, float(min_cell))
+    tol = merge_tolerance(coarse, min_cell)
 
     inside = sorted(min(max(v, lo), hi) for v in snaps
                     if lo - tol <= v <= hi + tol)
 
-    # Single-linkage clusters of near-coincident lines (see the docstring on why
-    # this rule and the mean, rather than "first one wins").
-    clusters = []
-    for v in inside:
-        if clusters and v - clusters[-1][-1] <= tol:
-            clusters[-1].append(v)
-        else:
-            clusters.append([v])
-
     lines = [lo]
-    for c in clusters:
-        v = math.fsum(c) / len(c)
+    for v in _cluster_means(inside, tol):
         if v - lines[-1] > tol and hi - v > tol:
             lines.append(v)
     if hi - lines[-1] > tol:
@@ -534,6 +600,72 @@ def _forced_lines(snaps, lo, hi, coarse, min_cell=0.0):
     else:
         lines[-1] = hi
     return lines
+
+
+def _tiled_cells(w, coarse):
+    """How many cells :func:`_graded_widths` lays across a gap of width *w*.
+
+    ``floor(w / coarse)``, at least one -- the fill lays whole cells of at most
+    *coarse* and absorbs the sub-cell leftover by scaling them all up. Only an
+    estimate: a fine end size dragged in from a neighbouring feature makes the
+    real fill lay more. Used solely to compare a gap against the two halves a
+    candidate line would cut it into, where any such refinement applies to both
+    sides of the comparison.
+    """
+    return max(int(math.floor(w / coarse + 1.0e-9)), 1)
+
+
+def _insert_centre_lines(forced, centres, coarse, min_cell, caps):
+    """*forced* plus every circle centre that costs the mesh nothing (mm).
+
+    A centre line splits the gap it lands in, and the fill tiles a gap of width
+    *w* with ``floor(w / target)`` cells (:func:`_tiled_cells`). Splitting is
+    therefore free when the two halves still lay as many cells as the whole did,
+    and **costs one** when they don't -- a gap spanning an odd number of targets
+    is the case, halving to two cells the fill then stretches. Measured on the
+    reference coax: the 3 mm inner conductor on a 1 mm grid went from three
+    1.0 mm cells to two of 1.5 mm, 50% coarser through the conductor. Forcing a
+    node onto the centre of an odd span costs a cell either way (``n-1`` or
+    ``n+1``); ``n+1`` means overriding the fill's cap rule for every gap in every
+    model, which on that coax was +23% cells and a 25% shorter timestep. So the
+    rule here is simply: take the line where it is free, leave the mesh alone
+    where it is not.
+
+    **The decision has to be made here, against the real forced set** -- not per
+    circle when the centres are collected. A circle's centre need not land in a
+    gap bounded by its *own* silhouettes: in the coax, the shield's centre and
+    the inner conductor's coincide, the shield's own diameter is already split by
+    the conductor, and the gap the line actually falls in is the conductor's. Ask
+    each circle about its own diameter and the shield answers "free" (10 cells
+    across, even) while paying for it out of the conductor. Only the gap knows.
+
+    Candidates are judged against the *original* line set and inserted together,
+    rather than one at a time against the growing one, so that two mirrored
+    candidates are judged identically -- the same mirror-invariance
+    :func:`_cluster_means` exists for. A candidate landing within the merge
+    tolerance of a line already there is dropped, not merged: it is a
+    convenience, never something to move an interface for.
+    """
+    tol = merge_tolerance(coarse, min_cell)
+    lo, hi = forced[0], forced[-1]
+    accepted = []
+    for c in _cluster_means(sorted(centres), tol):
+        if not lo + tol < c < hi - tol:
+            continue
+        gap = next(((a, b) for a, b in zip(forced[:-1], forced[1:])
+                    if a < c < b), None)
+        if gap is None:
+            continue  # already a forced line, or inside a merged cluster
+        a, b = gap
+        if c - a <= tol or b - c <= tol:
+            continue
+        target = max(_gap_coarse(a, b, coarse, caps), min_cell)
+        if (_tiled_cells(c - a, target) + _tiled_cells(b - c, target)
+                >= _tiled_cells(b - a, target)):
+            accepted.append(c)
+    if not accepted:
+        return forced
+    return sorted(forced + accepted)
 
 
 def _graded_widths(w, hL, hR, H, r):
@@ -589,7 +721,7 @@ def _graded_widths(w, hL, hR, H, r):
 
 
 def build_axis_nodes(snaps, lo, hi, coarse, ratio, pad_lo, pad_hi, min_cell=0.0,
-                     caps=(), line_sizes=()):
+                     caps=(), line_sizes=(), centres=()):
     """Graded node coordinates (mm) for one axis, PML pad cells included.
 
     Parameters
@@ -619,6 +751,10 @@ def build_axis_nodes(snaps, lo, hi, coarse, ratio, pad_lo, pad_hi, min_cell=0.0,
         shape for the request -- the surface is only unresolved right at its
         tangent plane, and the graded fill already knows how to spread a fine end
         size back out to the bulk at *ratio*. Empty ⇒ no curvature refinement.
+    centres : iterable of float
+        Circle-centre *candidates* (:func:`collect_axis_snaps`), promoted to
+        forced lines only where they cost no cells (:func:`_insert_centre_lines`).
+        Empty ⇒ no centre lines.
 
     Returns a strictly-increasing list of node coordinates. The inner region is
     tiled so every gap between forced lines is resolved with cells no larger than
@@ -631,6 +767,8 @@ def build_axis_nodes(snaps, lo, hi, coarse, ratio, pad_lo, pad_hi, min_cell=0.0,
         hi = lo + coarse  # degenerate/thin axis: at least one inner cell
 
     forced = _forced_lines(snaps, lo, hi, coarse, min_cell)
+    if centres:
+        forced = _insert_centre_lines(forced, centres, coarse, min_cell, caps)
     gaps = [b - a for a, b in zip(forced[:-1], forced[1:])]
 
     # Per-gap coarse target: the void size, tightened where a material body covers
@@ -701,7 +839,9 @@ def build_domain_nodes(sim, domain, force_pml_faces=(), modal_faces=()):
     :func:`collect_material_caps`), so higher-index regions are meshed finer than
     the void, and -- when the Domain's ``CurvatureRefinement`` factor is above 1 --
     lines where a curved face grazes an axis are refined and graded back out (see
-    :func:`collect_curvature_sizes`). Returns ``None`` when there is no geometry
+    :func:`collect_curvature_sizes`). Every full circle offers a line through its
+    centre, taken wherever the fill can absorb it for free
+    (:func:`_insert_centre_lines`). Returns ``None`` when there is no geometry
     to bound (the caller falls back to a uniform grid).
 
     If the grid exceeds :data:`_MAX_TOTAL_CELLS`, the coarse target is scaled up
@@ -727,7 +867,11 @@ def build_domain_nodes(sim, domain, force_pml_faces=(), modal_faces=()):
 
     los = (bbox.XMin - sp_lo_mm[0], bbox.YMin - sp_lo_mm[1], bbox.ZMin - sp_lo_mm[2])
     his = (bbox.XMax + sp_hi_mm[0], bbox.YMax + sp_hi_mm[1], bbox.ZMax + sp_hi_mm[2])
-    snaps = collect_axis_snaps(materials)
+    # Circle centres ride alongside the snaps as candidates; each attempt below
+    # re-judges them at its own coarse target, since which of them are free
+    # depends on it.
+    centres = ([], [], [])
+    snaps = collect_axis_snaps(materials, centres)
     # Per-axis material cell-size caps: higher-index bodies refine their band
     # below the coarse (background) target. Scaled alongside ``coarse`` in the
     # cell-count guard below, so a grid that must be coarsened to fit coarsens
@@ -756,7 +900,7 @@ def build_domain_nodes(sim, domain, force_pml_faces=(), modal_faces=()):
             build_axis_nodes(
                 snaps[a], los[a], his[a], coarse_mm[a] * scale, ratio,
                 pad_lo[a], pad_hi[a], min_cell_mm, scaled_caps[a],
-                scaled_sizes[a],
+                scaled_sizes[a], centres[a],
             )
             for a in range(3)
         )

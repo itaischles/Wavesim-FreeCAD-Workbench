@@ -48,8 +48,11 @@ parallel with the port and reflect about a third of the wave back.
 """
 
 import math
+import time
 
 import FreeCAD
+
+from wavesim_gui import sectionpool
 
 # Forward-slash JSON paths and mm->m conversion are the only unit handling here.
 _MM_PER_M = 1000.0
@@ -383,6 +386,126 @@ def _section_nudge(body_shape, sub_mm):
 COARSE_CHORD_FRACTION = 0.0025
 
 
+# --------------------------------------------------------------------------- #
+# Prefetched sections
+#
+# ``Shape.slice`` is ~80% of a conformal voxelisation and holds the GIL, so the
+# only way to make it faster is to cut planes in other *processes*
+# (:mod:`wavesim_gui.sectionpool`). Every sampler below has the same shape -- a
+# loop over Z planes whose full plane list is knowable before the loop starts --
+# so one hook serves all three: cut the whole list up front in parallel, park the
+# polygons in this cache, and let the untouched serial loop find them here.
+#
+# The cache is consulted by :func:`_section_polygons` itself, so a plane that was
+# *not* prefetched (or a pool that declined) simply falls through to the OCC call
+# it always made. That is what keeps the pool an accelerator rather than a second
+# source of truth: the worst case is the old speed, never a different answer.
+# --------------------------------------------------------------------------- #
+
+_MISSING = object()
+
+# Set only for the duration of one sampler's pass over one body; see
+# :func:`_prefetched`. Module-level rather than threaded through every call so
+# the samplers keep their signatures.
+_ACTIVE_CACHE = None
+
+# ``[seconds, count]`` while a serial pass is being timed to decide whether the
+# pool is worth starting, else None. It accumulates the time spent *cutting*
+# only, deliberately not the sampler's own point-in-polygon work: the pool moves
+# the sections and nothing else, so timing the whole loop overstates what it can
+# save. On a 361x98x98 model whose in-plane scanline dwarfs its simple sections
+# that error was enough to talk the pool into a 3.1 s sweep it returned in 5.0 s.
+_SECTION_TIMER = None
+
+
+class _SectionCache(object):
+    """Polygons for one shape, keyed by the arguments that produced them."""
+
+    __slots__ = ("shape", "planes")
+
+    def __init__(self, shape):
+        self.shape = shape
+        self.planes = {}
+
+
+def _is_z_axis(axis):
+    """Whether *axis* is the +Z direction the cache keys assume."""
+    return (getattr(axis, "x", None) == 0.0 and getattr(axis, "y", None) == 0.0
+            and getattr(axis, "z", None) == 1.0)
+
+
+def _worker_setting():
+    """The ``voxelize_workers`` setting, or ``'auto'`` when it can't be read.
+
+    Voxelisation must not fail because a settings file is missing or unreadable,
+    so anything unexpected here falls back to the default rather than raising.
+    """
+    try:
+        import wavesim_settings
+
+        return wavesim_settings.get_voxelize_workers()
+    except Exception:
+        return "auto"
+
+
+def _prefetched(pool, body_shape, planes, deflection, nudge=0.0, on_layer=None):
+    """Context manager: cut *planes* in parallel, cache them, tear down after.
+
+    *planes* is an iterable of Z coordinates, all to be cut at the same
+    *deflection* and *nudge*. Yields ``True`` when the pool ran -- in which case
+    it has already called *on_layer* once per plane, so the caller's own
+    per-section tick must not count them again -- and ``False`` when nothing was
+    prefetched and the caller should behave exactly as before.
+    """
+    import contextlib
+    import time
+
+    @contextlib.contextmanager
+    def _run():
+        global _ACTIVE_CACHE
+
+        zs = [float(z) for z in planes]
+        if pool is None or not zs:
+            yield False
+            return
+        requests = [(z, float(deflection), float(nudge)) for z in zs]
+        try:
+            results = pool.sections(body_shape, requests, on_progress=on_layer)
+        except sectionpool.SectionPoolCancelled:
+            raise VoxelizationCancelled()
+        if results is None:
+            # Declined -- usually because the pool has yet to learn what a plane
+            # of this geometry costs. Time the sections of the serial pass it
+            # falls back to and tell it, so the *next* batch is decided on a
+            # measurement of this model rather than a guess about it.
+            global _SECTION_TIMER
+
+            timer = [0.0, 0]
+            previous_timer = _SECTION_TIMER
+            _SECTION_TIMER = timer
+            try:
+                yield False
+            finally:
+                _SECTION_TIMER = previous_timer
+            pool.observe(timer[1], timer[0])
+            return
+
+        cache = _SectionCache(body_shape)
+        for (z, defl, nud), polys in zip(requests, results):
+            # A worker that raised on one plane leaves the sentinel; drop it and
+            # the serial path cuts that plane itself.
+            if not isinstance(polys, str):
+                cache.planes[(z, defl, nud)] = polys
+        previous = _ACTIVE_CACHE
+        _ACTIVE_CACHE = cache
+        try:
+            yield True
+        finally:
+            _ACTIVE_CACHE = previous
+
+    return _run()
+
+
 def _section_polygons(body_shape, z_axis, z, deflection, nudge=0.0):
     """Cross-section of *body_shape* at height *z* as a list of XY polygons.
 
@@ -407,6 +530,26 @@ def _section_polygons(body_shape, z_axis, z, deflection, nudge=0.0):
     that was never the body's shape, and their planes are cell *centres*, where
     a surface has no reason to land.
     """
+    cache = _ACTIVE_CACHE
+    if cache is not None and cache.shape is body_shape and _is_z_axis(z_axis):
+        hit = cache.planes.get((float(z), float(deflection), float(nudge)),
+                               _MISSING)
+        if hit is not _MISSING:
+            return hit
+
+    timer = _SECTION_TIMER
+    if timer is None:
+        return _cut_section(body_shape, z_axis, z, deflection, nudge)
+    started = time.perf_counter()
+    try:
+        return _cut_section(body_shape, z_axis, z, deflection, nudge)
+    finally:
+        timer[0] += time.perf_counter() - started
+        timer[1] += 1
+
+
+def _cut_section(body_shape, z_axis, z, deflection, nudge=0.0):
+    """:func:`_section_polygons` without the cache: always cuts the plane."""
     import numpy as np
 
     def _at(zz):
@@ -552,7 +695,7 @@ _SUBPIXEL_CHORD_FRACTION = 0.0025
 
 def _smooth_dielectric_body(arrays, body_shape, eps_r, mu_r,
                             nodes_mm, span, oversample, on_layer=None,
-                            sigma_r=0.0):
+                            sigma_r=0.0, pool=None):
     """Subpixel-smooth one dielectric body into ``eps_x/y/z`` (+ mu, sigma).
 
     *span* is ``((ia, ib), (ja, jb), (ka, kb))`` -- the half-open coarse sub-block
@@ -595,13 +738,17 @@ def _smooth_dielectric_body(arrays, body_shape, eps_r, mu_r,
 
     Z_AXIS = FreeCAD.Vector(0.0, 0.0, 1.0)
     inside_fine = np.zeros((xf.size, yf.size, zf.size), dtype=bool)
-    for kz in range(zf.size):
-        layer = _layer_inside_lattice(body_shape, Z_AXIS, float(zf[kz]),
-                                      xf, yf, deflection)
-        if layer is not None and layer.any():
-            inside_fine[:, :, kz] = layer
-        if on_layer is not None and on_layer():
-            raise VoxelizationCancelled()
+    # *pool* cuts the whole fine Z sweep in parallel up front (see _prefetched);
+    # it ticks on_layer for those planes itself, so the loop stops ticking.
+    with _prefetched(pool, body_shape, [float(z) for z in zf], deflection,
+                     0.0, on_layer) as prefetched:
+        for kz in range(zf.size):
+            layer = _layer_inside_lattice(body_shape, Z_AXIS, float(zf[kz]),
+                                          xf, yf, deflection)
+            if layer is not None and layer.any():
+                inside_fine[:, :, kz] = layer
+            if not prefetched and on_layer is not None and on_layer():
+                raise VoxelizationCancelled()
 
     # Fine permittivity field: the body's eps where inside, else the existing
     # (background) eps of the covering coarse cell, tiled to the sub-grid.
@@ -808,7 +955,8 @@ def _band_blocks_flat(body_shape, z_axis, z, xs, ys, os_, deflection, nudge=0.0)
     return flat.reshape(xs.shape[0], os_ + 1, os_ + 1)
 
 
-def _conformal_pec_body(covered, body_shape, nodes_mm, span, os_, on_layer=None):
+def _conformal_pec_body(covered, body_shape, nodes_mm, span, os_, on_layer=None,
+                        pool=None):
     """Accumulate one PEC body's **covered** fractions into the six arrays.
 
     *covered* holds the six ``(Nx, Ny, Nz)`` float arrays of covered (not open)
@@ -857,6 +1005,13 @@ def _conformal_pec_body(covered, body_shape, nodes_mm, span, os_, on_layer=None)
 
     ``on_layer()`` is called once per OCC section (progress + cancellation); a
     truthy return raises :class:`VoxelizationCancelled`.
+
+    *pool* is an optional :class:`wavesim_gui.sectionpool.SectionPool`. Both
+    passes know their whole plane list before they start looping -- pass 2's as
+    soon as the band exists -- so each is prefetched in one parallel batch and
+    the loops below then read cut polygons instead of cutting them. The pool
+    ticks *on_layer* itself for the planes it cuts, which is why the loops stop
+    ticking while it is in use.
     """
     import numpy as np
 
@@ -886,19 +1041,29 @@ def _conformal_pec_body(covered, body_shape, nodes_mm, span, os_, on_layer=None)
 
     Z_AXIS = FreeCAD.Vector(0.0, 0.0, 1.0)
 
+    # False while a prefetch has already counted this pass's planes against the
+    # progress total -- ticking again would double-count every section.
+    counted = [True]
+
     def _tick():
+        if not counted[0]:
+            return
         if on_layer is not None and on_layer():
             raise VoxelizationCancelled()
 
     # ---------------- pass 1: node lattice -> the surface band -------------- #
     xn, yn, zn = nx_mm[ia:ib + 1], ny_mm[ja:jb + 1], nz_mm[ka:kb + 1]
     node_in = np.zeros((ni + 1, nj + 1, nk + 1), dtype=bool)
-    for kk in range(nk + 1):
-        layer = _layer_inside_lattice(body_shape, Z_AXIS, float(zn[kk]),
-                                      xn, yn, deflection, nudge)
-        if layer is not None and layer.any():
-            node_in[:, :, kk] = layer
-        _tick()
+    with _prefetched(pool, body_shape, [float(z) for z in zn],
+                     deflection, nudge, on_layer) as prefetched:
+        counted[0] = not prefetched
+        for kk in range(nk + 1):
+            layer = _layer_inside_lattice(body_shape, Z_AXIS, float(zn[kk]),
+                                          xn, yn, deflection, nudge)
+            if layer is not None and layer.any():
+                node_in[:, :, kk] = layer
+            _tick()
+    counted[0] = True
 
     c = node_in
     corners = (c[:-1, :-1, :-1], c[1:, :-1, :-1], c[:-1, 1:, :-1], c[1:, 1:, :-1],
@@ -917,58 +1082,74 @@ def _conformal_pec_body(covered, body_shape, nodes_mm, span, os_, on_layer=None)
     # ---------------- pass 2: fine lattice over the band ------------------- #
     bi, bj, bk = np.nonzero(band)
     if bi.size:
-        for k in np.unique(bk):
-            sel = bk == k
-            ii, jj = bi[sel], bj[sel]
-            xs, ys = xb[ii], yb[jj]                      # (n, os_+1) each
-            n = ii.size
-            lat = _band_lattice(ii, jj, xb, yb)
+        layers = np.unique(bk)
+        # Every plane this pass will cut, known now that the band exists: one
+        # z-node plane plus os_ z-sub planes per occupied cell layer.
+        planes = []
+        for k in layers:
+            planes.append(float(zb[k, 0]))
+            planes.extend(float(zb[k, m + 1]) for m in range(os_))
+        with _prefetched(pool, body_shape, planes, deflection, nudge,
+                         on_layer) as prefetched:
+            counted[0] = not prefetched
+            for k in layers:
+                sel = bk == k
+                ii, jj = bi[sel], bj[sel]
+                xs, ys = xb[ii], yb[jj]                  # (n, os_+1) each
+                n = ii.size
+                lat = _band_lattice(ii, jj, xb, yb)
 
-            # z-node plane: the full (os_+1)^2 xy sub-block per cell.
-            layer = (_band_blocks_lattice(body_shape, Z_AXIS, float(zb[k, 0]),
-                                          lat, os_, deflection, nudge)
-                     if lat is not None else
-                     _band_blocks_flat(body_shape, Z_AXIS, float(zb[k, 0]),
-                                       xs, ys, os_, deflection, nudge))
-            _tick()
-            blk = (np.zeros((n, os_ + 1, os_ + 1), dtype=bool)
-                   if layer is None else layer)
-            local["pec_edge_open_x"][ii, jj, k] = blk[:, 1:, 0].mean(axis=1)
-            local["pec_edge_open_y"][ii, jj, k] = blk[:, 0, 1:].mean(axis=1)
-            local["pec_face_open_z"][ii, jj, k] = blk[:, 1:, 1:].mean(axis=(1, 2))
-
-            # z-sub planes: only the 2*os_+1 point cross through the low corner
-            # is needed -- [0] node/node, [1:1+os_] x-node/y-sub, [1+os_:]
-            # x-sub/y-node. The flat path samples exactly that; the lattice path
-            # answers the whole sub-block for the same work and slices it.
-            if lat is None:
-                px = np.concatenate([xs[:, :1], np.repeat(xs[:, :1], os_, axis=1),
-                                     xs[:, 1:]], axis=1)
-                py = np.concatenate([ys[:, :1], ys[:, 1:],
-                                     np.repeat(ys[:, :1], os_, axis=1)], axis=1)
-                cross_pts = np.column_stack([px.ravel(), py.ravel()])
-            cross = np.zeros((n, os_, 1 + 2 * os_), dtype=bool)
-            for m in range(os_):
-                z = float(zb[k, m + 1])
-                if lat is None:
-                    layer = _layer_inside(body_shape, Z_AXIS, z,
-                                          cross_pts, deflection, nudge)
-                    _tick()
-                    if layer is not None and layer.any():
-                        cross[:, m, :] = layer.reshape(n, 1 + 2 * os_)
-                    continue
-                sub = _band_blocks_lattice(body_shape, Z_AXIS, z, lat, os_,
-                                           deflection, nudge)
+                # z-node plane: the full (os_+1)^2 xy sub-block per cell.
+                layer = (_band_blocks_lattice(body_shape, Z_AXIS,
+                                              float(zb[k, 0]), lat, os_,
+                                              deflection, nudge)
+                         if lat is not None else
+                         _band_blocks_flat(body_shape, Z_AXIS, float(zb[k, 0]),
+                                           xs, ys, os_, deflection, nudge))
                 _tick()
-                if sub is not None and sub.any():
-                    cross[:, m, 0] = sub[:, 0, 0]
-                    cross[:, m, 1:1 + os_] = sub[:, 0, 1:]
-                    cross[:, m, 1 + os_:] = sub[:, 1:, 0]
-            local["pec_edge_open_z"][ii, jj, k] = cross[:, :, 0].mean(axis=1)
-            local["pec_face_open_x"][ii, jj, k] = (
-                cross[:, :, 1:1 + os_].mean(axis=(1, 2)))
-            local["pec_face_open_y"][ii, jj, k] = (
-                cross[:, :, 1 + os_:].mean(axis=(1, 2)))
+                blk = (np.zeros((n, os_ + 1, os_ + 1), dtype=bool)
+                       if layer is None else layer)
+                local["pec_edge_open_x"][ii, jj, k] = blk[:, 1:, 0].mean(axis=1)
+                local["pec_edge_open_y"][ii, jj, k] = blk[:, 0, 1:].mean(axis=1)
+                local["pec_face_open_z"][ii, jj, k] = (
+                    blk[:, 1:, 1:].mean(axis=(1, 2)))
+
+                # z-sub planes: only the 2*os_+1 point cross through the low
+                # corner is needed -- [0] node/node, [1:1+os_] x-node/y-sub,
+                # [1+os_:] x-sub/y-node. The flat path samples exactly that; the
+                # lattice path answers the whole sub-block for the same work and
+                # slices it.
+                if lat is None:
+                    px = np.concatenate([xs[:, :1],
+                                         np.repeat(xs[:, :1], os_, axis=1),
+                                         xs[:, 1:]], axis=1)
+                    py = np.concatenate([ys[:, :1], ys[:, 1:],
+                                         np.repeat(ys[:, :1], os_, axis=1)],
+                                        axis=1)
+                    cross_pts = np.column_stack([px.ravel(), py.ravel()])
+                cross = np.zeros((n, os_, 1 + 2 * os_), dtype=bool)
+                for m in range(os_):
+                    z = float(zb[k, m + 1])
+                    if lat is None:
+                        layer = _layer_inside(body_shape, Z_AXIS, z,
+                                              cross_pts, deflection, nudge)
+                        _tick()
+                        if layer is not None and layer.any():
+                            cross[:, m, :] = layer.reshape(n, 1 + 2 * os_)
+                        continue
+                    sub = _band_blocks_lattice(body_shape, Z_AXIS, z, lat, os_,
+                                               deflection, nudge)
+                    _tick()
+                    if sub is not None and sub.any():
+                        cross[:, m, 0] = sub[:, 0, 0]
+                        cross[:, m, 1:1 + os_] = sub[:, 0, 1:]
+                        cross[:, m, 1 + os_:] = sub[:, 1:, 0]
+                local["pec_edge_open_z"][ii, jj, k] = cross[:, :, 0].mean(axis=1)
+                local["pec_face_open_x"][ii, jj, k] = (
+                    cross[:, :, 1:1 + os_].mean(axis=(1, 2)))
+                local["pec_face_open_y"][ii, jj, k] = (
+                    cross[:, :, 1 + os_:].mean(axis=(1, 2)))
+        counted[0] = True
 
     for key in CONFORMAL_KEYS:
         target = covered[key][ia:ib, ja:jb, ka:kb]
@@ -1393,62 +1574,86 @@ def voxelize_materials(materials, cell_size_m,
         return bool(progress is not None
                     and progress(done_layers, total_layers))
 
-    for (body_shape, eps, mu, pec, sigma, i_idx, j_idx, k_idx, smooth,
-         span, c_span, part) in plans:
-        # Conformal open fractions for a PEC body, alongside (not instead of) the
-        # binary mask below: pec_mask stays in the contract as the fully-covered
-        # test and as the staircase path's own geometry.
-        if c_span is not None:
-            _conformal_pec_body(covered, body_shape, nodes_mm, c_span, c_ovr,
-                                on_layer=_on_layer)
-        if smooth:
-            # Subpixel dielectric: fine-sample the body over its bbox sub-block
-            # and reduce to an anisotropic effective permittivity (in place).
-            _smooth_dielectric_body(
-                arrays, body_shape, eps, mu, nodes_mm, span, ovr,
-                on_layer=_on_layer, sigma_r=sigma,
-            )
-            continue
-        if len(i_idx) == 0 or len(j_idx) == 0 or len(k_idx) == 0:
-            continue
-        # XY cell centres for this body's bbox -- a lattice, tested in a single
-        # vectorised call per Z-layer cross-section.
-        bx, by = xs[i_idx], ys[j_idx]
-        for k in k_idx:
-            inside = _layer_inside_lattice(body_shape, Z_AXIS, float(zs[k]),
-                                           bx, by, deflection)
-            if inside is not None and inside.any():
-                ii, jj = np.nonzero(inside)
-                gi, gj = i_idx[ii], j_idx[jj]
-                if pec:
-                    pec_mask[gi, gj, k] = True
-                    if pec_id is not None:
-                        # Later bodies win the overlap, exactly as pec_mask
-                        # composes: the label has to describe the metal the mask
-                        # ends up carrying, or the solver would pin a potential
-                        # on cells the field solver does not see as that part.
-                        pec_id[gi, gj, k] = part
-                else:
-                    eps_x[gi, gj, k] = eps
-                    eps_y[gi, gj, k] = eps
-                    eps_z[gi, gj, k] = eps
-                    mu_x[gi, gj, k] = mu
-                    mu_y[gi, gj, k] = mu
-                    mu_z[gi, gj, k] = mu
-                    # Written even when this body is lossless, so a lossless
-                    # body placed over a lossy background actually clears the
-                    # conductivity there instead of inheriting it.
-                    for arr in sigma_arrays:
-                        arr[gi, gj, k] = sigma
-                    # A dielectric body overrides a PEC background at its cells.
-                    pec_mask[gi, gj, k] = False
-                    if pec_id is not None:
-                        # ...and takes the part label with it. A label outside
-                        # the mask would describe metal that is no longer there.
-                        pec_id[gi, gj, k] = 0
-            done_layers += 1
-            if progress is not None and progress(done_layers, total_layers):
-                raise VoxelizationCancelled()
+    # One pool of section workers for the whole sweep, so the (real, one-off)
+    # cost of starting them is paid once across every body and pass rather than
+    # per body. It starts lazily on the first batch big enough to be worth
+    # dispatching, so a small model never spawns a process at all, and it is
+    # closed unconditionally -- including on a cancel, which raises through here.
+    pool = sectionpool.SectionPool(
+        sectionpool.resolve_workers(_worker_setting()))
+    pool.plan(total_layers)
+    try:
+        for (body_shape, eps, mu, pec, sigma, i_idx, j_idx, k_idx, smooth,
+             span, c_span, part) in plans:
+            # Conformal open fractions for a PEC body, alongside (not instead
+            # of) the binary mask below: pec_mask stays in the contract as the
+            # fully-covered test and as the staircase path's own geometry.
+            if c_span is not None:
+                _conformal_pec_body(covered, body_shape, nodes_mm, c_span,
+                                    c_ovr, on_layer=_on_layer, pool=pool)
+            if smooth:
+                # Subpixel dielectric: fine-sample the body over its bbox
+                # sub-block and reduce to an anisotropic effective permittivity
+                # (in place).
+                _smooth_dielectric_body(
+                    arrays, body_shape, eps, mu, nodes_mm, span, ovr,
+                    on_layer=_on_layer, sigma_r=sigma, pool=pool,
+                )
+                continue
+            if len(i_idx) == 0 or len(j_idx) == 0 or len(k_idx) == 0:
+                continue
+            # XY cell centres for this body's bbox -- a lattice, tested in a
+            # single vectorised call per Z-layer cross-section.
+            bx, by = xs[i_idx], ys[j_idx]
+            # *pool* cuts this body's whole Z sweep in parallel up front and
+            # ticks the progress for those planes itself (see _prefetched), so
+            # the loop's own tick below stands down while it is in use.
+            with _prefetched(pool, body_shape, [float(zs[k]) for k in k_idx],
+                             deflection, 0.0, _on_layer) as prefetched:
+                for k in k_idx:
+                    inside = _layer_inside_lattice(
+                        body_shape, Z_AXIS, float(zs[k]), bx, by, deflection)
+                    if inside is not None and inside.any():
+                        ii, jj = np.nonzero(inside)
+                        gi, gj = i_idx[ii], j_idx[jj]
+                        if pec:
+                            pec_mask[gi, gj, k] = True
+                            if pec_id is not None:
+                                # Later bodies win the overlap, exactly as
+                                # pec_mask composes: the label has to describe
+                                # the metal the mask ends up carrying, or the
+                                # solver would pin a potential on cells the
+                                # field solver does not see as that part.
+                                pec_id[gi, gj, k] = part
+                        else:
+                            eps_x[gi, gj, k] = eps
+                            eps_y[gi, gj, k] = eps
+                            eps_z[gi, gj, k] = eps
+                            mu_x[gi, gj, k] = mu
+                            mu_y[gi, gj, k] = mu
+                            mu_z[gi, gj, k] = mu
+                            # Written even when this body is lossless, so a
+                            # lossless body placed over a lossy background
+                            # actually clears the conductivity there instead of
+                            # inheriting it.
+                            for arr in sigma_arrays:
+                                arr[gi, gj, k] = sigma
+                            # A dielectric body overrides a PEC background at
+                            # its cells.
+                            pec_mask[gi, gj, k] = False
+                            if pec_id is not None:
+                                # ...and takes the part label with it. A label
+                                # outside the mask would describe metal that is
+                                # no longer there.
+                                pec_id[gi, gj, k] = 0
+                    if prefetched:
+                        continue
+                    done_layers += 1
+                    if progress is not None and progress(done_layers,
+                                                         total_layers):
+                        raise VoxelizationCancelled()
+    finally:
+        pool.close()
 
     # Covered -> open, and only if the geometry genuinely cuts something. A model
     # whose conductors land on cell edges produces 0/1 fractions everywhere: the

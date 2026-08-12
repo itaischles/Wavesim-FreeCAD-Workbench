@@ -56,6 +56,12 @@ DEFAULTS = {
     # cannot detect the GPU (it can't import numba/cuda), so the actual choice
     # for 'auto' is resolved by runner.py on the solver side.
     "backend": "auto",
+    # How many FreeCAD subprocesses cut OCC section planes during voxelisation
+    # (wavesim_gui.sectionpool). 'auto' leaves one core for the rest of the
+    # machine; **0 or 1 restores the fully serial voxeliser**, which is the
+    # revert switch if the pool ever misbehaves. The parallel and serial paths
+    # produce bit-identical arrays (tools/check_sectionpool.py).
+    "voxelize_workers": "auto",
 }
 
 # Environment variable that overrides each key when the stored value is absent.
@@ -65,6 +71,7 @@ _ENV_OVERRIDES = {
     "wavesim_results": "WAVESIM_RESULTS",
     "ngspice_dll": "WAVESIM_NGSPICE_DLL",
     "backend": "WAVESIM_BACKEND",
+    "voxelize_workers": "WAVESIM_VOXELIZE_WORKERS",
 }
 
 
@@ -162,6 +169,16 @@ def get_backend():
     return get("backend") or "auto"
 
 
+def get_voxelize_workers():
+    """How many subprocesses cut OCC section planes during voxelisation.
+
+    ``'auto'`` (the default) or a number as text; ``'0'``/``'1'`` select the
+    serial voxeliser. Resolved to a count by
+    ``wavesim_gui.sectionpool.resolve_workers``.
+    """
+    return get("voxelize_workers") or "auto"
+
+
 # --------------------------------------------------------------------------- #
 # GUI
 # --------------------------------------------------------------------------- #
@@ -205,6 +222,16 @@ if _GUI_AVAILABLE:
         ("numpy", "NumPy (reference)"),
     ]
 
+    # (stored value, display label) for the voxelisation-workers combo. This is
+    # a *FreeCAD-side* control -- it parallelises the OCC sectioning that
+    # dominates voxelising a dense conformal model, not anything the solver
+    # does -- and 'Serial' is the documented way back to the single-process
+    # voxeliser, which produces the same arrays only slower.
+    _WORKER_CHOICES = [
+        ("auto", "Parallel (one process per core, minus one)"),
+        ("1", "Serial (one process)"),
+    ]
+
     class SettingsDialog(QtWidgets.QDialog):
         """Modal dialog to view and edit the workbench solver paths."""
 
@@ -230,6 +257,15 @@ if _GUI_AVAILABLE:
                 self._backend_combo.addItem(label, value)
             idx = self._backend_combo.findData(current["backend"])
             self._backend_combo.setCurrentIndex(idx if idx >= 0 else 0)
+
+            # Voxelisation workers. This one is FreeCAD-side (it parallelises
+            # the OCC sectioning, not the solve), and 'Serial' is the revert
+            # switch: both settings produce bit-identical material arrays.
+            self._workers_combo = QtWidgets.QComboBox()
+            for value, label in _WORKER_CHOICES:
+                self._workers_combo.addItem(label, value)
+            idx = self._workers_combo.findData(current["voxelize_workers"])
+            self._workers_combo.setCurrentIndex(idx if idx >= 0 else 0)
 
             form.addRow(
                 "Solver Python interpreter:",
@@ -260,6 +296,7 @@ if _GUI_AVAILABLE:
                 ),
             )
             form.addRow("Solver backend:", self._backend_combo)
+            form.addRow("Voxelisation:", self._workers_combo)
             layout.addLayout(form)
 
             hint = QtWidgets.QLabel(
@@ -341,6 +378,7 @@ if _GUI_AVAILABLE:
             results_path = self._results_edit.text().strip()
             ngspice_dll = self._ngspice_edit.text().strip()
             backend = self._backend_combo.currentData() or "auto"
+            workers = self._workers_combo.currentData() or "auto"
 
             warnings = []
             if not os.path.isfile(python_path):
@@ -390,6 +428,7 @@ if _GUI_AVAILABLE:
                     "wavesim_results": results_path,
                     "ngspice_dll": ngspice_dll,
                     "backend": backend,
+                    "voxelize_workers": workers,
                 }
             ):
                 FreeCAD.Console.PrintMessage(

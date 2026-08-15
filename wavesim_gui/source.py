@@ -350,52 +350,82 @@ if _GUI_AVAILABLE:
         except RuntimeError:  # underlying C++ object already deleted
             return False
 
-    class ExcitationParamsMixin:
-        """Shared excitation combo + dynamic parameter widgets + preview plot.
+    class ExcitationEditor:
+        """One excitation's combo + dynamic parameter widgets + preview plot.
 
-        Reused by both the point-source and TEM-source task panels. The host
-        panel must set ``self.obj`` first, then call ``build_excitation_ui`` while
-        constructing its form (it appends the Excitation combo, a parameter block
-        that rebuilds per waveform, and a preview-plot button), and call
-        ``write_excitation`` inside its own open transaction to persist the values.
+        Owns the widgets for a **single** waveform: the family combo, a parameter
+        block rebuilt from :data:`excitation.PARAMS` whenever the family changes,
+        and (optionally) a preview-plot button. It is a plain object rather than a
+        task-panel mixin because a multi-conductor modal port needs *several* of
+        them at once -- one per drive row, each bound to its own suffixed property
+        set (``index``; see :func:`excitation.prop_for_key`) -- and panel-level
+        ``self.`` state cannot hold more than one.
+
+        *layout* is the ``QFormLayout`` the widgets are appended to. The combo's
+        change signal is left **unconnected**: the owner wires it, so a subclass
+        overriding the panel's rebuild hook still sees it (see
+        :class:`ExcitationParamsMixin`), and calls :meth:`rebuild_params` once.
+
+        Two options let a host lay the same excitation out across two places --
+        the modal port's conductor table puts the family and the amplitude in the
+        table row itself and only the remaining parameters below it:
+
+        * *combo* -- an externally owned family combo to read instead of building
+          one (no "Excitation:" row is added).
+        * *exclude* -- parameter keys to build no row for. Their cached SI values
+          survive :meth:`save_param_values` untouched, so whoever owns the widget
+          outside writes them through :meth:`set_param` and the spec still
+          carries them.
         """
 
-        def build_excitation_ui(self, layout, QtWidgets):
+        def __init__(self, obj, index, layout, QtWidgets, sim, with_plot=True,
+                     combo=None, exclude=()):
+            self.obj = obj
+            self.index = int(index)
             self._QtWidgets = QtWidgets
-            sim = active_simulation(self.obj.Document)
             self._freq_unit = units.get_frequency_unit(sim)
             self._time_unit = units.get_time_unit(sim)
+            self._exclude = set(exclude)
             # SI value cache for every parameter, seeded from the object so
             # switching waveforms mid-edit keeps previously entered values.
             self._values = {
-                key: float(getattr(self.obj, prop, exc.ALL_PARAMS[key][1]))
-                for key, prop in exc.PROP_FOR_KEY.items()
+                key: float(getattr(obj, exc.prop_for_key(key, self.index),
+                                   exc.ALL_PARAMS[key][1]))
+                for key in exc.PROP_FOR_KEY
             }
 
-            self._excitation = QtWidgets.QComboBox()
-            self._excitation.addItems(_EXCITATIONS)
-            self._excitation.setCurrentText(
-                str(getattr(self.obj, "Excitation", _EXCITATIONS[0]))
-            )
-            layout.addRow("Excitation:", self._excitation)
+            if combo is not None:
+                self.combo = combo
+            else:
+                self.combo = QtWidgets.QComboBox()
+                self.combo.addItems(_EXCITATIONS)
+                self.combo.setCurrentText(
+                    str(getattr(obj, exc.excitation_prop(self.index),
+                                _EXCITATIONS[0]))
+                )
+                layout.addRow("Excitation:", self.combo)
 
             # Container whose rows are rebuilt to match the selected waveform's
             # parameter set (see :data:`excitation.PARAMS`).
-            self._params_widget = QtWidgets.QWidget()
-            self._params_form = QtWidgets.QFormLayout(self._params_widget)
+            self.params_widget = QtWidgets.QWidget()
+            self._params_form = QtWidgets.QFormLayout(self.params_widget)
             self._params_form.setContentsMargins(0, 0, 0, 0)
-            self._param_spins = {}  # key -> (spin, to_si_callable)
-            layout.addRow(self._params_widget)
+            self.param_spins = {}  # key -> (spin, to_si_callable)
+            layout.addRow(self.params_widget)
 
-            self._plot_button = QtWidgets.QPushButton("Plot excitation vs. time…")
-            layout.addRow(self._plot_button)
+            self.plot_button = None
+            if with_plot:
+                self.plot_button = QtWidgets.QPushButton(
+                    "Plot excitation vs. time…")
+                layout.addRow(self.plot_button)
+                self.plot_button.clicked.connect(self.plot)
 
-            self._rebuild_params()
-            self._excitation.currentTextChanged.connect(self._rebuild_params)
-            self._plot_button.clicked.connect(self._plot)
+        @property
+        def time_unit(self):
+            return self._time_unit
 
-        def _current_type(self):
-            return exc.type_for_label(self._excitation.currentText())
+        def current_type(self):
+            return exc.type_for_label(self.combo.currentText())
 
         def _make_param_spin(self, kind, si_value):
             """Return ``(spin, to_si)`` for a parameter of the given *kind*.
@@ -443,47 +473,69 @@ if _GUI_AVAILABLE:
                 to_si = lambda v: v
             return spin, to_si
 
-        def _save_param_values(self):
+        def save_param_values(self):
             """Persist the currently shown spins into the SI value cache."""
-            for key, (spin, to_si) in self._param_spins.items():
+            for key, (spin, to_si) in self.param_spins.items():
                 self._values[key] = float(to_si(spin.value()))
 
-        def _rebuild_params(self, *_):
+        def rebuild_params(self, *_):
             """Rebuild the parameter rows to match the selected waveform."""
-            self._save_param_values()
+            self.save_param_values()
             while self._params_form.rowCount():
                 self._params_form.removeRow(0)
-            self._param_spins = {}
-            for key, label, kind, _default in exc.PARAMS[self._current_type()]:
+            self.param_spins = {}
+            for key, label, kind, _default in exc.PARAMS[self.current_type()]:
+                if key in self._exclude:
+                    continue
                 si_value = self._values.get(key, exc.ALL_PARAMS[key][1])
                 spin, to_si = self._make_param_spin(kind, si_value)
                 # A parameter bound to an expression in the property editor is
                 # re-evaluated on every recompute, so this row cannot own it.
                 expressions.lock_bound_widget(
-                    spin, self.obj, exc.PROP_FOR_KEY[key]
+                    spin, self.obj, exc.prop_for_key(key, self.index)
                 )
                 self._params_form.addRow(label + ":", spin)
-                self._param_spins[key] = (spin, to_si)
+                self.param_spins[key] = (spin, to_si)
 
-        def _spec_from_widgets(self):
+        def spec_from_widgets(self):
             """Return the excitation spec (SI) for the current widget state."""
-            self._save_param_values()
-            typ = self._current_type()
+            self.save_param_values()
+            typ = self.current_type()
             spec = {"type": typ}
             for key in exc.param_keys(typ):
                 spec[key] = float(self._values.get(key, exc.ALL_PARAMS[key][1]))
             return spec
 
-        def _plot(self, *_):
+        def get_param(self, key):
+            """The cached SI value of parameter *key* (shown or excluded)."""
+            self.save_param_values()
+            return float(self._values.get(key, exc.ALL_PARAMS[key][1]))
+
+        def set_param(self, key, value):
+            """Cache *key*'s **SI** value, for a parameter this editor excludes.
+
+            The way a parameter whose widget the host owns elsewhere -- the
+            amplitude column of the modal port's conductor table -- gets into the
+            spec. Cache-only by design: an included parameter's spin shows a
+            *display*-unit value (GHz, ns), and writing an SI number into it
+            would be off by the unit scale.
+            """
+            self._values[key] = float(value)
+
+        def uses_param(self, key):
+            """True if the currently selected waveform family uses *key*."""
+            return key in exc.param_keys(self.current_type())
+
+        def plot(self, *_):
             """Open a preview window plotting the excitation vs. time."""
             sim = active_simulation(self.obj.Document)
             t_max_s = float(getattr(sim, "MaxTime", 0.0)) if sim else 0.0
             _show_excitation_plot(
-                self._spec_from_widgets(), t_max_s, self._time_unit
+                self.spec_from_widgets(), t_max_s, self._time_unit
             )
 
-        def write_excitation(self, obj):
-            """Persist Excitation + every parameter from the widgets onto *obj*.
+        def write(self, obj):
+            """Persist this row's Excitation + every parameter onto *obj*.
 
             Writes all waveforms' parameters (not just the active one), so values
             entered under other waveforms are preserved -- except any the user
@@ -491,13 +543,63 @@ if _GUI_AVAILABLE:
             overwrite this one at the next recompute anyway. Call inside an open
             transaction; refreshes the property-editor visibility afterwards.
             """
-            self._save_param_values()
-            obj.Excitation = self._excitation.currentText()
-            for key, prop in exc.PROP_FOR_KEY.items():
+            self.save_param_values()
+            setattr(obj, exc.excitation_prop(self.index),
+                    self.combo.currentText())
+            for key in exc.PROP_FOR_KEY:
+                prop = exc.prop_for_key(key, self.index)
                 if key in self._values and hasattr(obj, prop) \
                         and not expressions.is_bound(obj, prop):
                     setattr(obj, prop, float(self._values[key]))
-            exc.sync_visibility(obj)
+            exc.sync_visibility(obj, self.index)
+
+    class ExcitationParamsMixin:
+        """Shared excitation combo + dynamic parameter widgets + preview plot.
+
+        Reused by the point-source, modal-port and Gaussian-beam task panels for
+        the object's **single/first** excitation (property index 0). The host
+        panel must set ``self.obj`` first, then call ``build_excitation_ui`` while
+        constructing its form, and call ``write_excitation`` inside its own open
+        transaction to persist the values.
+
+        A thin shim over :class:`ExcitationEditor`, which owns the widgets. The
+        combo is wired to ``self._rebuild_params`` rather than to the editor's own
+        method so a panel overriding it (the Gaussian beam re-hooks the fresh
+        spins into its waist hint) still runs on every waveform change.
+        """
+
+        def build_excitation_ui(self, layout, QtWidgets):
+            self._editor = ExcitationEditor(
+                self.obj, 0, layout, QtWidgets,
+                active_simulation(self.obj.Document),
+            )
+            self._rebuild_params()
+            self._editor.combo.currentTextChanged.connect(self._rebuild_params)
+
+        # The editor's widget state, exposed under the names panels already use.
+        @property
+        def _param_spins(self):
+            return self._editor.param_spins
+
+        @property
+        def _excitation(self):
+            return self._editor.combo
+
+        @property
+        def _time_unit(self):
+            return self._editor.time_unit
+
+        def _rebuild_params(self, *args):
+            self._editor.rebuild_params(*args)
+
+        def _spec_from_widgets(self):
+            return self._editor.spec_from_widgets()
+
+        def _plot(self, *_):
+            self._editor.plot()
+
+        def write_excitation(self, obj):
+            self._editor.write(obj)
 
     class SourceViewProvider:
         """Coin view provider drawing the source as an amber point marker.

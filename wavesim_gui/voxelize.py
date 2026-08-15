@@ -1944,7 +1944,12 @@ def build_job_from_document(doc, steps=None, fmax=30.0e9, progress=None):
                        if modal_mod.excitation_mode(p) == modal_mod.MODE_WAVEFORM]
     modal_spice_objs = [p for p in port_objs
                         if modal_mod.excitation_mode(p) == modal_mod.MODE_SPICE]
-    modal_ports = [modal_mod.modal_port_spec(p, origin_m) for p in modal_wave_objs]
+    # One entry per *drive row*, not per port object: a multi-conductor port
+    # energizes several modes on one face and the solver superposes the sheets
+    # (see ``modal_port.modal_port_specs``). A port with no conductor table still
+    # yields exactly one entry, unchanged.
+    modal_ports = [spec for p in modal_wave_objs
+                   for spec in modal_mod.modal_port_specs(p, origin_m)]
 
     # Boundary Gaussian beams: launched from a (forced-PML) domain face; the
     # runner places the sheet from the face + the boundary's PML depth, so no

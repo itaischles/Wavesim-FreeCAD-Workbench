@@ -50,6 +50,15 @@ A modal port is driven one of two ways, chosen in its task panel
   excitation's Amplitude is the launched **forward-wave** voltage: the solver
   calibrates ``amplitude=1`` to land one forward volt on any grid or fill, so the
   workbench applies no scaling of its own.
+
+  On a multi-conductor cross-section the drive is a **conductor table**: one row
+  per conductor the port terminates, each with its own waveform and amplitude, so
+  the launch is their superposition ``Σ aᵢ·fᵢ(t)·modeᵢ``. Each row becomes its
+  own ``modal_ports`` entry (co-planar ``ws.ModalPort`` sheets superpose on the
+  ghost H plane by construction) and records its own V(t)/I(t). Which mode a row
+  drives is settled by geometry -- a point inside that conductor's cross-section,
+  where the solved φ is 1 V -- not by the solver's raster-order conductor
+  numbering. See the conductor-table section below.
 * **SPICE** -- co-simulated in lockstep with an external ngspice netlist. This is
   still a lumped :class:`wavesim.sources.SpicePort` on an interior plane, so its
   spec goes into the job's ``spice_ports`` (``kind: "tem"``, built by
@@ -238,9 +247,14 @@ class ModalPortObject:
                 "App::PropertyInteger", "Conductor", "Port",
                 "Which solved TEM mode to launch: the conductor label of the "
                 "energized conductor (shown in the mode plot after 'Compute "
-                "Mode'). 0 = the dominant (first) mode.",
+                "Mode'). 0 = the dominant (first) mode. Legacy fallback, read "
+                "only when the port carries no conductor table.",
             )
             obj.Conductor = 0
+
+        # The conductor table: which conductors this port terminates, which of
+        # them it energizes, and each one's own waveform (see ``_ensure_table_props``).
+        _ensure_table_props(obj)
 
         # Optional in-plane bounds: an edge/face whose bounding box confines the
         # mode solve to a sub-rectangle of the port face (empty = whole face).
@@ -291,9 +305,15 @@ class ModalPortObject:
                 "App::PropertyInteger", "Conductor", "Port",
                 "Which solved TEM mode to launch: the conductor label of the "
                 "energized conductor (shown in the mode plot after 'Compute "
-                "Mode'). 0 = the dominant (first) mode.",
+                "Mode'). 0 = the dominant (first) mode. Legacy fallback, read "
+                "only when the port carries no conductor table.",
             )
             obj.Conductor = 0
+        # Back-fill the conductor table. It comes back **empty** on a port saved
+        # before it existed, which is exactly what keeps that port on its old
+        # single-mode behaviour until the user opens the panel (see
+        # :func:`drive_rows`).
+        _ensure_table_props(obj)
         # Back-fill the optional in-plane bounds selection (whole face when unset).
         if not hasattr(obj, "BoundsSel"):
             obj.addProperty(
@@ -372,23 +392,569 @@ def excitation_mode(obj):
 def _sync_mode_visibility(obj):
     """Show only the active drive mode's properties in the property editor.
 
-    Waveform mode hides the SPICE fields; SPICE mode hides the excitation enum
-    and all waveform parameters. (In waveform mode the waveform parameters'
-    visibility is already managed by :func:`excitation.sync_visibility`.)
+    Waveform mode hides the SPICE fields; SPICE mode hides every drive row's
+    excitation enum and waveform parameters. (In waveform mode the parameters'
+    visibility is already managed by :func:`excitation.sync_visibility`, per row.)
     The active mode's properties stay editable (mode 0) rather than read-only,
     so the property editor lets an expression drive them -- see
     :mod:`wavesim_gui.expressions`.
     """
     spice = excitation_mode(obj) == MODE_SPICE
-    if hasattr(obj, "Excitation"):
-        obj.setEditorMode("Excitation", 2 if spice else 0)
-    if spice:
-        for _key, prop in exc.PROP_FOR_KEY.items():
-            if hasattr(obj, prop):
-                obj.setEditorMode(prop, 2)  # hide all waveform params
+    for index in range(max(drive_row_count(obj), 1)):
+        if spice:
+            exc.hide_props(obj, index)
+        else:
+            enum_prop = exc.excitation_prop(index)
+            if hasattr(obj, enum_prop):
+                obj.setEditorMode(enum_prop, 0)
+            exc.sync_visibility(obj, index)
     for prop in _SPICE_PROPS:
         if hasattr(obj, prop):
             obj.setEditorMode(prop, 0 if spice else 2)  # editable vs hidden
+
+
+# --------------------------------------------------------------------------- #
+# The conductor table: which conductors the port terminates, and how it drives
+# them
+# --------------------------------------------------------------------------- #
+#
+# A modal port on a multi-conductor cross-section has one TEM mode per signal
+# conductor, and the launch the user wants is a **superposition** of them,
+#
+#     E(t) = Σ_i  a_i · f_i(t) · ê_i
+#
+# with an independent amplitude and waveform per conductor. Solver-side that is
+# not one object but N: :class:`wavesim.sources.ModalPort` sheets sharing a face
+# superpose on the ghost H plane by construction (``sources._GhostPlaneGroup``
+# clears it once and sums the contributors), so this port emits **one job
+# ``modal_ports`` entry per table row**, and the plane carries the sum. Each row
+# is therefore also a port in its own right: it records its own V(t)/I(t)
+# against its own Z_ref, which is what makes a multi-mode S-matrix fall out.
+#
+# Every listed conductor gets a sheet, driven or not. An undriven row launches
+# nothing (amplitude 0) but still **terminates its mode** -- without it that mode
+# has no absorber on a face that carries no PML, and it reflects.
+#
+# Which mode belongs to which row is settled geometrically, not by the solver's
+# labelling: each row carries a point inside its conductor's cross-section
+# (``conductor_point``, see :func:`conductor_plane_point_mm`), and the runner
+# picks the mode whose φ is 1 V there. ``mode_solver._solve_one`` pins φ to
+# exactly 1.0 on the energized conductor and 0.0 on every other one, so the match
+# is exact and owes nothing to ``ndimage.label``'s raster ordering -- which is
+# what the old integer ``Conductor`` had to be read against, and why it could
+# only be chosen *after* a mode solve had been run and looked at.
+
+# Row conductors: the PEC body per row, in row order.
+#
+# An ``App::PropertyLinkList`` and a parallel ``App::PropertyStringList``, not the
+# ``App::PropertyLinkSubList`` this obviously wants to be. That property **groups
+# its entries by object**: ``[(b,"Face13"), (b,"Face16")]`` comes back as one
+# ``(b, ("Face13","Face16"))`` pair. Two rows on one body -- exactly the case
+# this feature exists for, a shield and its pins padded from one sketch into a
+# single Part object -- would collapse into one row, and interleaved rows would
+# come back reordered, sliding every row off its ``Energized`` flag and its
+# excitation property set. A LinkList keeps duplicates and order (verified across
+# a save/reload), and the subnames ride beside it.
+_CONDUCTORS_PROP = "Conductors"
+# Per-row face naming which cross-section region of that body the row drives
+# ("" = the body's largest region, which is all a single-conductor body has).
+_CONDUCTOR_FACES_PROP = "ConductorFaces"
+# Per-row launch flag; False = terminate only (amplitude forced to 0).
+_ENERGIZED_PROP = "Energized"
+
+
+def _ensure_table_props(obj):
+    """Add/refresh the conductor-table properties and every row's waveform props.
+
+    Idempotent. On a port saved before the table existed all three lists come
+    back empty, which :func:`drive_rows` reads as "no table" and answers with the
+    legacy single-drive row -- so such a document runs exactly as it did.
+    """
+    # A ``Conductors`` of the wrong type is from a pre-release build of this
+    # feature; drop it (with its rows) rather than read it as something it is not.
+    if hasattr(obj, _CONDUCTORS_PROP):
+        try:
+            kind = obj.getTypeIdOfProperty(_CONDUCTORS_PROP)
+        except Exception:
+            kind = "App::PropertyLinkList"
+        if kind != "App::PropertyLinkList":
+            try:
+                obj.removeProperty(_CONDUCTORS_PROP)
+            except Exception:
+                pass
+    if not hasattr(obj, _CONDUCTORS_PROP):
+        obj.addProperty(
+            "App::PropertyLinkList", _CONDUCTORS_PROP, "Port",
+            "Conductors this port terminates, one per drive row: the PEC body "
+            "each row's conductor belongs to. Edited in the task panel's "
+            "conductor table.",
+        )
+        obj.setEditorMode(_CONDUCTORS_PROP, 1)  # read-only: the table owns it
+    if not hasattr(obj, _CONDUCTOR_FACES_PROP):
+        obj.addProperty(
+            "App::PropertyStringList", _CONDUCTOR_FACES_PROP, "Port",
+            "Per drive row: a face of that row's body which the port plane "
+            "crosses, naming which cross-section region (which conductor) the "
+            "row drives. Empty = the body's largest region.",
+        )
+        obj.setEditorMode(_CONDUCTOR_FACES_PROP, 1)  # read-only: the table owns it
+    if not hasattr(obj, _ENERGIZED_PROP):
+        obj.addProperty(
+            "App::PropertyBoolList", _ENERGIZED_PROP, "Port",
+            "Per drive row: True launches that conductor's mode with the row's "
+            "waveform, False terminates it only (amplitude 0).",
+        )
+        obj.setEditorMode(_ENERGIZED_PROP, 1)  # read-only: the table owns it
+    # One excitation property set per row (row 0 is the port's original one).
+    for index in range(drive_row_count(obj)):
+        exc.ensure_object_props(obj, index)
+
+
+def drive_row_count(obj):
+    """Number of rows in *obj*'s conductor table (0 ⇒ no table)."""
+    return len(getattr(obj, _CONDUCTORS_PROP, None) or [])
+
+
+def conductor_label(body, sub=""):
+    """Human label of one drive row's conductor."""
+    if body is None:
+        return "?"
+    return region_name(body, sub, 2 if sub else 1)
+
+
+def drive_rows(obj):
+    """``[(body, sub, energized, excitation_index), ...]`` for *obj*'s table.
+
+    Empty when the port carries no table -- callers then fall back to the legacy
+    single drive (the whole face, the integer ``Conductor``, excitation index 0).
+    """
+    bodies = list(getattr(obj, _CONDUCTORS_PROP, None) or [])
+    subs = list(getattr(obj, _CONDUCTOR_FACES_PROP, None) or [])
+    flags = list(getattr(obj, _ENERGIZED_PROP, None) or [])
+    rows = []
+    for index, body in enumerate(bodies):
+        if body is None:
+            continue
+        sub = str(subs[index]) if index < len(subs) else ""
+        # A row added before the flag list caught up defaults to energized: a
+        # conductor the user went out of their way to pick is one they meant.
+        energized = bool(flags[index]) if index < len(flags) else True
+        rows.append((body, sub, energized, index))
+    return rows
+
+
+def set_drive_rows(obj, conductors, energized):
+    """Replace *obj*'s conductor table with *conductors* / *energized*.
+
+    *conductors* is a list of ``(body, sub)`` pairs (a bare body is accepted and
+    means its largest cross-section region). *sub* names a face of that body the
+    port plane crosses, which is what picks out one conductor of a body holding
+    several.
+
+    Adds the waveform property set each new row needs and removes the ones a
+    shrunk table no longer uses, so the property editor never shows an orphan
+    row. Row 0's properties are never removed -- they are the set every
+    single-excitation source carries and the legacy fallback still reads.
+    """
+    _ensure_table_props(obj)
+    old_count = drive_row_count(obj)
+    bodies, subs = [], []
+    for item in conductors:
+        body, sub = item if isinstance(item, (tuple, list)) else (item, "")
+        bodies.append(body)
+        subs.append(str(sub or ""))
+    setattr(obj, _CONDUCTORS_PROP, bodies)
+    setattr(obj, _CONDUCTOR_FACES_PROP, subs)
+    setattr(obj, _ENERGIZED_PROP, [bool(e) for e in energized])
+    for index in range(len(bodies)):
+        exc.ensure_object_props(obj, index)
+    for index in range(len(bodies), old_count):
+        exc.remove_object_props(obj, index)
+
+
+# --------------------------------------------------------------------------- #
+# Conductor cross-sections on the port plane
+# --------------------------------------------------------------------------- #
+
+def _plane_point(axis, coord, a, b):
+    """A world point at ``axis == coord`` with transverse coordinates *(a, b)*."""
+    ax_a, ax_b = _TRANSVERSE[axis]
+    d = {axis: coord, ax_a: a, ax_b: b}
+    return FreeCAD.Vector(d["x"], d["y"], d["z"])
+
+
+def _plane_face(bbox, axis, coord, pad=10.0):
+    """A bounded planar face at ``axis == coord`` covering *bbox* plus *pad* mm.
+
+    Built from four explicit corners rather than ``Part.makePlane``, whose local
+    axes are derived from the normal and do not span the transverse pair for
+    every face orientation (a y-normal plane came out degenerate).
+    """
+    import Part
+
+    ax_a, ax_b = _TRANSVERSE[axis]
+    lo = {"x": bbox.XMin, "y": bbox.YMin, "z": bbox.ZMin}
+    hi = {"x": bbox.XMax, "y": bbox.YMax, "z": bbox.ZMax}
+    a0, a1 = lo[ax_a] - pad, hi[ax_a] + pad
+    b0, b1 = lo[ax_b] - pad, hi[ax_b] + pad
+    pts = [_plane_point(axis, coord, a0, b0), _plane_point(axis, coord, a1, b0),
+           _plane_point(axis, coord, a1, b1), _plane_point(axis, coord, a0, b1)]
+    return Part.Face(Part.makePolygon(pts + [pts[0]]))
+
+
+# Tolerance for ``Face.isInside`` (mm). Small against any cell the port is
+# solved on, large against OCC's own surface tolerance.
+_INSIDE_TOL = 1.0e-7
+
+
+def _section_faces(shape, axis, coord):
+    """The cross-section faces of *shape* on the plane ``axis == coord``.
+
+    Empty when the shape does not reach the plane. Uses a boolean common with a
+    bounded plane face rather than ``Shape.slice``, so a hollow or multi-part
+    cross-section comes back as real faces whose interior can be tested.
+    """
+    if shape is None:
+        return []
+    try:
+        section = shape.common(_plane_face(shape.BoundBox, axis, coord))
+    except Exception:
+        return []
+    return list(getattr(section, "Faces", []) or [])
+
+
+def _face_interior_point(face, axis, coord):
+    """A point strictly inside *face* (world mm), or ``None``.
+
+    The centroid first -- exact and free for the convex cross-sections most
+    conductors have -- then a widening scan of the face's bounding box, because a
+    coax shield's cross-section is an annulus whose centroid lies in the *hole*,
+    i.e. in the other conductor.
+    """
+    com = face.CenterOfMass
+    if face.isInside(com, _INSIDE_TOL, True):
+        return com
+    bbox = face.BoundBox
+    ax_a, ax_b = _TRANSVERSE[axis]
+    lo = {"x": bbox.XMin, "y": bbox.YMin, "z": bbox.ZMin}
+    hi = {"x": bbox.XMax, "y": bbox.YMax, "z": bbox.ZMax}
+    for n in (5, 11, 23, 47):
+        for i in range(1, n):
+            a = lo[ax_a] + (hi[ax_a] - lo[ax_a]) * i / n
+            for j in range(1, n):
+                b = lo[ax_b] + (hi[ax_b] - lo[ax_b]) * j / n
+                point = _plane_point(axis, coord, a, b)
+                if face.isInside(point, _INSIDE_TOL, True):
+                    return point
+    return None
+
+
+def _plane_coords_mm(dom, face):
+    """Candidate section coordinates (world mm) for the *face*'s port plane.
+
+    The face plane itself first. A modal-port face carries no background gap, so
+    it sits exactly where the geometry ends and a conductor's flat end cap is
+    coplanar with it -- which sections cleanly, but leaves nothing to fall back on
+    if the body stops a hair short of the boundary. The second candidate is half a
+    cell **inward**, where the mode is actually solved (the runner nudges the
+    plane one cell in), so a conductor that does not quite reach the face is still
+    found on the plane that matters.
+    """
+    if dom is None:
+        return []
+    coord = domain_mod.face_world_coord_mm(dom, face)
+    inward = 1.0 if face.endswith("0") else -1.0
+    axis = domain_mod.face_axis(face)
+    try:
+        step = domain_mod.min_spacings_m(dom)[_AXIS_IDX[axis]] * _MM_PER_M
+    except Exception:
+        step = 0.0
+    if step <= 0.0:
+        return [coord]
+    return [coord, coord + inward * 0.5 * step, coord + inward * 1.5 * step]
+
+
+def conductor_plane_point_mm(body, dom, face, sub=None):
+    """A point inside a conductor's cross-section on *face*'s port plane (mm).
+
+    Returns ``(a, b)`` in the face's two transverse axes (solver slice order, see
+    :data:`_TRANSVERSE`) or ``None`` when nothing is found. This is what makes the
+    conductor→mode assignment deterministic: the runner reads the solved φ at this
+    point, and φ is exactly 1 V on the energized conductor.
+
+    *sub* names one of *body*'s faces (``"Face7"``, as picked in the 3D view). The
+    **cross-section region that face bounds** is the conductor -- which is what
+    lets one Part object hold several conductors, the normal case for a shield and
+    its pins padded from one sketch (three solids, sixteen faces, one ``Body``).
+    Without *sub* the largest region is taken, which is what a one-conductor body
+    means and what this did before regions existed.
+    """
+    region = _region_on_plane(body, dom, face, sub)
+    return None if region is None else region["point"]
+
+
+def _subshape(body, sub):
+    """Resolve ``body.Shape``'s named sub-element, or ``None``."""
+    shape = getattr(body, "Shape", None)
+    if shape is None or not sub:
+        return shape
+    try:
+        return shape.getElement(sub)
+    except Exception:
+        return None
+
+
+# How close a sub-element's plane-section must lie to a cross-section region to
+# count as bounding it (mm). A picked face's section lies *on* the region's
+# boundary, so this only absorbs OCC's own tolerance.
+_ON_REGION_TOL = 1.0e-4
+
+
+def _region_records(body, dom, face):
+    """Every disjoint cross-section region of *body* on *face*'s port plane.
+
+    ``[{"sub", "point", "area", "faces"}, ...]``, largest first. Each record is
+    one conductor as the mode solver sees it: ``ndimage.label`` on the plane
+    splits metal into connected components, and two solids of one Part object --
+    or one U-shaped solid -- are separate components with separate modes. So the
+    unit the port's table addresses is a *region*, not a body.
+
+    ``sub`` is the name of a face of *body* that bounds the region (``""`` if
+    none could be attributed), which is what gives the row a stable identity to
+    store and what a 3D-view pick resolves against.
+    """
+    shape = getattr(body, "Shape", None)
+    if shape is None:
+        return []
+    axis = domain_mod.face_axis(face)
+    ax_a, ax_b = _TRANSVERSE[axis]
+    for coord in _plane_coords_mm(dom, face):
+        regions = _section_faces(shape, axis, coord)
+        if not regions:
+            continue
+        # The body's own faces, sectioned once each, so every region can be
+        # attributed to one without re-cutting the solid per region.
+        cuts = []
+        for idx, bface in enumerate(shape.Faces):
+            cut = _section_edges(bface, axis, coord)
+            if cut is not None:
+                cuts.append(("Face{}".format(idx + 1), cut))
+
+        out = []
+        for sec in sorted(regions, key=lambda f: -f.Area):
+            point = _face_interior_point(sec, axis, coord)
+            if point is None:
+                continue
+            out.append({
+                "sub": _bounding_sub(sec, cuts),
+                "point": (getattr(point, ax_a), getattr(point, ax_b)),
+                "area": float(sec.Area),
+                "shape": sec,
+            })
+        if out:
+            for record in out:
+                record["count"] = len(out)
+            return out
+    return []
+
+
+def storage_sub(record):
+    """The face a row should *store* for a region record.
+
+    Empty for a body cutting the plane once: there is nothing to disambiguate,
+    and storing a face would only pin the row to a number OCC may renumber and
+    make the row read "Rod A (Face3)" where "Rod A" is the whole truth. A body
+    holding several conductors stores the face, which is the only thing telling
+    its rows apart.
+    """
+    return record["sub"] if record.get("count", 1) > 1 else ""
+
+
+def _section_edges(shape, axis, coord):
+    """*shape* cut by the plane ``axis == coord``, or ``None`` if it misses it.
+
+    Used on a single face of a solid, where the cut is a curve rather than an
+    area -- a rod's cylindrical wall meets the port plane in the circle bounding
+    that rod's cross-section.
+    """
+    try:
+        cut = shape.common(_plane_face(shape.BoundBox, axis, coord))
+    except Exception:
+        return None
+    return cut if getattr(cut, "Edges", None) else None
+
+
+def _bounding_sub(region, cuts):
+    """Name of the face in *cuts* whose plane-section bounds *region*.
+
+    *cuts* is ``[(subname, section_shape), ...]``. The winner is the one lying
+    **on** the region -- distance ~0 -- which is exactly the relation "this face
+    is part of this conductor's surface". Distance rather than a containment
+    test, because the section of a lateral face *is* the region's boundary curve
+    and boundary containment is the one case point-in-face predicates disagree
+    about. ``""`` when nothing lies on it.
+    """
+    best, best_d = "", _ON_REGION_TOL
+    for sub, cut in cuts:
+        try:
+            d = region.distToShape(cut)[0]
+        except Exception:
+            continue
+        if d < best_d:
+            best, best_d = sub, d
+    return best
+
+
+def _region_on_plane(body, dom, face, sub=None):
+    """The cross-section region of *body* that *sub* bounds (or the largest).
+
+    A picked face is matched to its region by sectioning it and taking the region
+    that section lies on, rather than by trusting the stored region order: OCC
+    renumbers faces on a geometry edit, but the face the user picked still cuts
+    the conductor they meant.
+    """
+    regions = _region_records(body, dom, face)
+    if not regions:
+        return None
+    if not sub:
+        return regions[0]
+    for record in regions:
+        if record["sub"] == sub:
+            return record
+    # The stored subname no longer attributes to the same region (a renumbered
+    # or reshaped body): re-derive from the picked face's own section.
+    axis = domain_mod.face_axis(face)
+    picked = _subshape(body, sub)
+    if picked is None:
+        return None
+    for coord in _plane_coords_mm(dom, face):
+        cut = _section_edges(picked, axis, coord)
+        if cut is None:
+            continue
+        best, best_d = None, None
+        for record in regions:
+            try:
+                d = record["shape"].distToShape(cut)[0]
+            except Exception:
+                continue
+            if best_d is None or d < best_d:
+                best, best_d = record, d
+        if best is not None and best_d is not None and best_d <= _ON_REGION_TOL:
+            return best
+    return None
+
+
+def _solve_region_rect_mm(dom, face, bounds_sel):
+    """The in-plane rect the mode solve grounds the edge of (world mm), or None.
+
+    ``mode_solver`` pins φ=0 on the edge of the region it solves, which is the
+    ``bounds`` sub-rect when one is given and otherwise **the whole grid plane --
+    PML padding included**, not the inner domain box. The distinction decides
+    whether an outer shield is the grounded reference or a signal conductor with
+    a mode of its own: with an absorber on the transverse faces the shield stops
+    short of the grid edge and the solver gives it a mode. Reading the Domain's
+    padded node arrays is what keeps this panel's answer the solver's answer.
+    """
+    rect = _bounds_rect_mm(dom, face, bounds_sel)
+    if rect is not None:
+        return rect
+    if dom is None:
+        return None
+    ax_a, ax_b = _TRANSVERSE[domain_mod.face_axis(face)]
+    nodes = dict(zip(("x", "y", "z"), domain_mod.node_coords_mm(dom)))
+    na, nb = nodes.get(ax_a) or [], nodes.get(ax_b) or []
+    if len(na) >= 2 and len(nb) >= 2:
+        return (na[0], na[-1], nb[0], nb[-1])
+    # No node arrays yet (the domain has never been recomputed with geometry):
+    # the inner box is the best available guess.
+    if (dom.DomainMax - dom.DomainMin).Length <= 1.0e-9:
+        return None
+    lo = {"x": dom.DomainMin.x, "y": dom.DomainMin.y, "z": dom.DomainMin.z}
+    hi = {"x": dom.DomainMax.x, "y": dom.DomainMax.y, "z": dom.DomainMax.z}
+    return (lo[ax_a], hi[ax_a], lo[ax_b], hi[ax_b])
+
+
+def _section_touches_rect(faces, axis, rect, tol):
+    """True if any of *faces* reaches the in-plane rect ``(a0, a1, b0, b1)`` edge.
+
+    Mirrors what ``mode_solver._classify_conductors`` does with
+    ``boundary='ground'``: a conductor touching the solve region's edge joins the
+    grounded shield and gets **no mode of its own**. Advisory here -- it drives
+    the table's "reference" hint, not a refusal.
+    """
+    if rect is None:
+        return False
+    ax_a, ax_b = _TRANSVERSE[axis]
+    a0, a1, b0, b1 = rect
+    for sec in faces:
+        bbox = sec.BoundBox
+        lo = {"x": bbox.XMin, "y": bbox.YMin, "z": bbox.ZMin}
+        hi = {"x": bbox.XMax, "y": bbox.YMax, "z": bbox.ZMax}
+        if (lo[ax_a] <= a0 + tol or hi[ax_a] >= a1 - tol
+                or lo[ax_b] <= b0 + tol or hi[ax_b] >= b1 - tol):
+            return True
+    return False
+
+
+def conductors_on_face(sim, dom, face, bounds_sel=None):
+    """Every conductor the port plane cuts, one record per **cross-section region**.
+
+    ``[{"body", "sub", "name", "point", "area", "reference"}, ...]`` -- the
+    candidate rows of a port's conductor table. A region, not a body, because
+    that is the unit the mode solver works in: it labels connected components of
+    metal on the plane, so three solids padded from one sketch into a single
+    ``Body`` are three conductors with three modes, and a body-per-row table
+    could not name two of them. ``sub`` is a face of the body bounding the
+    region, the same thing a 3D-view pick yields.
+
+    ``reference`` flags the regions touching the solve region's edge -- the
+    grounded shield, which ``mode_solver._classify_conductors`` gives no mode of
+    its own.
+
+    **Signal conductors come first**, largest cross-section leading, with the
+    reference ones after them. Row 0 therefore lands on a conductor that actually
+    has a mode, which matters because row 0's waveform properties are the ones a
+    single-drive port already carried: a legacy port opened in the new panel finds
+    its own excitation on a signal conductor rather than on the shield.
+    """
+    from wavesim_gui import materials as materials_mod
+
+    axis = domain_mod.face_axis(face)
+    rect = _solve_region_rect_mm(dom, face, bounds_sel)
+    try:
+        tol = max(domain_mod.min_spacings_m(dom)) * _MM_PER_M if dom else 0.0
+    except Exception:
+        tol = 0.0
+
+    out = []
+    for body, _name, _volts in materials_mod.conductors(sim):
+        for record in _region_records(body, dom, face):
+            sub = storage_sub(record)
+            out.append({
+                "body": body,
+                "sub": sub,
+                "name": region_name(body, sub, record["count"]),
+                "point": record["point"],
+                "area": record["area"],
+                "reference": _section_touches_rect(
+                    [record["shape"]], axis, rect, tol),
+            })
+    out.sort(key=lambda r: (bool(r["reference"]), -r["area"]))
+    return out
+
+
+def region_name(body, sub, region_count=1):
+    """Human name of one conductor region: the body's Label, plus its face.
+
+    A body cutting the plane once is just its Label -- the overwhelmingly common
+    case, and what keeps a one-conductor-per-body document's port names, Results
+    groups and mode labels exactly what they were. Only a body holding several
+    conductors needs the face to tell them apart.
+    """
+    label = str(getattr(body, "Label", None) or getattr(body, "Name", "?"))
+    if region_count <= 1 or not sub:
+        return label
+    return "{} ({})".format(label, sub)
 
 
 def _face_corners(mn, mx, face, rect=None):
@@ -559,6 +1125,7 @@ def modal_port_spec(obj, origin_m):
     position = world_mm / _MM_PER_M - origin_m[_AXIS_IDX[axis]]
     spec = {
         "name": str(obj.Label or obj.Name),
+        "port": str(obj.Label or obj.Name),
         "normal": axis,
         "position": position,
         "face": face,
@@ -567,6 +1134,73 @@ def modal_port_spec(obj, origin_m):
     }
     _add_bounds_spec(spec, dom, face, axis, getattr(obj, "BoundsSel", None), origin_m)
     return spec
+
+
+def modal_port_specs(obj, origin_m):
+    """Every ``job.json`` ``modal_ports`` entry for *obj* -- **one per drive row**.
+
+    A port whose conductor table is empty yields the single legacy entry
+    :func:`modal_port_spec` builds, unchanged. A port with a table yields one
+    entry per row, all sharing the plane (``normal``/``position``/``face``/
+    ``bounds``) and differing in:
+
+    * ``name`` -- ``"<port> (<conductor>)"``, so each row's V(t)/I(t) series and
+      Results group name it. ``port`` carries the owning object's label on every
+      entry, which is what groups them back into one plane.
+    * ``conductor_point`` -- ``[a, b]`` in solver metres, transverse slice order:
+      a point inside that row's conductor, where the runner reads φ to find the
+      row's mode (see the conductor-table notes above).
+    * ``excitation`` -- the row's own waveform. An **unenergized** row still emits
+      one, with ``amplitude`` forced to 0: it is then a pure absorber, which is
+      the whole point of listing it (its mode would otherwise reflect off a face
+      that carries no PML).
+
+    Rows whose conductor no longer reaches the port plane are dropped with a
+    console warning rather than emitted pointing nowhere -- the runner would fall
+    back to the dominant mode and drive the wrong conductor silently.
+    """
+    base = modal_port_spec(obj, origin_m)
+    rows = drive_rows(obj)
+    if not rows:
+        return [base]
+
+    sim = active_simulation(obj.Document)
+    dom = domain_mod.find_domain(sim) if sim else None
+    face = str(obj.Face)
+    axis = domain_mod.face_axis(face)
+    ax_a, ax_b = _TRANSVERSE[axis]
+    ia, ib = _AXIS_IDX[ax_a], _AXIS_IDX[ax_b]
+
+    specs = []
+    for body, sub, energized, index in rows:
+        point = conductor_plane_point_mm(body, dom, face, sub)
+        label = region_name(body, sub, 2 if sub else 1)
+        if point is None:
+            FreeCAD.Console.PrintWarning(
+                "Wavesim: modal port '{}' lists conductor '{}', which does not "
+                "reach the {} plane; skipping that drive.\n".format(
+                    base["name"], label, face)
+            )
+            continue
+        spec = dict(base)
+        # An em dash, not parentheses: a conductor of a multi-conductor body is
+        # already named "Body (Face13)", and nesting that reads as noise.
+        spec["name"] = "{} — {}".format(base["name"], label)
+        spec["conductor"] = label
+        # The point is the authority; leave the legacy label at 0 so a point
+        # matching no solved mode falls back to the dominant one rather than to
+        # a number that was chosen for a different conductor.
+        spec["conductor_id"] = 0
+        spec["conductor_point"] = [
+            point[0] / _MM_PER_M - origin_m[ia],
+            point[1] / _MM_PER_M - origin_m[ib],
+        ]
+        excitation = exc.spec_from_object(obj, index)
+        if not energized:
+            excitation = dict(excitation, amplitude=0.0)
+        spec["excitation"] = excitation
+        specs.append(spec)
+    return specs or [base]
 
 
 def _add_bounds_spec(spec, dom, face, axis, bounds_sel, origin_m):
@@ -593,7 +1227,9 @@ def _describe(obj):
     """Short human label, e.g. ``z0, Gaussian Pulse @ 30 GHz``.
 
     Waveform mode uses the simulation's frequency unit (the rectangular pulse has
-    no frequency); SPICE mode names the linked netlist file instead.
+    no frequency); SPICE mode names the linked netlist file instead. A port
+    driving several conductors names the count instead of one row's waveform --
+    there is no single waveform to name.
     """
     face = str(getattr(obj, "Face", "z0"))
     if excitation_mode(obj) == MODE_SPICE:
@@ -601,6 +1237,17 @@ def _describe(obj):
         return "{}, {}".format(face, spice_mod._netlist_name(obj))
     doc = getattr(obj, "Document", None)
     sim = active_simulation(doc) if doc is not None else None
+    rows = drive_rows(obj)
+    driven = [row for row in rows if row[2]]
+    if len(driven) > 1:
+        return "{}, {} conductors driven".format(face, len(driven))
+    if len(driven) == 1:
+        body, sub, _energized, index = driven[0]
+        return "{}, {}, {}".format(
+            face, region_name(body, sub, 2 if sub else 1),
+            exc.excitation_label(obj, sim, index))
+    if rows:
+        return "{}, terminating {} conductors".format(face, len(rows))
     return "{}, {}".format(face, exc.excitation_label(obj, sim))
 
 
@@ -830,19 +1477,34 @@ if _GUI_AVAILABLE:
         __getstate__ = dumps
         __setstate__ = loads
 
-    class TaskModalPortPanel(source_mod.ExcitationParamsMixin):
-        """Task panel to edit a modal port: face, energized conductor and drive.
+    class TaskModalPortPanel:
+        """Task panel to edit a modal port: face, conductor table and drive.
 
         The **Drive** combo picks how the port is excited — a temporal waveform
-        (the excitation widgets, driving the modal impedance sheet) or an external
+        (the conductor table, driving the modal impedance sheets) or an external
         SPICE circuit (netlist + port nodes) — showing one control group at a
         time. "Inject fields" belongs to the SPICE drive only and rides in its
         container: a modal sheet is inherently one-way and has no such choice.
+
+        **The conductor table** is the waveform drive. One row per conductor the
+        port terminates, listing which to energize, with what waveform and at
+        what amplitude; the launch is their superposition,
+        ``Σ a_i·f_i(t)·mode_i``. Rows are filled in from the geometry (every PEC
+        body whose cross-section the port plane cuts, the grounded shield
+        excluded — it carries no mode of its own) and can be added from a 3D-view
+        selection. Selecting a row expands that row's remaining waveform
+        parameters below the table; family and amplitude stay in the row itself.
+        A port on a plane with no PEC geometry yet keeps a single "whole face"
+        row driving the dominant mode, which is what such a port always did.
+
         "Compute Mode" solves and visualises *this* port's mode now (out of
         process, no FDTD, nothing saved); OK commits the port and leaves the mode
         for the main Run. Cancel removes a freshly-created port so it leaves no
         trace.
         """
+
+        # Conductor-table columns.
+        _COL_CONDUCTOR, _COL_DRIVE, _COL_WAVEFORM, _COL_AMPLITUDE = range(4)
 
         def __init__(self, obj, created=False):
             try:
@@ -873,16 +1535,16 @@ if _GUI_AVAILABLE:
                                        _FIELDS_LABELS[0])
             )
 
-            # Which solved mode to launch, by energized-conductor label. 0 means
-            # the dominant (first) mode; other values match the "conductor N"
-            # modes Compute Mode plots.
+            # Legacy fallback: which solved mode to launch, by the solver's own
+            # conductor label. Only reachable for a port whose plane carries no
+            # PEC geometry to build a table from -- with a table the conductor is
+            # picked by identity, not by a number assigned after the fact.
             self._conductor = QtWidgets.QSpinBox()
             self._conductor.setRange(0, 999)
             self._conductor.setSpecialValueText("Dominant (first mode)")
             self._conductor.setValue(int(getattr(obj, "Conductor", 0)))
 
             layout.addRow("Port face:", self._face)
-            layout.addRow("Energize conductor:", self._conductor)
 
             # Optional in-plane bounds: pick an edge/face whose bounding box
             # confines the mode solve to a sub-rectangle of the port face.
@@ -910,12 +1572,12 @@ if _GUI_AVAILABLE:
             )
             layout.addRow("Drive:", self._mode)
 
-            # Waveform container: the excitation combo + parameter rows + preview
-            # button (shared with the point-source panel), inside its own form.
+            # Waveform container: the conductor table (one drive per row) plus
+            # the selected row's remaining waveform parameters.
             self._wave_widget = QtWidgets.QWidget()
             wave_form = QtWidgets.QFormLayout(self._wave_widget)
             wave_form.setContentsMargins(0, 0, 0, 0)
-            self.build_excitation_ui(wave_form, QtWidgets)
+            self._build_conductor_ui(wave_form, QtWidgets)
             layout.addRow(self._wave_widget)
 
             # SPICE container: netlist path + the two port node names.
@@ -971,10 +1633,22 @@ if _GUI_AVAILABLE:
                 "same conductor geometry, so with the Simulation's 'Conformal "
                 "(cut-cell) PEC' on it is the conformal Z₀, not the staircased "
                 "one (they differ by several percent on a round conductor). "
-                "With several conductors on the face (e.g. two coax cross-sections), "
-                "Compute Mode plots one mode per signal conductor (pick between "
-                "them in the plot window) — set 'Energize conductor' to that "
-                "conductor's N to drive it (0 launches the dominant mode). "
+                "With several conductors on the face, the table lists one row per "
+                "conductor the port terminates: tick 'Drive' and give each its own "
+                "waveform and amplitude, and the port launches their superposition "
+                "(a₁·f₁(t)·mode₁ + a₂·f₂(t)·mode₂ + …) as one impedance sheet per "
+                "mode summed on the face. Each driven row records its own V(t)/I(t), "
+                "so an S-matrix follows. Rows are matched to modes by a point inside "
+                "each conductor's cross-section, so which conductor a row drives is "
+                "fixed by the geometry and does not depend on running a mode solve "
+                "first. Leave a row unticked to terminate its mode without "
+                "launching it — do list it, because a mode with no sheet has no "
+                "absorber on this face and reflects. A row is one **cross-section "
+                "region**, not one body: a single Part object padded from one "
+                "sketch can hold a shield and two pins, which are three separate "
+                "conductors here. The table fills itself in from the geometry; to "
+                "name a particular one, select a face of it that the port plane "
+                "crosses and press 'Add selected face'. "
                 "Optionally select an edge/face to confine the mode solve to its "
                 "in-plane bounding box (e.g. a single connector's cross-section on "
                 "a shared plane); Clear restores the whole face. "
@@ -1004,6 +1678,420 @@ if _GUI_AVAILABLE:
         def _live_face(self, *_):
             self.obj.Face = self._selected_face()
             self.obj.Document.recompute()
+            # The table is per plane: a different face cuts different conductors.
+            self._refresh_conductors()
+
+        # ------------------------------------------------------------------ #
+        # Conductor table
+        # ------------------------------------------------------------------ #
+
+        def _build_conductor_ui(self, layout, QtWidgets):
+            """Build the conductor table, its buttons and the row-detail area."""
+            self._QtWidgets = QtWidgets
+            # One entry per table row: {"body", "energized", "editor", "page",
+            # "combo", "amp"}. ``body`` is None for the single "whole face" row a
+            # port with no PEC geometry on its plane falls back to.
+            self._rows = []
+
+            self._table = QtWidgets.QTableWidget(0, 4)
+            self._table.setHorizontalHeaderLabels(
+                ["Conductor", "Drive", "Waveform", "Amplitude"])
+            self._table.verticalHeader().setVisible(False)
+            self._table.setSelectionBehavior(
+                QtWidgets.QAbstractItemView.SelectRows)
+            self._table.setSelectionMode(
+                QtWidgets.QAbstractItemView.SingleSelection)
+            self._table.setEditTriggers(
+                QtWidgets.QAbstractItemView.NoEditTriggers)
+            header = self._table.horizontalHeader()
+            header.setStretchLastSection(False)
+            header.setSectionResizeMode(
+                self._COL_CONDUCTOR, QtWidgets.QHeaderView.Stretch)
+            for col in (self._COL_DRIVE, self._COL_WAVEFORM,
+                        self._COL_AMPLITUDE):
+                header.setSectionResizeMode(
+                    col, QtWidgets.QHeaderView.ResizeToContents)
+            self._table.setMinimumHeight(120)
+            layout.addRow(self._table)
+
+            buttons = QtWidgets.QWidget()
+            blay = QtWidgets.QHBoxLayout(buttons)
+            blay.setContentsMargins(0, 0, 0, 0)
+            self._btn_refresh = QtWidgets.QPushButton("Refresh from geometry")
+            self._btn_add = QtWidgets.QPushButton("Add selected face")
+            self._btn_add.setToolTip(
+                "Add the conductor bounded by the face(s) selected in the 3D "
+                "view. Pick a face the port plane crosses — that is how one "
+                "conductor of a body holding several (a shield and its pins "
+                "padded from one sketch) is named.")
+            self._btn_remove = QtWidgets.QPushButton("Remove")
+            for btn in (self._btn_refresh, self._btn_add, self._btn_remove):
+                blay.addWidget(btn)
+            layout.addRow(buttons)
+            self._btn_refresh.clicked.connect(self._refresh_conductors)
+            self._btn_add.clicked.connect(self._add_from_selection)
+            self._btn_remove.clicked.connect(self._remove_row)
+
+            self._table_hint = QtWidgets.QLabel("")
+            self._table_hint.setWordWrap(True)
+            layout.addRow(self._table_hint)
+
+            # Legacy fallback row, shown only while the table has no conductor.
+            self._conductor_row_label = QtWidgets.QLabel("Energize conductor:")
+            layout.addRow(self._conductor_row_label, self._conductor)
+
+            # The selected row's remaining waveform parameters (family and
+            # amplitude live in the row itself), one page per row.
+            self._detail = QtWidgets.QStackedWidget()
+            layout.addRow(self._detail)
+
+            self._table.itemSelectionChanged.connect(self._on_row_selected)
+            self._load_rows()
+
+        def _stored_rows(self):
+            """The rows to open the panel with: the port's table, or a fresh one.
+
+            A port that already carries a table keeps it verbatim -- reopening the
+            panel must not silently re-pick conductors. One that does not (a new
+            port, or one saved before the table existed) is filled in from the
+            geometry, energizing the largest signal conductor and carrying that
+            port's existing waveform on it (row 0's properties *are* the ones a
+            single-drive port already had). With no PEC geometry on the plane,
+            one bodiless "whole face" row, which behaves exactly as the port did
+            before this table existed.
+            """
+            # Scanned either way: even a stored table wants the reference-
+            # conductor hint, which only the scan knows.
+            found = self._face_conductors()
+            rows = drive_rows(self.obj)
+            if rows:
+                return [{"body": body, "sub": sub, "energized": energized}
+                        for body, sub, energized, _index in rows]
+            if not found:
+                return [{"body": None, "sub": "", "energized": True}]
+            return [{"body": r["body"], "sub": r["sub"], "energized": i == 0}
+                    for i, r in enumerate(found)]
+
+        def _face_conductors(self):
+            """``conductors_on_face`` for the currently selected face, minus the
+            reference ones (which carry no mode of their own).
+
+            Sets ``_reference_names`` as a side effect, for the panel's hint.
+            """
+            sim = active_simulation(self.obj.Document)
+            dom = domain_mod.find_domain(sim) if sim else None
+            try:
+                found = conductors_on_face(
+                    sim, dom, self._selected_face(),
+                    getattr(self.obj, "BoundsSel", None))
+            except Exception as exc_:
+                FreeCAD.Console.PrintWarning(
+                    "Wavesim: could not section the port plane: {}\n".format(exc_))
+                return []
+            self._reference_names = [r["name"] for r in found if r["reference"]]
+            self._scan = {(id(r["body"]), r["sub"]): r for r in found}
+            return [r for r in found if not r["reference"]]
+
+        def _load_rows(self, rows=None):
+            """(Re)build the table and the per-row editors from *rows*."""
+            from PySide import QtCore
+
+            QtWidgets = self._QtWidgets
+            if rows is None:
+                self._reference_names = []
+                rows = self._stored_rows()
+
+            sim = active_simulation(self.obj.Document)
+            self._table.blockSignals(True)
+            self._table.setRowCount(0)
+            while self._detail.count():
+                page = self._detail.widget(0)
+                self._detail.removeWidget(page)
+                page.deleteLater()
+            self._rows = []
+
+            for index, row in enumerate(rows):
+                body = row.get("body")
+                sub = row.get("sub", "")
+                energized = bool(row.get("energized", True))
+                self._table.insertRow(index)
+
+                label = (region_name(body, sub, 2 if sub else 1)
+                         if body is not None else "Whole face (dominant mode)")
+                item = QtWidgets.QTableWidgetItem(label)
+                item.setToolTip(self._row_tooltip(body, sub))
+                self._table.setItem(index, self._COL_CONDUCTOR, item)
+
+                check = QtWidgets.QCheckBox()
+                check.setChecked(energized)
+                # A bare checkbox in a cell hugs its left edge; centre it in a
+                # holder so the column reads as a column.
+                holder = QtWidgets.QWidget()
+                hlay = QtWidgets.QHBoxLayout(holder)
+                hlay.setContentsMargins(0, 0, 0, 0)
+                hlay.setAlignment(QtCore.Qt.AlignCenter)
+                hlay.addWidget(check)
+                self._table.setCellWidget(index, self._COL_DRIVE, holder)
+
+                combo = QtWidgets.QComboBox()
+                combo.addItems(_EXCITATIONS)
+                combo.setCurrentText(
+                    str(getattr(self.obj, exc.excitation_prop(index),
+                                _EXCITATIONS[0]))
+                )
+                self._table.setCellWidget(index, self._COL_WAVEFORM, combo)
+
+                amp = QtWidgets.QDoubleSpinBox()
+                amp.setRange(-1.0e9, 1.0e9)
+                amp.setDecimals(4)
+                amp.setSingleStep(0.1)
+                amp.setValue(float(getattr(
+                    self.obj, exc.prop_for_key("amplitude", index),
+                    exc.ALL_PARAMS["amplitude"][1])))
+                amp.setToolTip(
+                    "Launched forward-wave voltage for this conductor's mode. "
+                    "The solver calibrates the sheet so this is volts on any "
+                    "grid; the port's total launch is the sum over driven rows.")
+                self._table.setCellWidget(index, self._COL_AMPLITUDE, amp)
+
+                # This row's remaining waveform parameters, below the table.
+                page = QtWidgets.QWidget()
+                page_form = QtWidgets.QFormLayout(page)
+                page_form.setContentsMargins(0, 0, 0, 0)
+                editor = source_mod.ExcitationEditor(
+                    self.obj, index, page_form, QtWidgets, sim,
+                    combo=combo, exclude={"amplitude"},
+                )
+                editor.rebuild_params()
+                self._detail.addWidget(page)
+
+                entry = {"body": body, "sub": sub, "check": check,
+                         "combo": combo, "amp": amp, "editor": editor,
+                         "page": page}
+                self._rows.append(entry)
+
+                combo.currentTextChanged.connect(
+                    lambda _t, e=editor: e.rebuild_params())
+                amp.valueChanged.connect(
+                    lambda v, e=editor: e.set_param("amplitude", v))
+                check.toggled.connect(self._on_drive_toggled)
+                editor.set_param("amplitude", amp.value())
+
+            self._table.blockSignals(False)
+            if self._rows:
+                self._table.selectRow(0)
+            self._sync_table_state()
+
+        def _row_tooltip(self, body, sub):
+            """What this row's conductor is, in the plane's own terms.
+
+            The cross-section's area and centre, because a body holding several
+            conductors names its rows by face number and "Face7" says nothing
+            about which pin that is; the in-plane position does.
+            """
+            if body is None:
+                return ("No PEC body was found crossing this port plane, so the "
+                        "port drives the solver's dominant mode as before.")
+            base = ("The port terminates this conductor's mode. Tick 'Drive' to "
+                    "launch it as well.")
+            record = getattr(self, "_scan", {}).get((id(body), sub))
+            if record is None:
+                return base
+            ax_a, ax_b = _TRANSVERSE[domain_mod.face_axis(self._selected_face())]
+            return ("{}\n\nCross-section {:.4g} mm² at {} = {:.4g} mm, "
+                    "{} = {:.4g} mm.".format(
+                        base, record["area"], ax_a, record["point"][0],
+                        ax_b, record["point"][1]))
+
+        def _on_drive_toggled(self, *_):
+            self._sync_table_state()
+
+        def _sync_table_state(self):
+            """Enable/disable per-row widgets and refresh the hint text."""
+            has_body = any(r["body"] is not None for r in self._rows)
+            self._conductor_row_label.setVisible(not has_body)
+            self._conductor.setVisible(not has_body)
+            self._btn_remove.setEnabled(has_body and len(self._rows) > 1)
+            for entry in self._rows:
+                driven = entry["check"].isChecked()
+                # An undriven row is a pure absorber: it still terminates its
+                # mode (which is why it is listed), but its waveform is unused.
+                entry["combo"].setEnabled(driven)
+                entry["amp"].setEnabled(driven)
+                entry["page"].setEnabled(driven)
+
+            bits = []
+            driven = [e for e in self._rows if e["check"].isChecked()]
+            if len(driven) > 1:
+                bits.append(
+                    "The port launches the superposition of the {} driven modes "
+                    "(one impedance sheet each, summed on the face)."
+                    .format(len(driven)))
+            elif not driven:
+                bits.append(
+                    "No row is driven: this port is a pure absorber, "
+                    "terminating every listed conductor's mode.")
+            undriven = len(self._rows) - len(driven)
+            if undriven and has_body:
+                bits.append(
+                    "{} listed but undriven conductor(s) are still terminated — "
+                    "an unlisted mode has no absorber on this face and would "
+                    "reflect.".format(undriven))
+            refs = getattr(self, "_reference_names", None)
+            if refs:
+                bits.append(
+                    "Reference (ground) on this plane: {} — it touches the solve "
+                    "region's edge, so it carries no mode of its own."
+                    .format(", ".join(refs)))
+            self._table_hint.setText(" ".join(bits))
+
+        def _on_row_selected(self, *_):
+            row = self._table.currentRow()
+            if 0 <= row < self._detail.count():
+                self._detail.setCurrentIndex(row)
+
+        def _refresh_conductors(self, *_):
+            """Re-scan the port plane and rebuild the table from the geometry.
+
+            Keeps each surviving conductor's Drive tick, so re-scanning after a
+            geometry edit does not silently un-energize the port.
+            """
+            if not hasattr(self, "_table"):
+                return
+            driven = {(id(r["body"]), r["sub"]): r["check"].isChecked()
+                      for r in self._rows if r["body"] is not None}
+            found = self._face_conductors()
+            if not found:
+                self._load_rows([{"body": None, "sub": "", "energized": True}])
+                return
+            rows = []
+            for i, record in enumerate(found):
+                key = (id(record["body"]), record["sub"])
+                energized = driven.get(key, i == 0 and not driven)
+                rows.append({"body": record["body"], "sub": record["sub"],
+                             "energized": energized})
+            self._load_rows(rows)
+
+        def _add_from_selection(self, *_):
+            """Append a row for each conductor **face** selected in the 3D view.
+
+            The way to name one conductor of a body that holds several: pick a
+            face of it that the port plane crosses (a pin's cylindrical wall, a
+            trace's side) and the row is the cross-section region that face
+            bounds -- not the whole body, whose plane-section may be three
+            disjoint conductors. Selecting the body with no face named still
+            works and means its largest region.
+
+            Also the escape hatch from the automatic scan: a region it skipped
+            (one wrongly read as the grounded reference, or a body only just
+            assigned to a PEC material) can be added by hand. Anything not PEC,
+            or not reaching the port plane, is refused with a reason rather than
+            added as a row that would match no mode.
+            """
+            from wavesim_gui import materials as materials_mod
+
+            QtWidgets = self._QtWidgets
+            sim = active_simulation(self.obj.Document)
+            dom = domain_mod.find_domain(sim) if sim else None
+            face = self._selected_face()
+            pec_bodies = {id(b) for b, _n, _v in materials_mod.conductors(sim)}
+            known = {(id(r["body"]), r["sub"])
+                     for r in self._rows if r["body"] is not None}
+            known_points = {r["point"] for r in
+                            (getattr(self, "_scan", {}) or {}).values()
+                            if (id(r["body"]), r["sub"]) in known}
+            rows = [{"body": r["body"], "sub": r["sub"],
+                     "energized": r["check"].isChecked()}
+                    for r in self._rows if r["body"] is not None]
+            added, not_pec, missed, dup = [], [], [], []
+            for sel in Gui.Selection.getSelectionEx():
+                body = sel.Object
+                if body is None:
+                    continue
+                label = str(getattr(body, "Label", "?"))
+                if id(body) not in pec_bodies:
+                    not_pec.append(label)
+                    continue
+                # One row per picked face; a bare body pick means its largest
+                # region, as a single-conductor body always did.
+                picks = [n for n in (getattr(sel, "SubElementNames", []) or [])
+                         if n.startswith("Face")] or [""]
+                for sub in picks:
+                    if (id(body), sub) in known:
+                        dup.append(conductor_label(body, sub))
+                        continue
+                    region = _region_on_plane(body, dom, face, sub)
+                    if region is None:
+                        missed.append(conductor_label(body, sub))
+                        continue
+                    # Store the face only when the body holds several conductors
+                    # -- otherwise the row is just the body, as it always was.
+                    keep = storage_sub(region)
+                    name = region_name(body, keep, region["count"])
+                    # A *different* face of a conductor already listed resolves
+                    # to the same region; adding it again would drive that mode
+                    # twice on one plane.
+                    if (id(body), keep) in known \
+                            or region["point"] in known_points:
+                        dup.append(name)
+                        continue
+                    known.add((id(body), sub))
+                    known.add((id(body), keep))
+                    known_points.add(region["point"])
+                    rows.append({"body": body, "sub": keep, "energized": True})
+                    added.append(name)
+            if not added:
+                why = []
+                if not_pec:
+                    why.append("Not assigned to a PEC material: {}.".format(
+                        ", ".join(not_pec)))
+                if missed:
+                    why.append("Do not reach the {} plane: {}.".format(
+                        face, ", ".join(missed)))
+                if dup:
+                    why.append("Already in the table (the same conductor): "
+                               "{}.".format(", ".join(dup)))
+                QtWidgets.QMessageBox.information(
+                    self.form, "Wavesim Modal Port",
+                    "Select a conductor face crossing the port plane in the 3D "
+                    "view first.\n\n"
+                    + (" ".join(why) if why else "Nothing new was selected."),
+                )
+                return
+            self._load_rows(rows)
+
+        def _remove_row(self, *_):
+            """Drop the selected conductor row."""
+            row = self._table.currentRow()
+            if row < 0 or len(self._rows) <= 1:
+                return
+            rows = [{"body": r["body"], "sub": r["sub"],
+                     "energized": r["check"].isChecked()}
+                    for i, r in enumerate(self._rows) if i != row]
+            self._load_rows(rows)
+
+        def _write_conductor_table(self, obj):
+            """Persist the table (conductors, drive flags, per-row waveforms).
+
+            Call inside an open transaction. A table of bodiless rows clears the
+            stored one, which is what puts the port back on the legacy single
+            drive that :func:`drive_rows` answers ``[]`` for.
+            """
+            bodies = [(r["body"], r["sub"])
+                      for r in self._rows if r["body"] is not None]
+            flags = [r["check"].isChecked()
+                     for r in self._rows if r["body"] is not None]
+            if bodies:
+                set_drive_rows(obj, bodies, flags)
+            else:
+                set_drive_rows(obj, [], [])
+                obj.Conductor = int(self._conductor.value())
+            # Each row's waveform. The properties must exist before the editor
+            # writes them, and only ``set_drive_rows`` above has added them for
+            # the rows that are staying.
+            for index, entry in enumerate(self._rows):
+                exc.ensure_object_props(obj, index)
+                entry["editor"].write(obj)
 
         def _pick_bounds(self, *_):
             """Set BoundsSel from the first edge/face in the current selection."""
@@ -1058,11 +2146,13 @@ if _GUI_AVAILABLE:
             self.obj.Face = face
             self.obj.BoundsSel = new_bounds
             self.obj.Fields = _FIELDS_TOKEN[self._fields.currentText()]
-            self.obj.Conductor = int(self._conductor.value())
             self.obj.ExcitationMode = self._selected_mode()
             # Persist both drives' inputs (only the active one is read at run
             # time) so toggling the mode back and forth keeps what was entered.
-            self.write_excitation(self.obj)
+            # The table owns Conductor too: it writes the legacy label only for a
+            # bodiless ("whole face") table, which is the one case it still means
+            # anything.
+            self._write_conductor_table(self.obj)
             self.obj.Netlist = self._netlist.text().strip()
             self.obj.NodePlus = self._node_plus.text().strip() or "port1p"
             self.obj.NodeMinus = self._node_minus.text().strip() or "0"
@@ -1122,19 +2212,25 @@ if _GUI_AVAILABLE:
         """Cut a job *spec* down to the single mode-solved port *port_obj*.
 
         "Compute Mode" previews one port, so the other ports' (expensive) mode
-        solves have nothing to do here. Ports are matched on the ``name`` their
-        ``*_spec`` writes -- the object's label, the same key the runner echoes
-        into ``summary["modes"]``. Returns ``False`` when *port_obj* has no entry
-        in the job at all.
+        solves have nothing to do here. Ports are matched on the ``port`` key
+        their ``*_spec`` writes -- the owning object's label, which every drive
+        row of a multi-conductor port shares (its ``name`` is per row) and which
+        the runner echoes into ``summary["modes"]``. A legacy job entry carrying
+        no ``port`` key falls back to its ``name``. Returns ``False`` when
+        *port_obj* has no entry in the job at all.
 
         *arrays* is accepted (and left alone) so the signature survives: the mode
         is solved on the run's own grid, so ``materials.npz`` carries nothing
         port-specific to prune.
         """
         name = str(getattr(port_obj, "Label", "") or getattr(port_obj, "Name", ""))
-        modal = [t for t in spec.get("modal_ports") or [] if t.get("name") == name]
+
+        def _owns(entry):
+            return (entry.get("port") or entry.get("name")) == name
+
+        modal = [t for t in spec.get("modal_ports") or [] if _owns(t)]
         spice = [p for p in spec.get("spice_ports") or []
-                 if p.get("kind") == "tem" and p.get("name") == name]
+                 if p.get("kind") == "tem" and _owns(p)]
         if not modal and not spice:
             return False
         spec["modal_ports"] = modal

@@ -804,9 +804,15 @@ def build_results(doc, sim, workdir, summary):
             )
             if key + "_phi" not in keys:
                 continue
-            cond = meta.get("conductor_id", "?")
             port_name = str(meta.get("name", "port"))
-            name = "{} mode (conductor {})".format(port_name, cond)
+            # Name the conductor the way the user does when the port's table
+            # picked it; the solver's raster-order label is what is left when
+            # nothing named it (a legacy port, or a mode no row claimed).
+            cond = meta.get("conductor") if meta.get("driven") else None
+            name = "{} mode ({})".format(
+                port_name,
+                cond if cond else
+                "conductor {}".format(meta.get("conductor_id", "?")))
             leaf = _new_leaf(name, _KIND_MODE, key, "",
                              parent=port_groups.get(port_name))
             _store_mode_meta(leaf, meta)
@@ -953,6 +959,11 @@ def _store_mode_meta(leaf, meta):
     _add("Normal", "App::PropertyString", str(meta.get("normal", "")))
     _add("ModePosition", "App::PropertyFloat", float(meta.get("position", 0.0)))
     _add("ConductorId", "App::PropertyInteger", int(meta.get("conductor_id", 0)))
+    # The conductor the port's table named, when one did. Empty for a legacy
+    # port and for any mode no drive row claimed -- then ConductorId, the
+    # solver's own raster-order label, is all there is.
+    _add("Conductor", "App::PropertyString",
+         str(meta.get("conductor", "") if meta.get("driven") else ""))
     _add("Ecomps", "App::PropertyString", ",".join(meta.get("Ecomps", [])))
 
     # Per-unit-length parameters may be None (params skipped / degenerate solve);
@@ -2423,6 +2434,7 @@ if _GUI_AVAILABLE:
             "axis_a": str(getattr(obj, "AxisA", "a")),
             "axis_b": str(getattr(obj, "AxisB", "b")),
             "conductor_id": int(getattr(obj, "ConductorId", 0)),
+            "conductor": str(getattr(obj, "Conductor", "")),
             "normal": str(getattr(obj, "Normal", "")),
             "position": _num("ModePosition"),
             "impedance": _num("Impedance"), "eps_eff": _num("EpsEff"),
@@ -2462,11 +2474,14 @@ if _GUI_AVAILABLE:
 
         axes = meta.get("transverse_axes", ["a", "b"])
         name = meta.get("name", "port")
+        conductor = str(meta.get("conductor", "") if meta.get("driven") else "")
         return {
-            "label": "{} — energized conductor {}".format(
-                name, meta.get("conductor_id", "?")
+            "label": "{} — energized {}".format(
+                name, conductor or "conductor {}".format(
+                    meta.get("conductor_id", "?"))
             ),
             "port_name": name,
+            "conductor": conductor,
             "phi": phi,
             "pec": _load_array(workdir, key + "_pec"),
             "Ea": Ea, "Eb": Eb,
@@ -2543,7 +2558,9 @@ if _GUI_AVAILABLE:
         cap, ind, vph = data["capacitance"], data["inductance"], data["v_phase"]
         fmax = data["fmax"]
 
-        lines = ["energized conductor {}".format(data["conductor_id"]),
+        lines = ["energized {}".format(
+                     data.get("conductor")
+                     or "conductor {}".format(data["conductor_id"])),
                  "{}-propagation @ {:.4g} mm".format(
                      data["normal"], data["position"] * 1.0e3)]
         if math.isfinite(z0):

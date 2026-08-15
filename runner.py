@@ -84,17 +84,34 @@ job.json schema (Session 2)
                        "face": "z0".."z1",      # the domain face this port
                                                 # terminates; ModalPort derives its
                                                 # ghost-H plane and sign from it
-                       "conductor_id": 0,       # which solved mode to launch:
-                                                # a conductor label (see summary
-                                                # "modes"), 0/absent = dominant
+                       "conductor_point": [a,b],# optional: a point inside the
+                                                # conductor whose mode to launch
+                                                # (solver metres, transverse slice
+                                                # order). The mode with phi ~ 1 V
+                                                # there is the one; takes priority
+                                                # over "conductor_id"
+                       "conductor_id": 0,       # legacy: which solved mode to
+                                                # launch by conductor label (see
+                                                # summary "modes"), 0/absent =
+                                                # dominant. Read only when no
+                                                # "conductor_point" is given
+                       "port": "<label>",       # optional: the owning port object;
+                                                # every drive row of one multi-
+                                                # conductor port shares it
+                       "conductor": "<label>",  # optional: that row's conductor,
+                                                # echoed into summary["modes"]
                        "bounds": [a0,a1,b0,b1], # optional in-plane subset (solver
                                                 # metres, transverse slice order);
                                                 # absent = the whole face
                        "excitation": {"type":.., ...}}, ...],
                        # A modal port face carries NO PML and NO PEC: the port is
-                       # the boundary (see "Modal ports" below). Legacy jobs name
-                       # this list "tem_sources" and may carry "direction"/"fields"
-                       # and a "mode_mesh" block; all three are ignored now.
+                       # the boundary (see "Modal ports" below). SEVERAL entries may
+                       # share one face -- that is how a multi-conductor port
+                       # launches a superposition of modes; their sheets superpose
+                       # on the ghost H plane and the plane is factorised once.
+                       # Legacy jobs name this list "tem_sources" and may carry
+                       # "direction"/"fields" and a "mode_mesh" block; all three are
+                       # ignored now.
       "gaussian_beams": [{"face":"x0".."z1", "angle_deg":.., "waist":<metres>,
                        "directional":true,
                        "excitation": {"type":.., ...}}, ...],
@@ -215,6 +232,26 @@ plane to find the TEM mode of the PEC cross-section, hands it to a
 mode's 2D field profiles into ``results.npz`` (keys ``mode_<si>_<mi>_phi`` /
 ``_pec`` / ``_E_<comp>``) with its per-unit-length parameters under
 ``summary["modes"]``.
+
+**Which mode an entry drives** is set by ``conductor_point`` when present: a
+point inside the wanted conductor's cross-section, in solver metres on the two
+transverse axes. ``mode_solver._solve_one`` pins φ to exactly 1.0 on the
+energized conductor and 0.0 on the others, so the mode with φ ~ 1 there is that
+conductor's -- an assignment fixed by the geometry, not by ``ndimage.label``'s
+raster ordering, which is what the legacy integer ``conductor_id`` (still read
+when no point is given) indexes into. A point matching no mode falls back to the
+dominant one with an stderr note.
+
+**Several entries may name one plane.** A multi-conductor port emits one entry
+per energized conductor, all on the same face; their sheets superpose on the
+shared ghost H plane (``sources._GhostPlaneGroup``), which is how the port
+launches ``Σ aᵢ·fᵢ(t)·modeᵢ``. The cross-section is factorised **once per
+distinct plane** and the solve reused across those entries. Each entry still
+saves the mode it drives as ``mode_<si>_0``, keeping a port's series and its mode
+shapes on one ``si``; modes no entry drives are saved after the ones of the
+plane's first entry, so nothing solved goes unreported. A mode entry carries
+``driven`` (True for the one its port launches) and, when the workbench named
+it, the ``conductor`` it energizes.
 
 Each port also **records its own V(t) and I(t)**, saved as ``port_<si>v_times`` /
 ``_values`` and ``port_<si>i_*`` with the port named under ``summary["ports"]``
@@ -655,12 +692,59 @@ def _crop_plane(arr, win):
     return arr[ia0:ia1, ib0:ib1]
 
 
-def _choose_mode(modes, wanted, name):
-    """Pick the mode whose energized conductor is *wanted* (0 = dominant).
+def _mode_at_point(np, modes, grid, point, name):
+    """Pick the mode that energizes the conductor containing *point*.
 
-    Falls back to the dominant (first) mode with an stderr note when no mode
-    carries the requested conductor label.
+    *point* is ``(a, b)`` in solver metres on the mode's two transverse axes --
+    the workbench's ``conductor_point``, derived from a point inside that
+    conductor's CAD cross-section. ``mode_solver._solve_one`` pins φ to **exactly
+    1.0** on the energized conductor and 0.0 on every other one, so the mode whose
+    φ is ~1 there *is* the one driving that conductor. That makes the assignment a
+    property of the geometry rather than of ``ndimage.label``'s raster ordering,
+    which is what the integer ``conductor_id`` had to be read against and why it
+    could only be chosen after looking at a solve.
+
+    ``None`` (with an stderr note) when the point lands on no conductor -- a
+    conductor that moved off the plane, or a table built against different
+    geometry -- so the caller can fall back rather than drive the wrong mode.
     """
+    axes = list(getattr(modes[0], "transverse_axes", []))
+    if len(axes) != 2:
+        return None
+    shape = np.asarray(modes[0].phi).shape
+    ia = min(max(grid.axis_index(axes[0], float(point[0])), 0), shape[0] - 1)
+    ib = min(max(grid.axis_index(axes[1], float(point[1])), 0), shape[1] - 1)
+    best, best_phi = None, 0.5   # φ is 1.0 on the energized conductor
+    for mode in modes:
+        value = float(np.asarray(mode.phi)[ia, ib])
+        if value > best_phi:
+            best, best_phi = mode, value
+    if best is None:
+        sys.stderr.write(
+            "wavesim: port '{}' points at ({:.6g}, {:.6g}) m on the plane, which "
+            "is not inside any solved signal conductor (it may be the grounded "
+            "reference, or the geometry may have moved); falling back to the "
+            "dominant mode.\n".format(name, point[0], point[1])
+        )
+    return best
+
+
+def _choose_mode(np, modes, grid, entry, name):
+    """Pick the mode an entry drives: by conductor point, else by label.
+
+    The point (``conductor_point``, written by a port's conductor table) wins
+    when present; the integer ``conductor_id`` is the legacy path for a port
+    with no table. Either way an unmatched request falls back to the dominant
+    (first) mode with an stderr note.
+    """
+    point = entry.get("conductor_point")
+    if point:
+        match = _mode_at_point(np, modes, grid, point, name)
+        if match is not None:
+            return match
+        return modes[0]
+
+    wanted = int(entry.get("conductor_id", 0))
     chosen = modes[0]
     if wanted > 0:
         match = next((m for m in modes if m.conductor_id == wanted), None)
@@ -770,6 +854,16 @@ def _solve_all_modes(ws, np, grid, job):
     any ``bounds``. There is deliberately no finer mode mesh: a ``ModalPort``'s
     profile must be a discrete null vector of *this* grid, and a Z₀ measured on a
     different mesh is not the Z₀ the run presents (see the module docstring).
+
+    **Several entries may share one plane.** A multi-conductor modal port emits
+    one entry per energized conductor, all on the same face, whose sheets
+    superpose there. The cross-section is therefore factorised **once per
+    distinct plane** (``normal``/``position``/``bounds``) and the solve reused --
+    it is the expensive step and it does not depend on which conductor is being
+    driven. Each entry still saves the mode *it* drives under its own ``si``, so
+    the invariant that a port's V(t)/I(t) and its mode shapes share one index
+    holds per drive row; modes no entry claims are saved against the plane's
+    first entry so nothing solved goes unreported.
     """
     mode_only = bool(job.get("mode_only", False))
     # PML depth (cells) of the run. Only a SPICE-TEM port's plane is held that far
@@ -795,6 +889,10 @@ def _solve_all_modes(ws, np, grid, job):
     mode_meta = []
 
     n_ports = len(planes)
+
+    # --- pass 1: describe every entry, and solve each distinct plane once ---- #
+    entries = []          # per si: the resolved parameters of that entry
+    solved = {}           # plane key -> (modes, win)
     for si, (kind, t, spice_index) in enumerate(planes):
         normal = t.get("normal", "z")
         name = t.get("name", "port")
@@ -826,7 +924,19 @@ def _solve_all_modes(ws, np, grid, job):
 
         # Optional in-plane bounds (solver-frame metres, transverse slice order).
         bounds = t.get("bounds")
+        # Two entries share a solve only if they name the same cell of the same
+        # axis with the same sub-rect. ``position`` is already snapped to a node
+        # by _interior_position, so equality here is exact, not approximate.
+        key = (normal, float(position), tuple(bounds) if bounds else None)
+        entries.append({
+            "si": si, "kind": kind, "cfg": t, "spice_index": spice_index,
+            "normal": normal, "name": name, "position": position,
+            "fmax": fmax, "amplitude": amplitude, "fields": fields,
+            "bounds": bounds, "key": key,
+        })
 
+        if key in solved:
+            continue
         prefix = "Port {}/{}: ".format(si + 1, n_ports) if n_ports > 1 else ""
         _emit_status(
             "{}solving TEM mode on the {}-plane of '{}'\n"
@@ -835,7 +945,6 @@ def _solve_all_modes(ws, np, grid, job):
         )
         # Confine the mode solve to a sub-rectangle of the face when the port
         # carries ``bounds``. Absent => the whole face.
-        solve_grid = grid
         modes = ws.solve_tem_modes(
             grid, normal=normal, position=position,
             bounds=tuple(bounds) if bounds else None,
@@ -846,7 +955,6 @@ def _solve_all_modes(ws, np, grid, job):
                 prefix, len(modes)
             )
         )
-
         # ``solve_tem_modes`` embeds a bounded solve back into the *full* plane
         # (the port needs the full transverse shape), padding it with zeros. Crop
         # the **saved** profiles back to the cells actually solved, so the results
@@ -854,8 +962,45 @@ def _solve_all_modes(ws, np, grid, job):
         # zeros around it. The in-memory ``mode`` handed to ``ModalPort`` /
         # ``SpicePort`` below keeps its full shape and is untouched.
         win = _bounds_window(grid, modes[0], bounds) if (bounds and modes) else None
+        solved[key] = (modes, win)
 
-        for mi, mode in enumerate(modes):
+    # --- pass 2: which mode does each entry drive? -------------------------- #
+    # Done before anything is saved, so the plane's first entry knows which of
+    # its modes nobody claimed and can report those too.
+    for entry in entries:
+        modes, _win = solved[entry["key"]]
+        entry["chosen"] = None if (not modes or mode_only) else _choose_mode(
+            np, modes, grid, entry["cfg"], entry["name"])
+
+    first_of_plane = {}
+    for entry in entries:
+        first_of_plane.setdefault(entry["key"], entry["si"])
+    claimed = {}   # plane key -> ids of the modes some entry drives
+    for entry in entries:
+        if entry["chosen"] is not None:
+            claimed.setdefault(entry["key"], set()).add(id(entry["chosen"]))
+
+    # --- pass 3: save profiles, and build the ports ------------------------- #
+    for entry in entries:
+        si, kind, t = entry["si"], entry["kind"], entry["cfg"]
+        modes, win = solved[entry["key"]]
+        if not modes:
+            continue
+
+        # What this entry reports. ``mode_only`` has no chosen mode (there is no
+        # FDTD to drive), so the plane's first entry reports every mode -- which
+        # is what the panel's "Compute Mode" preview scrolls through. Otherwise
+        # each entry leads with the mode it drives, and the plane's first entry
+        # also carries the ones no entry took.
+        if entry["chosen"] is None:
+            reported = list(modes) if si == first_of_plane[entry["key"]] else []
+        else:
+            reported = [entry["chosen"]]
+            if si == first_of_plane[entry["key"]]:
+                taken = claimed.get(entry["key"], set())
+                reported += [m for m in modes if id(m) not in taken]
+
+        for mi, mode in enumerate(reported):
             key = "mode_{}_{}".format(si, mi)
             mode_arrays[key + "_phi"] = np.asarray(
                 _crop_plane(mode.phi, win), dtype=np.float64
@@ -874,14 +1019,14 @@ def _solve_all_modes(ws, np, grid, job):
             if len(t_axes) == 2:
                 # From the grid the mode was solved on -- the run's own grid --
                 # sliced to the same window as the profiles above.
-                ca = _axis_centers(solve_grid, t_axes[0])
-                cb = _axis_centers(solve_grid, t_axes[1])
+                ca = _axis_centers(grid, t_axes[0])
+                cb = _axis_centers(grid, t_axes[1])
                 if win is not None:
                     ca, cb = ca[win[0]:win[1]], cb[win[2]:win[3]]
                 mode_arrays[key + "_ca"] = np.asarray(ca, dtype=np.float64)
                 mode_arrays[key + "_cb"] = np.asarray(cb, dtype=np.float64)
             meta = {
-                "source_index": si, "mode_index": mi, "name": name,
+                "source_index": si, "mode_index": mi, "name": entry["name"],
                 "conductor_id": int(mode.conductor_id),
                 "normal": mode.normal, "position": float(mode.position),
                 "transverse_axes": list(mode.transverse_axes),
@@ -891,35 +1036,46 @@ def _solve_all_modes(ws, np, grid, job):
                 "capacitance": _f(mode.capacitance),
                 "inductance": _f(mode.inductance),
                 "v_phase": _f(mode.v_phase),
-                "fmax": fmax, "amplitude": amplitude, "fields": fields,
-                "spice": kind == "spice",
+                "fmax": entry["fmax"], "amplitude": entry["amplitude"],
+                "fields": entry["fields"], "spice": kind == "spice",
+                "driven": entry["chosen"] is not None and mi == 0,
             }
+            # The entry's conductor names the mode it *drives*, which is the one
+            # at mi == 0. The modes after it are the plane's unclaimed ones and
+            # belong to other conductors entirely -- carrying this name onto them
+            # would label three different modes with one conductor.
+            if meta["driven"] and t.get("conductor"):
+                meta["conductor"] = str(t["conductor"])
             mode_meta.append(meta)
 
-        if not modes or mode_only:
+        chosen = entry["chosen"]
+        if chosen is None:
             continue
 
-        chosen = _choose_mode(modes, int(t.get("conductor_id", 0)), name)
         # ``position`` was already nudged onto a usable cell before the solve
         # (:func:`_interior_position`), and both launch paths read the chosen
         # mode's own ``position``, so nothing needs moving here.
         if kind == "spice":
             # Hand the chosen mode to _build_spice_ports; the circuit drives it.
-            spice_modes[spice_index] = chosen
+            spice_modes[entry["spice_index"]] = chosen
             continue
 
         # Modal port: an impedance sheet on the face that launches the chosen
         # mode inward and terminates the plane at the same time (no reflection,
         # exact at DC), which is why that face carries no PML. Registered as a
-        # boundary, not a source -- see :func:`_build_modal_port`.
+        # boundary, not a source -- see :func:`_build_modal_port`. Several such
+        # sheets may share one face: they superpose on the ghost H plane, which
+        # is how a multi-conductor port launches a superposition of modes.
         waveform = _build_waveform(ws, t)
         # Legacy jobs carry ``direction`` instead of ``face``; derive the face
         # name from the normal and that sign so an old job.json still runs.
         face = t.get("face") or "{}{}".format(
-            normal, "0" if float(t.get("direction", 1.0)) >= 0 else "1")
+            entry["normal"],
+            "0" if float(t.get("direction", 1.0)) >= 0 else "1")
         modal_ports.append(
-            (si, name,
-             _build_modal_port(ws, chosen, waveform, grid, str(face), name)))
+            (si, entry["name"],
+             _build_modal_port(ws, chosen, waveform, grid, str(face),
+                               entry["name"])))
 
     return modal_ports, spice_modes, mode_arrays, mode_meta
 

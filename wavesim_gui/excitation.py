@@ -153,6 +153,18 @@ EXCITATION_LABELS = [LABELS[t] for t in ORDER]
 # tidy, and read the properties back into a spec dict. They only *call* methods
 # on the passed FreeCAD object, so this module stays FreeCAD-free/importable in
 # console mode.
+#
+# An object may carry **several** excitations, one per *index*: a multi-conductor
+# modal port drives each energized conductor with its own waveform and sums them
+# on the port plane, so it needs one full parameter set per drive row. Index 0
+# uses the bare property names (``Excitation``, ``Amplitude``, ...) and every
+# further index appends its 1-based number (``Excitation2``, ``Amplitude2``, ...).
+# That keeps a single-excitation object -- every point source, Gaussian beam and
+# legacy modal port -- byte-for-byte what it always was, and makes row 0 of a new
+# port table *be* the property set such a port already had. Real properties
+# rather than a packed blob, because a FreeCAD expression can only drive a real
+# property (see :mod:`wavesim_gui.expressions`), and driving a sweep parameter
+# into one row's amplitude is exactly what a multi-pin port is for.
 
 # Excitation parameter key -> FreeCAD property name holding its SI value.
 PROP_FOR_KEY = {
@@ -184,42 +196,85 @@ PARAM_DESCRIPTIONS = {
 }
 
 
-def ensure_object_props(obj):
-    """Add/refresh the Excitation enum + one property per waveform parameter.
+def excitation_prop(index=0):
+    """Name of the waveform-family enum property for drive row *index*.
+
+    ``"Excitation"`` for row 0, ``"Excitation2"``, ``"Excitation3"``, ... after
+    it, so an object carrying a single excitation keeps exactly the property it
+    always had.
+    """
+    return "Excitation" if index <= 0 else "Excitation{}".format(index + 1)
+
+
+def prop_for_key(key, index=0):
+    """FreeCAD property name holding parameter *key* for drive row *index*."""
+    prop = PROP_FOR_KEY[key]
+    return prop if index <= 0 else "{}{}".format(prop, index + 1)
+
+
+def prop_group(index=0):
+    """Property-editor group for drive row *index*'s excitation properties."""
+    return "Excitation" if index <= 0 else "Excitation {}".format(index + 1)
+
+
+def ensure_object_props(obj, index=0):
+    """Add/refresh drive row *index*'s Excitation enum + one property per parameter.
 
     Idempotent and safe on both freshly created and reloaded objects, so sources
     saved before the extra waveforms existed pick up the new selectable families
     and parameter properties. Parameters are stored in SI with the catalogue
     defaults and edited through the task panel in display units.
     """
-    if not hasattr(obj, "Excitation"):
+    enum_prop = excitation_prop(index)
+    if not hasattr(obj, enum_prop):
         obj.addProperty(
-            "App::PropertyEnumeration", "Excitation", "Excitation",
+            "App::PropertyEnumeration", enum_prop, prop_group(index),
             "Temporal waveform driving the source",
         )
-        obj.Excitation = EXCITATION_LABELS
-        obj.Excitation = EXCITATION_LABELS[0]
+        setattr(obj, enum_prop, EXCITATION_LABELS)
+        setattr(obj, enum_prop, EXCITATION_LABELS[0])
     else:
         # Refresh the allowed options (older docs only offered Gaussian Pulse),
         # preserving the current selection.
-        current = str(obj.Excitation)
-        obj.Excitation = EXCITATION_LABELS
-        obj.Excitation = current if current in EXCITATION_LABELS \
-            else EXCITATION_LABELS[0]
+        current = str(getattr(obj, enum_prop))
+        setattr(obj, enum_prop, EXCITATION_LABELS)
+        setattr(obj, enum_prop,
+                current if current in EXCITATION_LABELS else EXCITATION_LABELS[0])
 
-    for key, prop in PROP_FOR_KEY.items():
+    for key in PROP_FOR_KEY:
+        prop = prop_for_key(key, index)
         if not hasattr(obj, prop):
             _kind, default = ALL_PARAMS[key]
             obj.addProperty(
-                "App::PropertyFloat", prop, "Excitation",
+                "App::PropertyFloat", prop, prop_group(index),
                 PARAM_DESCRIPTIONS.get(key, ""),
             )
             setattr(obj, prop, float(default))
-    sync_visibility(obj)
+    sync_visibility(obj, index)
 
 
-def sync_visibility(obj):
-    """Show the parameters the active Excitation uses, hide the rest.
+def remove_object_props(obj, index):
+    """Drop drive row *index*'s excitation properties from *obj*.
+
+    Used when a multi-drive port's table shrinks, so a removed row leaves no
+    orphan properties behind in the editor. **Row 0 is never removed** -- it is
+    the property set every single-excitation source has, and the fallback a port
+    with no table still reads. Silently skips a property an expression is bound
+    to: FreeCAD refuses to remove one, and the binding is the user's.
+    """
+    if index <= 0:
+        return
+    for prop in [excitation_prop(index)] + [
+            prop_for_key(key, index) for key in PROP_FOR_KEY]:
+        if hasattr(obj, prop):
+            try:
+                obj.removeProperty(prop)
+            except Exception:
+                pass
+
+
+def sync_visibility(obj, index=0):
+    """Show the parameters drive row *index*'s Excitation uses, hide the rest.
 
     The parameters a waveform uses are editable (mode 0) so the property editor
     offers them its ``f(x)`` button and a VarSet parameter can drive a bandwidth
@@ -227,23 +282,42 @@ def sync_visibility(obj):
     shows them in the simulation's display units. Those irrelevant to the
     current waveform are hidden (mode 2) to keep the editor uncluttered.
     """
-    typ = type_for_label(str(getattr(obj, "Excitation", EXCITATION_LABELS[0])))
+    typ = type_for_label(
+        str(getattr(obj, excitation_prop(index), EXCITATION_LABELS[0]))
+    )
     used = set(param_keys(typ))
-    for key, prop in PROP_FOR_KEY.items():
+    for key in PROP_FOR_KEY:
+        prop = prop_for_key(key, index)
         if hasattr(obj, prop):
             obj.setEditorMode(prop, 0 if key in used else 2)
 
 
-def spec_from_object(obj):
-    """Return the excitation spec dict (SI) read from *obj*'s properties.
+def hide_props(obj, index=0):
+    """Hide drive row *index*'s excitation properties outright (mode 2).
+
+    For a port whose drive mode does not use a waveform at all (a SPICE-driven
+    modal port), where even the *active* waveform's parameters are noise.
+    """
+    for prop in [excitation_prop(index)] + [
+            prop_for_key(key, index) for key in PROP_FOR_KEY]:
+        if hasattr(obj, prop):
+            obj.setEditorMode(prop, 2)
+
+
+def spec_from_object(obj, index=0):
+    """Return drive row *index*'s excitation spec dict (SI) from *obj*'s properties.
 
     Carries the waveform ``type`` and only the parameters that type uses -- the
     job.json contract the runner rebuilds the solver waveform from.
     """
-    typ = type_for_label(str(getattr(obj, "Excitation", EXCITATION_LABELS[0])))
+    typ = type_for_label(
+        str(getattr(obj, excitation_prop(index), EXCITATION_LABELS[0]))
+    )
     spec = {"type": typ}
     for key in param_keys(typ):
-        spec[key] = float(getattr(obj, PROP_FOR_KEY[key], ALL_PARAMS[key][1]))
+        spec[key] = float(
+            getattr(obj, prop_for_key(key, index), ALL_PARAMS[key][1])
+        )
     return spec
 
 
@@ -261,13 +335,14 @@ def representative_fmax(spec):
     return 0.0
 
 
-def excitation_label(obj, sim):
+def excitation_label(obj, sim, index=0):
     """Human excitation label for a source, e.g. ``Gaussian Pulse @ 30 GHz``.
 
     Uses *sim*'s frequency unit and appends the characteristic frequency for the
-    waveforms that have one (the rectangular pulse has none).
+    waveforms that have one (the rectangular pulse has none). *index* selects a
+    drive row on a multi-drive object (0 = the only/first excitation).
     """
-    spec = spec_from_object(obj)
+    spec = spec_from_object(obj, index)
     label = label_for_type(spec["type"])
     fmax = representative_fmax(spec)
     if fmax > 0.0:

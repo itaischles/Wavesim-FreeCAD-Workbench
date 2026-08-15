@@ -137,6 +137,18 @@ job.json schema (Session 2)
          "directional":true, "sign":1.0, "uic":false}, ...],
                       # A SPICE TEM port is still a *lumped* launch on an interior
                       # plane, so unlike a modal port its face IS forced to PML.
+      "lumped_ports": [                       # lumped R/L/C elements on a line
+        {"name":.., "p0":[x,y,z], "p1":[x,y,z],
+         "resistance":50.0, "inductance":.., "capacitance":..,  # each optional
+         "topology":"series"|"parallel",
+         "drive":"none"|"voltage"|"current",
+         "excitation": {"type":.., ...}}, ...],  # only when drive != "none"
+                      # One wavesim.sources.LineSource each: the given branches
+                      # wired between the two terminals, optionally in company
+                      # with an ideal voltage (Thevenin) or current (Norton)
+                      # source. An omitted branch is ABSENT, not zero (a short in
+                      # series, an open in parallel); at least one branch or a
+                      # drive is required. p0 is the "+" terminal.
       "electrostatic": {                      # required when mode == "electrostatic"
         "potentials": {"trace": 5.0, "gnd": 0.0},  # volts, keyed by part name
         "boundary": "ground" | "neumann" | {"xmin": "ground", ...},
@@ -367,6 +379,26 @@ search). Each port records its port V(t)/I(t) into ``results.npz`` (keys
 independent ngspice instances. (The port series are stored as two
 ``_times``/``_values`` pairs — ``spice_<idx>v_*`` for voltage, ``spice_<idx>i_*``
 for current.)
+
+Lumped R/L/C ports
+------------------
+Each ``lumped_ports`` entry is one :class:`wavesim.sources.LineSource` across a
+straight ``p0 -> p1`` gap: up to three R/L/C branches wired ``series`` or
+``parallel``, with an optional ideal voltage (Thevenin) or current (Norton)
+source in company. The reactive branches are integrated with the trapezoidal
+companion model (:mod:`wavesim.lumped`), whose every branch resistance is
+positive and finite, so **no value of L or C imposes a timestep limit** — a job
+that was stable without the element stays stable with it. This is the analytic
+sibling of a ``spice_ports`` entry and needs no ngspice; the port series land in
+``results.npz`` as ``lumped_<idx>v_*`` / ``lumped_<idx>i_*`` with names and
+branch values under ``summary["lumped_ports"]``, exactly like the SPICE ones.
+
+Two discretisation facts the caller owns rather than the solver: the element
+presents ``Z_eq + kappa/2`` to the field (``kappa`` being the line's own
+self-coupling, which a *resistive* load can pre-compensate for and a reactive one
+cannot), and two elements sharing a line inject sequentially rather than as one
+solved circuit — a single entry with a ``topology`` network is the way to put two
+branches on one gap.
 """
 
 import json
@@ -1401,6 +1433,50 @@ def _build_spice_ports(ws, job, spice_modes):
 
 
 # --------------------------------------------------------------------------- #
+# Lumped R/L/C ports — one LineSource per lumped_ports entry
+# --------------------------------------------------------------------------- #
+
+def _build_lumped_ports(ws, job):
+    """Build a :class:`wavesim.sources.LineSource` for each ``lumped_ports`` entry.
+
+    Returns a list of ``(name, LineSource, entry)`` — the job entry travels with
+    the port so the summary can report the network without reaching into the
+    solver object's internals. An entry with neither a branch nor
+    a drive is skipped with a note rather than allowed to raise out of the run:
+    the solver refuses that combination, and it means a port the user has not
+    finished configuring, not a job that should die at step 0. The branches are
+    passed through as keywords, so an omitted one stays *absent* (a short in
+    series, an open in parallel) instead of becoming a zero the solver would
+    reject.
+    """
+    ports = []
+    for e in job.get("lumped_ports") or []:
+        name = e.get("name", "lumped")
+        load = {key: float(e[key])
+                for key in ("resistance", "inductance", "capacitance")
+                if e.get(key) is not None}
+        drive = str(e.get("drive", "none"))
+        if not load and drive == "none":
+            sys.stderr.write(
+                "wavesim: lumped port '{}' has neither a load nor a drive; "
+                "skipping.\n".format(name))
+            continue
+        kwargs = dict(load)
+        kwargs["topology"] = str(e.get("topology", "series"))
+        if drive in ("voltage", "current"):
+            kwargs[drive] = _build_waveform(ws, e)
+        try:
+            port = ws.LineSource(p0=tuple(e["p0"]), p1=tuple(e["p1"]), **kwargs)
+        except Exception as err:
+            sys.stderr.write(
+                "wavesim: lumped port '{}' could not be built ({}); "
+                "skipping.\n".format(name, err))
+            continue
+        ports.append((name, port, e))
+    return ports
+
+
+# --------------------------------------------------------------------------- #
 # Core — callable so a future persistent worker can reuse it
 # --------------------------------------------------------------------------- #
 
@@ -1679,6 +1755,12 @@ def run_job(workdir):
     # and their ngspice instances torn down after the run.
     spice_ports = _build_spice_ports(ws, job, spice_modes)
     sources.extend(port for _name, port in spice_ports)
+
+    # Lumped R/L/C ports: the same kind of element, with the circuit solved
+    # analytically here instead of by ngspice. Kept aside for the same reason --
+    # each records the port V(t)/I(t) saved after the run.
+    lumped_ports = _build_lumped_ports(ws, job)
+    sources.extend(port for _name, port, _entry in lumped_ports)
 
     # Monitors. Probes and snapshots (Session 7) are point/plane recorders
     # described in the job. All locations are already in the solver frame
@@ -1979,6 +2061,31 @@ def run_job(workdir):
         except Exception:
             pass
 
+    # Lumped R/L/C ports: the same two series, under their own key prefix. The
+    # branch values ride in the summary so a results window can say what the
+    # element *was* without reopening job.json.
+    lumped_meta = []
+    for idx, (name, port, cfg) in enumerate(lumped_ports):
+        times = np.asarray(port.times)
+        result_arrays["lumped_{}v_times".format(idx)] = times
+        result_arrays["lumped_{}v_values".format(idx)] = np.asarray(port.voltages)
+        result_arrays["lumped_{}i_times".format(idx)] = times
+        result_arrays["lumped_{}i_values".format(idx)] = np.asarray(port.currents)
+        meta = {"name": name,
+                "topology": str(cfg.get("topology", "series")),
+                "drive": str(cfg.get("drive", "none"))}
+        for key in ("resistance", "inductance", "capacitance"):
+            if cfg.get(key) is not None:
+                meta[key] = float(cfg[key])
+        # kappa is the element's own model of the grid it landed on, and what a
+        # user comparing the recorded Z against a nominal R/L/C needs: the field
+        # sees Z_eq + kappa/2, not Z_eq.
+        try:
+            meta["kappa"] = float(port.self_coupling(grid))
+        except Exception:
+            pass
+        lumped_meta.append(meta)
+
     np.savez(os.path.join(workdir, "results.npz"), **result_arrays)
 
     summary = {
@@ -2027,6 +2134,8 @@ def run_job(workdir):
         summary["currents"] = current_meta
     if spice_meta:
         summary["spice_ports"] = spice_meta
+    if lumped_meta:
+        summary["lumped_ports"] = lumped_meta
     if port_meta:
         summary["ports"] = port_meta
     if mode_meta:

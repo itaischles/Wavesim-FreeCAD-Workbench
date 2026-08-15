@@ -83,6 +83,7 @@ class WavesimWorkbench(Gui.Workbench):
                 "Wavesim_AddSource",
                 "Wavesim_AddModalPort",
                 "Wavesim_AddGaussianBeam",
+                "Wavesim_AddLumpedPort",
                 "Wavesim_AddSpiceLinePort",
             )
             # Monitors: everything that records, point to whole-domain.

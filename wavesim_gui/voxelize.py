@@ -206,18 +206,28 @@ def spice_line_port_points_mm(sim):
     return pts
 
 
+def lumped_port_points_mm(sim):
+    """World-mm endpoints of every lumped R/L/C port's line under *sim*."""
+    if sim is None:
+        return []
+    from wavesim_gui import lumped_port as lumped_mod
+
+    return lumped_mod.lumped_port_points_mm(sim)
+
+
 def combined_bbox_mm(sim, materials):
     """Material union-bbox (mm) grown to include sources and monitor geometry.
 
     The domain auto-sizes to this combined box, so a source, snapshot slice,
-    voltage/current monitor curve or SPICE line port placed outside the material
-    bounds (or in the PML) enlarges the domain to contain it. Returns ``None``
-    when there is nothing to bound.
+    voltage/current monitor curve, SPICE line port or lumped port placed outside
+    the material bounds (or in the PML) enlarges the domain to contain it.
+    Returns ``None`` when there is nothing to bound.
     """
     bbox = materials_bbox_mm(materials)
     bbox = _expand_bbox_points(bbox, source_points_mm(sim))
     bbox = _expand_bbox_points(bbox, path_monitor_points_mm(sim))
     bbox = _expand_bbox_points(bbox, spice_line_port_points_mm(sim))
+    bbox = _expand_bbox_points(bbox, lumped_port_points_mm(sim))
     bbox = _expand_bbox_axis(bbox, snapshot_axis_offsets(sim))
     return bbox
 
@@ -1933,6 +1943,7 @@ def build_job_from_document(doc, steps=None, fmax=30.0e9, progress=None):
     # fallback is skipped when one is present.
     from wavesim_gui import source as source_mod
     from wavesim_gui import spice_port as spice_mod
+    from wavesim_gui import lumped_port as lumped_mod
     from wavesim_gui import gaussian_beam as beam_mod
 
     # Modal ports split by drive mode: waveform-driven ones go into
@@ -1969,12 +1980,26 @@ def build_job_from_document(doc, steps=None, fmax=30.0e9, progress=None):
                        for p in spice_tem_objs]
     spice_ports = [s for s in (spice_line_specs + spice_tem_specs) if s]
 
+    # Lumped R/L/C ports: the analytic sibling of a SPICE line port. Ports that
+    # could not serialise (no terminals, or neither a load nor a drive) are
+    # dropped with a warning by the spec builder.
+    lumped_ports = [s for s in (lumped_mod.lumped_port_spec(p, origin_m)
+                                for p in lumped_mod.find_lumped_ports(sim)) if s]
+    # Two elements on one line inject sequentially rather than as one solved
+    # circuit -- said here, where the whole document is in view.
+    for message in lumped_mod.colocation_warnings(sim):
+        FreeCAD.Console.PrintWarning("Wavesim: " + message + "\n")
+
+    # A lumped port only counts as excitation when it actually drives; a passive
+    # termination is a load, and a run with nothing else needs the fallback.
+    driven_lumped = [s for s in lumped_ports if s.get("drive", "none") != "none"]
+
     sources = source_mod.find_sources(sim)
     if sources:
         source = source_mod.source_spec(sources[0], origin_m)
-    elif modal_ports or spice_ports or gaussian_beams:
-        # A modal port, a Gaussian beam or a (driven) SPICE port is excitation
-        # enough; skip the centre-Gaussian fallback.
+    elif modal_ports or spice_ports or gaussian_beams or driven_lumped:
+        # A modal port, a Gaussian beam, a (driven) SPICE port or a driven
+        # lumped port is excitation enough; skip the centre-Gaussian fallback.
         source = None
     else:
         source = {
@@ -2037,6 +2062,7 @@ def build_job_from_document(doc, steps=None, fmax=30.0e9, progress=None):
         "modal_ports": modal_ports,
         "gaussian_beams": gaussian_beams,
         "spice_ports": spice_ports,
+        "lumped_ports": lumped_ports,
         "monitors": monitors,
     }
     if electrostatic:
@@ -2105,6 +2131,7 @@ def _electrostatic_warnings(sim, dom, potentials, boundary, capacitance):
     from wavesim_gui import monitors as monitors_mod
     from wavesim_gui import materials as materials_mod
     from wavesim_gui import domain as domain_mod
+    from wavesim_gui import lumped_port as lumped_mod
 
     out = []
     # A conductor sitting on a Ground face is shorted to it. Harmless while that
@@ -2128,6 +2155,8 @@ def _electrostatic_warnings(sim, dom, potentials, boundary, capacitance):
         ignored.append("point sources")
     if modal_mod.find_modal_ports(sim):
         ignored.append("modal ports")
+    if lumped_mod.find_lumped_ports(sim):
+        ignored.append("lumped ports")
     if monitors_mod.find_probes(sim):
         ignored.append("probes")
     if ignored:

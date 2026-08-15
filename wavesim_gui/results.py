@@ -77,6 +77,8 @@ _KIND_VOLTAGE = "voltage"
 _KIND_CURRENT = "current"
 _KIND_SPICE_V = "spice_v"   # SPICE co-simulation port voltage V(t)
 _KIND_SPICE_I = "spice_i"   # SPICE co-simulation port current I(t)
+_KIND_LUMPED_V = "lumped_v"  # lumped R/L/C port voltage V(t)
+_KIND_LUMPED_I = "lumped_i"  # lumped R/L/C port current I(t)
 # A modal port's own V(t)/I(t), recorded at its impedance sheet. Distinct kinds
 # from the line-integral monitors above because they are a different measurement:
 # a projection onto the port's mode rather than an integral along a user curve,
@@ -100,6 +102,8 @@ _KIND_ICONS = {
     _KIND_CURRENT: _icon("current.svg"),
     _KIND_SPICE_V: _icon("port_spice.svg"),
     _KIND_SPICE_I: _icon("port_spice.svg"),
+    _KIND_LUMPED_V: _icon("port_lumped.svg"),
+    _KIND_LUMPED_I: _icon("port_lumped.svg"),
     # The monitor icons, not the port's: these rows say "voltage" / "current",
     # and the group they sit in already says which port they belong to.
     _KIND_PORT_V: _icon("voltage.svg"),
@@ -727,6 +731,19 @@ def build_results(doc, sim, workdir, summary):
                 _new_leaf("{} current".format(name), _KIND_SPICE_I,
                           "spice_{}i".format(idx), parent=parent)
 
+        # Lumped R/L/C ports: the same V(t)/I(t) pair. A lumped port has no mode
+        # and so no port group -- it is a line element, and its two leaves sit
+        # flat beside the monitors.
+        for idx, meta in enumerate(summary.get("lumped_ports", [])):
+            name = meta.get("name") or "Lumped Port {}".format(idx)
+            for kind, suffix, label in ((_KIND_LUMPED_V, "v", "voltage"),
+                                        (_KIND_LUMPED_I, "i", "current")):
+                key = "lumped_{}{}".format(idx, suffix)
+                if key + "_values" not in keys:
+                    continue
+                leaf = _new_leaf("{} {}".format(name, label), kind, key)
+                _store_lumped_meta(leaf, meta)
+
         # Modal ports: the V(t)/I(t) the port's own impedance sheet recorded --
         # V the modal projection of the plane E, I the Poynting-paired
         # projection of the H one cell inside it, positive into the domain. Both
@@ -1005,6 +1022,40 @@ def _store_port_meta(obj, meta):
          _num(meta.get("reference_impedance")))
     _add("ModalConductance", "App::PropertyFloat",
          _num(meta.get("modal_conductance")))
+
+
+def _store_lumped_meta(obj, meta):
+    """Stash a lumped port's network description and grid parasitic on its leaf.
+
+    ``Network`` is what the element *was* (the branches, their wiring and any
+    drive) and ``SelfCoupling`` is the ``kappa`` the solver measured for it on
+    this grid. Both ride on the leaf because the plot annotates them: a V/I pair
+    read against a nominal 50 ohm is off by ``kappa/2``, and that number belongs
+    to the run rather than to the document, which the user may have edited since.
+    """
+    def _add(prop, kind, value, group="Port"):
+        if not hasattr(obj, prop):
+            obj.addProperty(kind, prop, group, "")
+            obj.setEditorMode(prop, 1)
+        setattr(obj, prop, value)
+
+    parts = []
+    for key, kind, unit in (("resistance", "R", "ohm"),
+                            ("inductance", "L", "H"),
+                            ("capacitance", "C", "F")):
+        if meta.get(key) is not None:
+            parts.append("{} {:g} {}".format(kind, float(meta[key]), unit))
+    text = " + ".join(parts) if parts else "no load"
+    if len(parts) > 1:
+        text += " ({})".format(meta.get("topology", "series"))
+    drive = str(meta.get("drive", "none"))
+    if drive != "none":
+        text += ", {} drive".format(drive)
+
+    _add("PortName", "App::PropertyString", str(meta.get("name", "")))
+    _add("Network", "App::PropertyString", text)
+    _add("SelfCoupling", "App::PropertyFloat",
+         float("nan") if meta.get("kappa") is None else float(meta["kappa"]))
 
 
 def _store_electrostatic_meta(leaf, meta):
@@ -1296,6 +1347,10 @@ if _GUI_AVAILABLE:
                 _plot_spice_voltage(obj)
             elif kind == _KIND_SPICE_I:
                 _plot_spice_current(obj)
+            elif kind == _KIND_LUMPED_V:
+                _plot_lumped_voltage(obj)
+            elif kind == _KIND_LUMPED_I:
+                _plot_lumped_current(obj)
             elif kind == _KIND_PORT_V:
                 _plot_port_voltage(obj)
             elif kind == _KIND_PORT_I:
@@ -1414,6 +1469,39 @@ if _GUI_AVAILABLE:
         _plot_series(
             obj, "current (A)", "SPICE port current vs. time", "#9467bd"
         )
+
+    def _lumped_note(obj):
+        """Annotate a lumped port's plot with its network and grid parasitic.
+
+        Worth the corner of the figure for the same reason the panel says it
+        before the run: to the field the element is ``Z_eq + kappa/2``, and a
+        reactive branch cannot pre-compensate for that half-kappa. Without it,
+        a V/I pair read against the nominal R/L/C quietly disagrees.
+        """
+        network = str(getattr(obj, "Network", "") or "")
+        kappa = getattr(obj, "SelfCoupling", None)
+        lines = [network] if network else []
+        if kappa is not None and kappa == kappa and kappa > 0.0:   # not None/NaN
+            lines.append("grid parasitic κ/2 = {:.4g} Ω in series".format(
+                0.5 * float(kappa)))
+        if not lines:
+            return None
+
+        def _annotate(ax, _times, _values):
+            ax.text(0.98, 0.95, "\n".join(lines), transform=ax.transAxes,
+                    ha="right", va="top", fontsize=9,
+                    bbox=dict(boxstyle="round", fc="white", ec="0.7",
+                              alpha=0.85))
+
+        return _annotate
+
+    def _plot_lumped_voltage(obj):
+        _plot_series(obj, "voltage (V)", "Lumped port voltage vs. time",
+                     "#2ca02c", annotate=_lumped_note(obj))
+
+    def _plot_lumped_current(obj):
+        _plot_series(obj, "current (A)", "Lumped port current vs. time",
+                     "#9467bd", annotate=_lumped_note(obj))
 
     def _zref_note(obj):
         """Annotate a modal port's V/I plot with the impedance it is referenced

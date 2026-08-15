@@ -945,5 +945,6 @@ if _GUI_AVAILABLE:
     from wavesim_gui import modal_port  # noqa: F401  (registers Wavesim_AddModalPort)
     from wavesim_gui import gaussian_beam  # noqa: F401  (registers Wavesim_AddGaussianBeam)
     from wavesim_gui import spice_port  # noqa: F401  (registers the SPICE port commands)
+    from wavesim_gui import lumped_port  # noqa: F401  (registers Wavesim_AddLumpedPort)
     from wavesim_gui import monitors  # noqa: F401  (registers the monitor commands)
     from wavesim_gui import results  # noqa: F401  (registers result proxies/VPs)

@@ -2771,16 +2771,33 @@ if _GUI_AVAILABLE:
 
         phi = data["phi"]
         Na, Nb = phi.shape
-        # Cell-centre coordinates in mm (the workbench's display unit). Prefer the
+        # Where each sample sits, in mm (the workbench's display unit). Prefer the
         # real transverse coordinate arrays from the runner (which honour a
         # non-uniform grid); fall back to a constant da/db spacing for older runs.
+        #
+        # φ and the PEC mask are **node**-indexed -- ``phi[i, j]`` is the
+        # potential at node ``(a[i], b[j])`` -- and the runner's arrays are the
+        # node coordinates to match. Everything below treats these purely as
+        # sample positions (``_edges_from_centres`` builds midpoint edges around
+        # whatever it is handed), so nothing here cares which lattice they name;
+        # what matters is that they are the lattice the data is actually on.
+        # Runs saved before that was fixed carry cell centres instead and plot
+        # skewed on a graded mesh -- re-run the port to redraw them straight.
+        #
+        # The E components are the one thing still half a cell out: ``Ea[i]`` is
+        # the field on the *edge* from node i to node i+1, so drawing it at node
+        # i offsets it by half a cell along its own axis. Left as is deliberately
+        # -- the arrows are decimated onto a fixed physical lattice many cells
+        # wide, so the offset is well inside one arrow's own footprint, and
+        # averaging the two edges onto the node would smear the exact zero that
+        # marks the metal and put arrows on conductor surfaces.
         coords_a, coords_b = data["coords_a"], data["coords_b"]
         if len(coords_a) == Na and len(coords_b) == Nb:
             xa = np.asarray(coords_a)
             yb = np.asarray(coords_b)
         else:
-            xa = (np.arange(Na) + 0.5) * (data["da"] or 1.0) * 1.0e3
-            yb = (np.arange(Nb) + 0.5) * (data["db"] or 1.0) * 1.0e3
+            xa = np.arange(Na) * (data["da"] or 1.0) * 1.0e3
+            yb = np.arange(Nb) * (data["db"] or 1.0) * 1.0e3
 
         opts = dict(_MODE_VIEW_DEFAULTS) if opts is None else opts
         pec = data["pec"]

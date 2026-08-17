@@ -228,10 +228,11 @@ an H snapshot sharing a ``times`` entry are simultaneous -- what a Poynting
 vector needs. The saved frames and edges are **cropped to the domain
 interior** -- the PML padding cells on both in-plane axes are stripped so the
 animation/export shows only the physical region. Each TEM mode stores its two
-transverse cell-centre
-coordinate arrays (``mode_<si>_<mi>_ca`` / ``_cb``), so the workbench draws them
-on the real grid (uniform or non-uniform) instead of assuming a constant cell
-size.
+transverse sample-coordinate arrays (``mode_<si>_<mi>_ca`` / ``_cb``), so the
+workbench draws them on the real grid (uniform or non-uniform) instead of
+assuming a constant cell size. Those are **node** coordinates, one per saved
+sample: a mode's profiles are node-indexed, not cell-centred (see
+:func:`_solve_modes`).
 
 Modal ports
 -----------
@@ -708,14 +709,21 @@ def _bounds_window(grid, mode, bounds):
     Mirrors ``mode_solver.solve_tem_modes``'s own sub-rect indexing, so the saved
     profiles can be cropped back to exactly the cells it solved. ``None`` when the
     rect degenerates to nothing (⇒ save the whole plane, as before).
+
+    That includes the solver's one-node reach past ``axis_index``: the profiles
+    are node-indexed, and a rect covering cells ``ia0..ia1-1`` stands on nodes
+    ``ia0..ia1``. Crop one node short and the saved picture is not the region
+    that was solved -- and, worse, the two would disagree only on the far edge,
+    which is exactly where the interesting boundary usually is.
     """
     a0, a1, b0, b1 = bounds
     ta = mode.transverse_axes
+    shape = mode.phi.shape          # numpy is not imported at module scope here
     ia0, ia1 = grid.axis_index(ta[0], a0), grid.axis_index(ta[0], a1)
     ib0, ib1 = grid.axis_index(ta[1], b0), grid.axis_index(ta[1], b1)
     if ia1 <= ia0 or ib1 <= ib0:
         return None
-    return ia0, ia1, ib0, ib1
+    return ia0, min(ia1 + 1, shape[0]), ib0, min(ib1 + 1, shape[1])
 
 
 def _crop_plane(arr, win):
@@ -1046,17 +1054,42 @@ def _solve_all_modes(ws, np, grid, job):
                 mode_arrays["{}_E_{}".format(key, comp)] = np.asarray(
                     _crop_plane(arr, win), dtype=np.float64
                 )
-            # Transverse cell-centre coordinates (metres, solver frame) so the
-            # results plot can draw the mode on the real (possibly non-uniform)
-            # axes rather than assuming a constant da/db spacing.
+            # Transverse sample coordinates (metres, solver frame) so the results
+            # plot can draw the mode on the real (possibly non-uniform) axes
+            # rather than assuming a constant da/db spacing.
+            #
+            # These are the **node** coordinates, not the cell centres: a mode's
+            # profiles are node-indexed. ``phi[i, j]`` is the potential *at* node
+            # ``(a[i], b[j])`` -- see ``mode_solver.TEMMode.E``, "φ sits on nodes,
+            # so consecutive φ are one primary [width] apart", and the
+            # ``a_nodes``/``b_nodes`` the solver carries for exactly this. The
+            # arrays are still shaped (Na, Nb) like cells, with the plane's last
+            # node simply unrepresented, which is what makes the confusion easy:
+            # handing back cell centres is one constant half-cell shift on a
+            # uniform mesh and so invisible, but on a graded mesh the two rulers
+            # are not a rigid shift at all. Drawn on centres, this run's coax pin
+            # -- centred on the axis, on the nodes either side of it -- came out
+            # 1.25 mm off centre with the outer bore bursting through one corner
+            # of the window and a cell clear of the other: a symmetric port that
+            # plots skewed.
             t_axes = list(getattr(mode, "transverse_axes", []))
             if len(t_axes) == 2:
                 # From the grid the mode was solved on -- the run's own grid --
                 # sliced to the same window as the profiles above.
-                ca = _axis_centers(grid, t_axes[0])
-                cb = _axis_centers(grid, t_axes[1])
+                ca = _axis_nodes(grid, t_axes[0])
+                cb = _axis_nodes(grid, t_axes[1])
                 if win is not None:
                     ca, cb = ca[win[0]:win[1]], cb[win[2]:win[3]]
+                # One coordinate per saved sample. A node array is one longer
+                # than the profiles it rules (N+1 nodes, N samples), and the
+                # bounded slices above already drop the window's last node; the
+                # unbounded case has to drop the plane's. Length is not cosmetic
+                # here -- the plot only believes these coordinates when they
+                # match the profile shape, and falls back to a uniform da/db
+                # ruler when they do not, which is the very thing they exist to
+                # replace.
+                na, nb = mode_arrays[key + "_phi"].shape
+                ca, cb = ca[:na], cb[:nb]
                 mode_arrays[key + "_ca"] = np.asarray(ca, dtype=np.float64)
                 mode_arrays[key + "_cb"] = np.asarray(cb, dtype=np.float64)
             meta = {

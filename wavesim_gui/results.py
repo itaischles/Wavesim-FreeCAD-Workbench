@@ -1025,13 +1025,16 @@ def _store_port_meta(obj, meta):
 
 
 def _store_lumped_meta(obj, meta):
-    """Stash a lumped port's network description and grid parasitic on its leaf.
+    """Stash a lumped port's network description and its cell's gap C on its leaf.
 
     ``Network`` is what the element *was* (the branches, their wiring and any
-    drive) and ``SelfCoupling`` is the ``kappa`` the solver measured for it on
-    this grid. Both ride on the leaf because the plot annotates them: a V/I pair
-    read against a nominal 50 ohm is off by ``kappa/2``, and that number belongs
-    to the run rather than to the document, which the user may have edited since.
+    drive), ``SelfCoupling`` is the ``kappa`` the solver measured for it on this
+    grid, and ``CellCapacitance`` is the ``dt/kappa = eps*dA/dl`` the bridged
+    cells keep in **parallel** with the element. All three ride on the leaf
+    because the plot annotates them: a V/I pair read against a nominal 50 ohm is
+    off by that shunt (the element itself delivers exactly its nominal value),
+    and the number belongs to the run rather than to the document, which the user
+    may have edited since.
     """
     def _add(prop, kind, value, group="Port"):
         if not hasattr(obj, prop):
@@ -1056,6 +1059,8 @@ def _store_lumped_meta(obj, meta):
     _add("Network", "App::PropertyString", text)
     _add("SelfCoupling", "App::PropertyFloat",
          float("nan") if meta.get("kappa") is None else float(meta["kappa"]))
+    _add("CellCapacitance", "App::PropertyFloat",
+         float("nan") if meta.get("c_cell") is None else float(meta["c_cell"]))
 
 
 def _store_electrostatic_meta(leaf, meta):
@@ -1471,19 +1476,20 @@ if _GUI_AVAILABLE:
         )
 
     def _lumped_note(obj):
-        """Annotate a lumped port's plot with its network and grid parasitic.
+        """Annotate a lumped port's plot with its network and its cell's gap C.
 
         Worth the corner of the figure for the same reason the panel says it
-        before the run: to the field the element is ``Z_eq + kappa/2``, and a
-        reactive branch cannot pre-compensate for that half-kappa. Without it,
-        a V/I pair read against the nominal R/L/C quietly disagrees.
+        before the run: the element delivers exactly the R/L/C it was given, but
+        the cells it bridges keep ``C_cell`` across it, so a V/I pair read against
+        the nominal value quietly disagrees by that shunt — and ``C_cell`` came
+        from the mesh, not from the network the label names.
         """
         network = str(getattr(obj, "Network", "") or "")
-        kappa = getattr(obj, "SelfCoupling", None)
+        c_cell = getattr(obj, "CellCapacitance", None)
         lines = [network] if network else []
-        if kappa is not None and kappa == kappa and kappa > 0.0:   # not None/NaN
-            lines.append("grid parasitic κ/2 = {:.4g} Ω in series".format(
-                0.5 * float(kappa)))
+        if c_cell is not None and c_cell == c_cell and c_cell > 0.0:  # not NaN
+            lines.append("cell gap C = {:.4g} fF in parallel".format(
+                1.0e15 * float(c_cell)))
         if not lines:
             return None
 

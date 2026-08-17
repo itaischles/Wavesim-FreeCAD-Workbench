@@ -393,12 +393,14 @@ sibling of a ``spice_ports`` entry and needs no ngspice; the port series land in
 ``results.npz`` as ``lumped_<idx>v_*`` / ``lumped_<idx>i_*`` with names and
 branch values under ``summary["lumped_ports"]``, exactly like the SPICE ones.
 
-Two discretisation facts the caller owns rather than the solver: the element
-presents ``Z_eq + kappa/2`` to the field (``kappa`` being the line's own
-self-coupling, which a *resistive* load can pre-compensate for and a reactive one
-cannot), and two elements sharing a line inject sequentially rather than as one
-solved circuit — a single entry with a ``topology`` network is the way to put two
-branches on one gap.
+The element contributes **exactly** its own admittance — measured spectrally
+solver-side to four figures over 4–30 GHz — so there is nothing for the caller to
+pre-compensate. Two discretisation facts the caller does own: the Yee cells the
+line bridges keep their own gap capacitance ``C_cell = eps*dA/dl`` (``= dt/kappa``)
+in **parallel** with it, which moves with the mesh and is only fixable by meshing;
+and two elements sharing a line inject sequentially rather than as one solved
+circuit, each then adding its own ``kappa/2`` in series — a single entry with a
+``topology`` network is the way to put two branches on one gap.
 """
 
 import json
@@ -2077,13 +2079,18 @@ def run_job(workdir):
         for key in ("resistance", "inductance", "capacitance"):
             if cfg.get(key) is not None:
                 meta[key] = float(cfg[key])
-        # kappa is the element's own model of the grid it landed on, and what a
-        # user comparing the recorded Z against a nominal R/L/C needs: the field
-        # sees Z_eq + kappa/2, not Z_eq.
+        # kappa is the element's own model of the grid it landed on. It is *not*
+        # a series parasitic (the element delivers exactly its own admittance);
+        # what it buys is the gap capacitance dt/kappa = eps*dA/dl the bridged
+        # cells keep in parallel, which is what a user comparing the recorded Z
+        # against a nominal R/L/C needs, and which moves with the mesh.
         try:
-            meta["kappa"] = float(port.self_coupling(grid))
+            kappa = float(port.self_coupling(grid))
         except Exception:
-            pass
+            kappa = None
+        if kappa:
+            meta["kappa"] = kappa
+            meta["c_cell"] = float(grid.dt) / kappa
         lumped_meta.append(meta)
 
     np.savez(os.path.join(workdir, "results.npz"), **result_arrays)

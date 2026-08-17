@@ -26,3 +26,6 @@ tools/circle_centres.txt
 # Unused image assets
 Resources/Gemini_Generated_Image_.png
 Resources/excitation.png
+
+# Report written by tools/check_lumped_geometry.py
+tools/lumped_geometry.txt

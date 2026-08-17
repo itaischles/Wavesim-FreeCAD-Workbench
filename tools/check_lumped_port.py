@@ -18,10 +18,9 @@ What the laws are, and why kappa is absent from them
 ----------------------------------------------------
 The recorded ``V`` is the post-injection line voltage ``V_n`` and the recorded
 ``I`` is the impressed current at ``n+1/2``, so the voltage *across the element*
-at that instant is the port mid-value ``(V_{n-1} + V_n)/2``. ``kappa/2`` sits
-between the element and the field, **not** inside the recorded pair — which is
-exactly the solver's claim that "the recorded V(t)/I(t) are exact regardless, so
-port extraction is unaffected". Hence:
+at that instant is the port mid-value ``(V_{n-1} + V_n)/2``. The element
+contributes exactly its own admittance — there is no ``kappa/2`` in series, and
+nothing about ``kappa`` enters the recorded pair. Hence:
 
 * resistor (single branch, ``Z_eq = R``)::
 
@@ -36,17 +35,27 @@ port extraction is unaffected". Hence:
 
       I_n = (Vs(t_n) - (V_{n-1} + V_n)/2) / R
 
-The fourth port carries neither a branch nor a drive and must be **skipped** by
-both sides (the solver refuses that combination, and it means a half-configured
-port rather than a job worth killing at step 0).
+One port carries neither a branch nor a drive and must be **skipped** by both
+sides (the solver refuses that combination, and it means a half-configured port
+rather than a job worth killing at step 0).
 
-There is a second, two-process check this file deliberately does not automate:
-the workbench's own ``lumped_port.self_coupling_ohms`` estimate against
-``LineSource.self_coupling`` on the same grid. They agree to round-off, and the
-reason it is worth re-checking after any change to either side is that the
-solver's path quadrature puts a **half** weight on an edge at each end of a
-node-aligned line — so the obvious "the line covers whole edges" formula
-overstates kappa by exactly 2x for a one-cell gap, the commonest case there is.
+The placement rule, checked as an identity
+------------------------------------------
+``kappa`` is not a series parasitic; it is the bridged cells' own gap
+capacitance, ``C_cell = dt/kappa``. What makes it worth a gate is the path
+quadrature: an edge's weight is the length of the line **inside that edge's own
+cell**, and the injection divides by the *dual* Ampere face across the edge. So a
+path running node to node puts the same current through every cell it crosses,
+whatever the grading — that is what lets an element span uneven cells at all. Two
+consequences, both asserted below against ``LineSource.self_coupling``:
+
+* ends on **nodes** (a conductor surface the mesher put a grid line on, the
+  normal case) give every crossed cell its full width, so
+  ``kappa == dt*L/(eps*dA)`` exactly;
+* ends **half a cell in** cover the two end cells only halfway. Since kappa sums
+  ``w^2/h``, each half end contributes ``h/4`` rather than ``h``, so a span from
+  one cell centre to another two cells away reads ``1.5x`` the whole-cell value
+  — the reason the workbench no longer moves the endpoints it is given.
 """
 
 import json
@@ -95,6 +104,12 @@ R_PASSIVE = 50.0
 R_DRIVEN = 25.0
 C = 2.0e-13
 TOL = 1.0e-9
+# wavesim.constants.EPS0's own (truncated) value, so the kappa identities below
+# are not decided by the ninth digit of a constant.
+EPS0 = 8.8541878e-12
+# The kappa identities are analytic but reach through a quadrature that sub-steps
+# the path, so they close to round-off rather than exactly.
+KAPPA_TOL = 1.0e-6
 
 
 def _job():
@@ -125,6 +140,12 @@ def _job():
                             "amplitude": 2.0},
              "p0": [12 * DX, 9 * DX, 12 * DX],
              "p1": [12 * DX, 9 * DX, 13 * DX]},
+            # Ends half a cell in, covering the two end cells only halfway --
+            # what the workbench used to produce, kept as the second identity.
+            {"name": "half-cell R port", "topology": "series", "drive": "none",
+             "resistance": R_PASSIVE,
+             "p0": [16 * DX, 16 * DX, 12.5 * DX],
+             "p1": [16 * DX, 16 * DX, 14.5 * DX]},
             {"name": "unconfigured", "topology": "series", "drive": "none",
              "p0": [12 * DX, 15 * DX, 12 * DX],
              "p1": [12 * DX, 15 * DX, 13 * DX]},
@@ -133,8 +154,8 @@ def _job():
     }
 
 
-def _report(label, residual, extra=""):
-    ok = residual < TOL
+def _report(label, residual, extra="", tol=TOL):
+    ok = residual < tol
     print("  {:14s} residual = {:9.3g}   {}{}".format(
         label, residual, "OK " if ok else "FAIL", extra))
     return ok
@@ -162,12 +183,28 @@ def main():
         summary["steps"], summary["dt"]))
     ok = True
 
-    if len(meta) != 3:
-        print("  FAIL: expected 3 built ports (the fourth has neither a load "
-              "nor a drive and must be skipped), got {}".format(len(meta)))
+    if len(meta) != 4:
+        print("  FAIL: expected 4 built ports (the unconfigured one has neither "
+              "a load nor a drive and must be skipped), got {}".format(len(meta)))
         return 1
-    print("  kappa = {:.4g} ohm  (the field sees Z_eq + kappa/2 = "
-          "Z_eq + {:.4g} ohm)".format(meta[0]["kappa"], 0.5 * meta[0]["kappa"]))
+
+    # -- kappa: the placement identities ------------------------------------ #
+    dt = summary["dt"]
+    whole = dt * DX / (EPS0 * DX * DX)      # one whole cell of weight, in vacuum
+    print("  kappa = {:.4g} ohm node-to-node, {:.4g} ohm half-cell ends  "
+          "(C_cell = {:.4g} / {:.4g} fF in parallel)".format(
+              meta[0]["kappa"], meta[3]["kappa"],
+              1.0e15 * meta[0]["c_cell"], 1.0e15 * meta[3]["c_cell"]))
+    ok &= _report("kappa on nodes",
+                  abs(meta[0]["kappa"] - whole) / whole,
+                  "(dt*L/(eps*dA), L = 1 cell)", tol=KAPPA_TOL)
+    # Half + whole + half: 0.25 + 1 + 0.25 cells of w^2/h over a 2-cell span.
+    ok &= _report("kappa half-cell",
+                  abs(meta[3]["kappa"] - 1.5 * whole) / (1.5 * whole),
+                  "(two half-covered end cells)", tol=KAPPA_TOL)
+    ok &= _report("C_cell",
+                  abs(meta[3]["c_cell"] * meta[3]["kappa"] - dt) / dt,
+                  "(C_cell = dt/kappa)", tol=KAPPA_TOL)
 
     # -- resistor ---------------------------------------------------------- #
     v = data["lumped_0v_values"]
@@ -202,9 +239,17 @@ def main():
     ok &= _report("driven", np.max(np.abs(predicted - i)) / scale,
                   "(peak Vs = {:.3g} V)".format(np.max(np.abs(vs))))
 
+    # -- the same resistor law, on the half-cell-ended placement ------------- #
+    v = data["lumped_3v_values"]
+    i = data["lumped_3i_values"]
+    v_prev = np.concatenate(([0.0], v[:-1]))
+    predicted = -(v_prev + v) / (2.0 * R_PASSIVE)
+    scale = max(np.max(np.abs(i)), 1.0e-30)
+    ok &= _report("half-cell R", np.max(np.abs(predicted - i)) / scale)
+
     # A reactive branch must not cost the run its stability.
     finite = all(np.all(np.isfinite(data["lumped_{}{}_values".format(n, s)]))
-                 for n in range(3) for s in "vi")
+                 for n in range(4) for s in "vi")
     print("  {:14s} {}".format("finite", "OK" if finite else "FAIL"))
     ok &= finite
 

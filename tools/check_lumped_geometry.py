@@ -24,6 +24,14 @@ It also covers the polarity rules (an edge's own direction, ``ReversePolarity``)
 and the migration of a port saved with the old *local*-scope
 ``App::PropertyLinkSub`` terminals, which FreeCAD refuses to point into a Body.
 
+The last section is about the **grid** rather than the pick: that the endpoints
+reach the job exactly as picked (nothing snaps them), and that the
+``kappa``/``C_cell`` estimate matches the closed form on both a uniform and a
+graded mesh. Its identity ``kappa == dt*L/(eps*dA)`` for a node-to-node line is
+the same one ``tools/check_lumped_port.py`` asserts against the solver's own
+``LineSource.self_coupling``, which is what ties the two estimators together
+across the process split without this file needing the solver.
+
 ``freecadcmd`` can swallow a crashed script's stdout, so the report is also
 written to ``tools/lumped_geometry.txt``.
 """
@@ -45,10 +53,16 @@ if not hasattr(FreeCADGui, "addCommand"):
 import Part
 
 from wavesim_gui import commands
+from wavesim_gui import domain as domain_mod
 from wavesim_gui import lumped_port as lp
 
 
 TOL = 1.0e-9
+# The kappa identity reaches through a sub-stepped quadrature, so it closes to
+# round-off rather than exactly.
+KAPPA_TOL = 1.0e-6
+# wavesim.constants.EPS0's own (truncated) value -- the one lumped_port uses.
+EPS0 = 8.8541878e-12
 _LINES = []
 
 
@@ -219,10 +233,128 @@ def part_design_bodies():
     return ok
 
 
+def _ok(label, condition, detail=""):
+    _say("  {:24s} {}   {}".format(label, "OK  " if condition else "FAIL", detail))
+    return bool(condition)
+
+
+def endpoints_and_coupling():
+    """Endpoints reach the job untouched, and kappa / C_cell match the closed form.
+
+    A 1 mm uniform grid is **planted** straight onto the Domain's node arrays
+    rather than meshed: what is under test is the quadrature the estimator models,
+    and a hand-written grid makes the expected kappa a closed form. Nothing may
+    recompute after the planting -- ``Domain.execute`` would rebuild the arrays
+    from geometry that does not exist here -- so the ports are made first.
+
+    The graded case is the one that used to be wrong on both sides: the weights
+    are per-cell overlaps and the Ampere face is built from *dual* widths, so a
+    node-to-node line still satisfies ``kappa == dt*L/(eps*dA)`` on an uneven
+    mesh, and an element can span uneven cells at all.
+    """
+    doc, sim = _sim_doc("lp_gate_ends")
+    # Picked gaps: 4 cells across, 1 cell across, ends mid-cell, and oblique.
+    wide = doc.addObject("Part::Feature", "Wide")
+    wide.Shape = Part.makePolygon([_vec(5, 5, 4), _vec(5, 5, 8)])
+    narrow = doc.addObject("Part::Feature", "Narrow")
+    narrow.Shape = Part.makePolygon([_vec(9, 9, 4), _vec(9, 9, 5)])
+    partial = doc.addObject("Part::Feature", "Partial")
+    partial.Shape = Part.makePolygon([_vec(7, 7, 4.5), _vec(7, 7, 7.5)])
+    oblique = doc.addObject("Part::Feature", "Oblique")
+    oblique.Shape = Part.makePolygon([_vec(12, 12, 4), _vec(12, 15, 8)])
+    doc.recompute()
+
+    port = _port(doc, sim, "S1", (wide, []))
+    flipped = _port(doc, sim, "S2", (wide, []), reverse=True)
+    one_cell = _port(doc, sim, "S3", (narrow, []))
+    half_ends = _port(doc, sim, "S4", (partial, []))
+    skew = _port(doc, sim, "S5", (oblique, []))
+
+    dom = domain_mod.find_domain(sim)
+    ticks = [float(i) for i in range(21)]        # 0..20 mm, 1 mm cells
+    dom.NodesX = dom.NodesY = dom.NodesZ = ticks
+    dom.Nx = dom.Ny = dom.Nz = 20
+    dt = domain_mod.cfl_dt(dom)
+
+    ok = True
+    _say("\nendpoints & coupling (planted 1 mm grid, 20 cells per axis)")
+
+    # The job carries the picked ends: nothing snaps them any more, because the
+    # solver weights an edge by the line's overlap with that edge's own cell.
+    spec = lp.lumped_port_spec(port, (0.0, 0.0, 0.0))
+    ok &= _ok("spec carries the pick",
+              spec is not None and abs(spec["p0"][2] - 0.004) < TOL
+              and abs(spec["p1"][2] - 0.008) < TOL,
+              "" if spec is None else "p0 = {}  p1 = {}".format(
+                  spec["p0"], spec["p1"]))
+    ok &= _ok("polarity kept",
+              abs(lp.lumped_port_spec(flipped, (0.0, 0.0, 0.0))["p0"][2] - 0.008)
+              < TOL, "'+' end stays the '+' end")
+
+    # kappa == dt*L/(eps*dA) node to node -- the identity the solver-side gate
+    # checks against LineSource.self_coupling on its own grid.
+    area = 1.0e-6
+    for obj, label, length, cells, partial_ends in (
+            (port, "4-cell line", 4.0e-3, 4, 0),
+            (one_cell, "1-cell line", 1.0e-3, 1, 0),
+            (half_ends, "mid-cell ends", 3.0e-3, 4, 2)):
+        report = lp.coupling_report(obj, sim)
+        if report is None:
+            ok &= _ok(label, False, "report is None")
+            continue
+        # kappa sums w^2/h: a whole cell contributes h, a half-covered end h/4.
+        # The mid-cell line covers cells 4..7 as 0.5, 1, 1, 0.5 mm, so the sum is
+        # 0.25 + 1 + 1 + 0.25 = 2.5 mm against its 3 mm length.
+        eff = length if partial_ends == 0 else 2.5e-3
+        expect_kappa = dt * eff / (EPS0 * area)
+        ok &= _ok(label,
+                  abs(report["length"] - length) < TOL
+                  and report["cells"] == cells
+                  and report["partial_ends"] == partial_ends
+                  and abs(report["kappa"] - expect_kappa) / expect_kappa < KAPPA_TOL
+                  and abs(report["c_cell"] * report["kappa"] - dt) / dt < KAPPA_TOL,
+                  "L %.3f mm, %d cells, %d partial, kappa %.5g (expect %.5g), "
+                  "C_cell %.4g fF" % (report["length"] * 1e3, report["cells"],
+                                      report["partial_ends"], report["kappa"],
+                                      expect_kappa, report["c_cell"] * 1e15))
+
+    # An oblique line is left alone and gets no estimate (a different quadrature).
+    ok &= _ok("oblique gets no estimate", lp.coupling_report(skew, sim) is None,
+              "spec still written: %s" % (
+                  lp.lumped_port_spec(skew, (0.0, 0.0, 0.0)) is not None,))
+
+    # A graded mesh must not change the identity -- that is the whole point of
+    # the per-cell overlap weights and the dual Ampere face.
+    graded = [0.0]
+    for i in range(20):
+        graded.append(graded[-1] + (0.6 if i % 2 else 1.4))
+    dom.NodesZ = graded
+    dom.Nz = 20
+    wide.Shape = Part.makePolygon([_vec(5, 5, graded[4]), _vec(5, 5, graded[8])])
+    doc.recompute()
+    dom.NodesX = dom.NodesY = ticks
+    dom.NodesZ = graded
+    dom.Nx = dom.Ny = dom.Nz = 20
+    report = lp.coupling_report(port, sim)
+    dt = domain_mod.cfl_dt(dom)
+    length = (graded[8] - graded[4]) * 1.0e-3
+    expect = dt * length / (EPS0 * area)
+    ok &= _ok("graded mesh, node to node",
+              report is not None
+              and abs(report["kappa"] - expect) / expect < KAPPA_TOL,
+              "kappa %.6g, expected %.6g (L = %.3f mm over 4 uneven cells)"
+              % (report["kappa"] if report else float("nan"), expect,
+                 length * 1e3))
+
+    FreeCAD.closeDocument(doc.Name)
+    return ok
+
+
 def main():
     _say("lumped port geometry gate")
     ok = primitives()
     ok &= part_design_bodies()
+    ok &= endpoints_and_coupling()
     _say("\nRESULT: {}".format("PASS" if ok else "FAIL"))
     with open(os.path.join(_HERE, "lumped_geometry.txt"), "w",
               encoding="utf-8") as fh:

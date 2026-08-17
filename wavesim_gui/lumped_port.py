@@ -44,19 +44,55 @@ button, and the only way to flip a single-edge pick.
 
 Nothing is added to the document: the resolved endpoints live in the hidden
 ``P0``/``P1`` and the view provider draws its own bold segment, ``+``/``-`` end
-markers and a mid-line arrow along the positive-current direction. The picked
+markers and a mid-line arrow pointing from ``-`` to ``+``, the direction current
+is driven *through* the element (a source's own reference direction). The picked
 bodies keep their own appearance.
 
-The grid parasitic
+What the element delivers
+-------------------------
+The value asked for is the value the field gets: the element contributes exactly
+its own admittance, measured spectrally solver-side to four figures over 4-30 GHz
+for R, L and C. There is **no** ``kappa/2`` in series and nothing to
+pre-compensate -- an earlier version of this module claimed there was and the
+panel told users to subtract it from a resistance, which mis-set the value. The
+only deviation is the trapezoidal companion's frequency warp,
+``s -> j*(2/dt)*tan(w*dt/2)`` (0.06% on 100 fF at 30 GHz).
+
+What *is* across the element is the modelled gap's own capacitance: the Yee cells
+the line occupies keep ``C_cell = eps*dA/dl`` in parallel (``= dt/kappa``, with
+``kappa = sum(dt*w^2/(eps*dV))`` over the line's edges). That is the gap's real
+capacitance, there with or without the element, exactly as a real gap would have
+it. It is only an artifact when the component's footprint is smaller than one
+cell, and then it drifts as the mesh is refined -- the fix is meshing (refine the
+port cell transversely), never compensation. The task panel reports it
+(:func:`cell_capacitance_f`) against the load, because nothing else in the run
+will say so.
+
+Endpoint placement
 ------------------
-A discrete lumped element presents ``Z_eq + kappa/2`` to the field, not
-``Z_eq``: ``kappa = sum(dt*dl^2/(eps*dV))`` over the line's Yee edges is the
-port voltage change per unit injected current, and half of it lands in series
-with the load. A resistor can pre-compensate (``R = R_target - kappa/2``); a
-reactive branch cannot, and kappa/2 runs to ~100 ohm per edge on a short line,
-which is the practical limit on how ideal a discrete capacitor can be. The task
-panel estimates it (:func:`self_coupling_ohms`) and compares it against the
-load, because nothing else in the run will say so.
+**Draw the line across the gap and leave it alone.** The solver gives each Yee
+edge the length of the line inside that edge's own cell, and divides by the dual
+Ampere face across it, so a path running from one conductor surface to the other
+puts the same current through every cell it crosses -- charge lands on the two
+terminals and nowhere else -- however uneven the mesh is. Terminals picked as the
+two facing surfaces are therefore exactly right, and nothing here adjusts them.
+
+Two things still spoil an element, and both are about *which* edges the path
+covers rather than how they are weighted:
+
+* **Do not let the path run through metal.** Pick the faces that *face* the gap
+  (a trace's underside, a ground plane's top), not the far side of either
+  conductor. An edge inside the conductor is charged by the injection and cleared
+  by the PEC mask every step, which reads back as a large spurious series
+  capacitance (~100 fF in the solver's test geometry) without looking wrong.
+* **The path has to reach both conductors.** An element that stops short of the
+  metal has the remaining sliver of gap in series with it as a capacitance -- a
+  few fF, which is kilohms at 10 GHz.
+
+This module briefly snapped both ends onto cell centres, to dodge a solver-side
+quadrature that bound a sub-step to the *nearest node* rather than to its own
+cell. With that fixed the snap did both kinds of damage at once (short of the
+metal at one end, half an edge inside it at the other), and it is gone.
 
 Units: FreeCAD is millimetres, the solver metres -- :func:`lumped_port_spec`
 converts to the solver frame (from the domain origin), mirroring
@@ -495,7 +531,7 @@ def _describe(obj):
 
 
 # --------------------------------------------------------------------------- #
-# The grid parasitic (kappa)
+# The grid the element lands on: endpoint snapping, kappa, C_cell
 # --------------------------------------------------------------------------- #
 
 def _cell_span(nodes, lo, hi):
@@ -521,24 +557,75 @@ def _nearest_yee_index(locs, values):
     return [min(max(bisect.bisect_right(bounds, v), 0), last) for v in values]
 
 
-def self_coupling_ohms(obj, sim=None):
-    """Estimated ``kappa`` in ohms for this port on the current grid, or ``None``.
+def _node_dual_widths(nodes):
+    """Dual-cell width centred on each **node**, mirroring the solver's array.
 
-    ``kappa = sum(dt*dl^2/(eps*dV))`` over the Yee E-edges the line occupies
-    (:meth:`wavesim.sources.LineSource.self_coupling`). Half of it sits in
-    series with the load.
+    ``wavesim.grid.FDTDGrid.node_dual_widths``: the dual cell straddling node
+    ``n`` is ``(h[n-1] + h[n])/2``, and node 0 gets the boundary-truncated
+    ``h[0]/2``. This is the divisor the E update applies across an edge -- so it,
+    and not the primary width, is what sets the Ampere face a lumped element
+    injects through.
+    """
+    widths = [nodes[i + 1] - nodes[i] for i in range(len(nodes) - 1)]
+    out = [0.5 * widths[0]]
+    for i in range(1, len(widths)):
+        out.append(0.5 * (widths[i - 1] + widths[i]))
+    return out
 
-    This **replicates the solver's own quadrature** rather than assuming the
-    line covers whole edges, because it does not: the path is walked in
-    sub-steps of half a cell and each sub-step's length is binned onto the Yee
-    edge nearest its midpoint, so a line whose endpoints sit on grid *nodes*
-    puts a half weight on an edge at either end. Since kappa sums ``w^2`` that
-    is not a rounding detail -- for the commonest case of all, a gap crossed in
-    one cell, the whole-edge assumption overstates kappa by exactly 2x.
+
+def _overlaps(nodes, lo, hi):
+    """``[(cell index, overlap length), ...]`` for the interval ``[lo, hi]``.
+
+    The solver's quadrature, exactly: a sub-step belongs to the cell that
+    *contains* it (``_CENTRE_OFFSETS`` puts an ``E_a`` sample at the centre of
+    its own cell along ``a``), so an edge's weight is the length of the line
+    inside that cell. A path running node to node therefore gets ``w = h`` on
+    every cell it crosses, whatever the local grading.
+    """
+    out = []
+    for i in range(len(nodes) - 1):
+        a, b = max(lo, nodes[i]), min(hi, nodes[i + 1])
+        # An endpoint that lands on a conductor surface lands on a *node*, and
+        # the mm->m conversion leaves it a few ULP off it. Without a tolerance
+        # that sliver reads as one more covered cell, and as a partial end.
+        if b - a > 1.0e-9 * (nodes[i + 1] - nodes[i]):
+            out.append((i, b - a))
+    return out
+
+
+def coupling_report(obj, sim=None):
+    """What the grid does to this port, or ``None`` when it cannot be told yet.
+
+    A dict with
+
+    ``kappa``
+        ohms; ``sum(dt*w^2/(eps*h*dA_dual))`` over the Yee E-edges the line
+        occupies (:meth:`wavesim.sources.LineSource.self_coupling`). Not a series
+        parasitic -- see the module docstring -- but the number the run reports
+        and the one ``C_cell`` is derived from.
+    ``c_cell``
+        farads; ``dt/kappa``, which for a path running node to node is
+        ``eps*dA_dual/L`` -- the modelled gap's own capacitance, in **parallel**
+        with the element.
+    ``length`` / ``cells`` / ``edges``
+        metres along the axis, and how many grid cells and Yee edges the line
+        covers (equal, since every covered cell contributes one edge).
+    ``partial_ends``
+        how many of the two end cells the line covers only *part* of. Zero when
+        the picked ends land on cell boundaries, which is what happens when the
+        terminals are the two conductor surfaces and the mesher has put grid
+        lines on them. A partial end is not an error -- the weights are exact
+        either way -- it just means the element stops inside a cell.
+
+    This **replicates the solver's own quadrature**: a weight is the length of
+    the line inside each cell (``_CENTRE_OFFSETS`` puts an ``E_a`` sample at its
+    own cell's centre along ``a``), and the Ampere face across the edge is built
+    from **dual** widths centred on the edge's nodes, not primary cell widths.
+    Both matter on a graded mesh and neither does on a uniform one.
 
     Estimated in one respect and honest about it: the permittivity used is the
-    domain **background** material's, since the run reads a per-edge epsilon off
-    a voxelised grid that does not exist until the job is built. An oblique line
+    domain **background** material's, since the run reads a per-edge epsilon off a
+    voxelised grid that does not exist until the job is built. An oblique line
     returns ``None`` rather than a number from a quadrature (per-axis staggered
     edges) this does not implement.
     """
@@ -574,45 +661,67 @@ def self_coupling_ohms(obj, sim=None):
     if any(not w for w in widths):
         return None
 
-    # The transverse Yee offset of the line's own component is half a cell, so
-    # those two indices come from the cell centres; the offset along the line is
-    # zero, so those sample positions are the nodes themselves (see
-    # wavesim.monitors._YEE_OFFSETS -- this is what makes a node-aligned end
-    # contribute a half weight).
-    trans_idx = {}
+    # Across the line, the component sits *on* the node (offset 0), and the face
+    # the E update integrates over is bounded by the dual widths centred there.
+    area = 1.0
     for a in range(3):
         if a == axis:
             continue
-        centres = [0.5 * (nodes[a][i] + nodes[a][i + 1])
-                   for i in range(len(widths[a]))]
-        trans_idx[a] = _nearest_yee_index(centres, [p0_m[a]])[0]
-    area = 1.0
-    for a, i in trans_idx.items():
-        area *= widths[a][i]
+        locs = nodes[a][:len(widths[a])]
+        idx = _nearest_yee_index(locs, [p0_m[a]])[0]
+        area *= _node_dual_widths(nodes[a])[idx]
     if area <= 0.0:
         return None
 
-    # Sub-step exactly as the solver's path quadrature does: steps of at most
-    # half the smallest cell anywhere, each binned onto the nearest Yee edge.
-    length = abs(p1_m[axis] - p0_m[axis])
-    max_step = 0.5 * min(domain_mod.min_spacings_m(dom))
-    if max_step <= 0.0 or length <= 0.0:
+    lo, hi = sorted((p0_m[axis], p1_m[axis]))
+    per_edge = _overlaps(nodes[axis], lo, hi)
+    if not per_edge:
         return None
-    n_sub = max(1, int(math.ceil(length / max_step * (1.0 - 1.0e-9))))
-    n_sub = min(n_sub, 100000)
-    step = (p1_m[axis] - p0_m[axis]) / n_sub
-    mids = [p0_m[axis] + (m + 0.5) * step for m in range(n_sub)]
-    locs = nodes[axis][:len(widths[axis])]      # E_a samples sit on the nodes
-    per_edge = {}
-    for i in _nearest_yee_index(locs, mids):
-        per_edge[i] = per_edge.get(i, 0.0) + abs(step)
+    length = hi - lo
 
-    total = 0.0
-    for i, w in per_edge.items():
+    kappa = 0.0
+    for i, w in per_edge:
         dv = widths[axis][i] * area
         if dv > 0.0:
-            total += dt * w * w / (_EPS0 * eps_r * dv)
-    return total if total > 0.0 else None
+            kappa += dt * w * w / (_EPS0 * eps_r * dv)
+    if kappa <= 0.0:
+        return None
+    partial = sum(1 for i, w in (per_edge[0], per_edge[-1])
+                  if w < widths[axis][i] * (1.0 - 1.0e-9))
+    return {
+        "kappa": kappa,
+        "c_cell": dt / kappa,
+        "length": length,
+        "cells": len(per_edge),
+        "edges": len(per_edge),
+        "partial_ends": partial if len(per_edge) > 1 else (1 if partial else 0),
+        "area": area,
+        "eps_r": eps_r,
+        "dt": dt,
+    }
+
+
+def self_coupling_ohms(obj, sim=None):
+    """``kappa`` in ohms for this port as the job will place it, or ``None``.
+
+    Kept as its own name because it is the quantity the run reports back
+    (``summary["lumped_ports"][i]["kappa"]``); everything the panel says comes
+    from :func:`coupling_report`.
+    """
+    report = coupling_report(obj, sim)
+    return report["kappa"] if report else None
+
+
+def cell_capacitance_f(obj, sim=None):
+    """The gap capacitance ``C_cell = eps*dA/L`` in parallel with the element.
+
+    Farads, or ``None`` when the grid cannot be read yet (see
+    :func:`coupling_report`). This is the number worth showing a user: the
+    element itself delivers exactly the R/L/C asked for, and this is what sits
+    across it.
+    """
+    report = coupling_report(obj, sim)
+    return report["c_cell"] if report else None
 
 
 def cells_crossed(obj, sim=None):
@@ -850,6 +959,12 @@ def lumped_port_spec(obj, origin_m):
     do not resolve to a line, or when the port has neither a load nor a drive --
     the solver's ``LineSource`` refuses that combination, and it means the user
     has not finished configuring the port rather than that the run is wrong.
+
+    The endpoints written here are **exactly the picked ones**. They were briefly
+    snapped onto cell centres (see the module docstring's placement section);
+    with the solver binding a sub-step to the cell that *contains* it, that snap
+    left the element half a cell short of the conductor at one end and half an
+    edge inside the metal at the other, which is worse than doing nothing.
     """
     p0, p1, warnings = resolve_line(obj)
     for text in warnings:
@@ -894,7 +1009,12 @@ def colocation_warnings(sim):
     Co-located elements inject sequentially rather than as one solved circuit,
     so each contributes its own ``kappa/2`` in series and the pair settles to a
     divider the user did not ask for. One port with a ``Topology`` network is
-    the supported way to put two branches on one gap.
+    the supported way to put two branches on one gap -- those branches *are*
+    solved jointly.
+
+    This is the **one** place ``kappa/2`` is real. A single element has no such
+    series term (see the module docstring); it appears only because two elements
+    sharing edges each see the other's injection as a field change.
     """
     ports = [(p, line_endpoints_mm(p)) for p in find_lumped_ports(sim)]
     ports = [(p, e) for p, e in ports if e is not None]
@@ -992,9 +1112,10 @@ if _GUI_AVAILABLE:
             self._line = coin.SoLineSet()
             root.addChild(self._line)
 
-            # Mid-line arrow along p0 -> p1, the direction positive port current
-            # is delivered. Sized as a fraction of the line (rather than a fixed
-            # pixel size) so it stays readable against the element it labels.
+            # Mid-line arrow pointing '-' -> '+' (p1 -> p0): the direction current
+            # is driven *through the element*, which is how a source is drawn in a
+            # circuit. Sized as a fraction of the line (rather than a fixed pixel
+            # size) so it stays readable against the element it labels.
             arrow = coin.SoSeparator()
             acolor = coin.SoBaseColor()
             acolor.rgb.setValue(*_LINE_COLOR)
@@ -1063,9 +1184,10 @@ if _GUI_AVAILABLE:
             size = _ARROW_FRACTION * delta.Length
             mid = p0 + delta * 0.5
             self._arrow_pos.translation.setValue(mid.x, mid.y, mid.z)
+            # The cone's axis is +Y; aim it along '-' -> '+', i.e. against delta.
             self._arrow_rot.rotation.setValue(
                 coin.SbRotation(coin.SbVec3f(0.0, 1.0, 0.0),
-                                coin.SbVec3f(delta.x, delta.y, delta.z)))
+                                coin.SbVec3f(-delta.x, -delta.y, -delta.z)))
             self._arrow_scale.scaleFactor.setValue(size, size, size)
 
             self._plus["coords"].point.setValues(0, 1, [pts[0]])
@@ -1256,7 +1378,11 @@ if _GUI_AVAILABLE:
                 "line across a gap. Select two vertices, two parallel planar "
                 "faces, or a single edge; the '+' terminal is where positive "
                 "port current leaves. Give it a load, a drive, or both. For a "
-                "nonlinear or larger circuit use a SPICE line port instead."
+                "nonlinear or larger circuit use a SPICE line port instead.\n"
+                "The run gets exactly the values above, and the line exactly as "
+                "drawn. Pick the two faces that face each other across the gap - "
+                "a path that runs into metal, or stops short of it, is the one "
+                "way to spoil the element."
             )
             info.setWordWrap(True)
             layout.addRow(info)
@@ -1364,11 +1490,14 @@ if _GUI_AVAILABLE:
             return 1.0 / sum(1.0 / z for z in zs)
 
         def _update_hint(self, *_):
-            """Rebuild the geometry/parasitic hint from the current state.
+            """Rebuild the geometry/gap-capacitance hint from the current state.
 
-            The kappa/2 line is the point of this panel: a discrete lumped
-            element presents ``Z + kappa/2`` to the field, a reactive branch
-            cannot pre-compensate for it, and no other part of the run says so.
+            ``C_cell`` is the point of this panel. The element delivers exactly
+            the R/L/C asked for -- there is nothing to pre-compensate -- but the
+            cells it bridges keep their own gap capacitance in parallel, and that
+            one moves with the mesh, so it is the number a user has to see before
+            reading a port impedance back. The run gets the line exactly as drawn,
+            so what the panel shows is what the job carries.
             """
             from wavesim_gui.commands import max_frequency_hz
 
@@ -1388,35 +1517,57 @@ if _GUI_AVAILABLE:
                     delta.Length, axis_text,
                     ", {} cell{}".format(cells, "" if cells == 1 else "s")
                     if cells else ""))
-                kappa = self_coupling_ohms(obj, sim)
-                if kappa is None:
+                report = coupling_report(obj, sim)
+                if report is not None and report["partial_ends"]:
+                    # Not an error, but the usual cause is a terminal that does
+                    # not sit on the conductor surface the mesher put a grid line
+                    # on -- and an element that stops inside the gap has the rest
+                    # of the gap in series with it.
+                    lines.append(
+                        "{} end{} of the line stop{} inside a cell rather than on "
+                        "a cell boundary; check the terminals are the two faces "
+                        "across the gap.".format(
+                            report["partial_ends"],
+                            "" if report["partial_ends"] == 1 else "s",
+                            "s" if report["partial_ends"] == 1 else ""))
+                if report is None:
                     # Say why rather than quietly dropping the line the user is
                     # meant to read before trusting a reactive load.
                     lines.append(
-                        "Grid parasitic: only estimated for an axis-aligned "
+                        "Gap capacitance: only estimated for an axis-aligned "
                         "line." if axis is None else
-                        "Grid parasitic: unavailable until the domain has been "
+                        "Gap capacitance: unavailable until the domain has been "
                         "sized (assign geometry to a material).")
-                if kappa is not None:
+                else:
+                    c_cell = report["c_cell"]
                     lines.append(
-                        "Grid parasitic: kappa/2 = {:.4g} ohm in series with "
-                        "the load (background epsilon).".format(0.5 * kappa))
+                        "Gap capacitance: the cells the element bridges keep "
+                        "C_cell = {} in parallel with it (background epsilon). "
+                        "The element itself delivers exactly the values above - "
+                        "there is nothing to pre-compensate.".format(
+                            format_value(c_cell, "C")))
                     fmax = max_frequency_hz(sim) if sim is not None else 0.0
                     z = self._widget_impedance(fmax)
-                    if z is not None:
+                    if z is not None and fmax > 0.0:
                         mag = abs(z)
+                        shunt = 2.0 * math.pi * fmax * c_cell * mag
                         lines.append(
-                            "Load |Z| = {:.4g} ohm at {:.4g} GHz.".format(
-                                mag, fmax / 1.0e9))
-                        if 0.5 * kappa > 0.2 * mag:
-                            # kappa ~ dt*L/(eps*A_transverse), so the gap length
-                            # is the knob with the most authority -- said first.
+                            "Load |Z| = {:.4g} ohm at {:.4g} GHz, against "
+                            "{:.4g} ohm for C_cell ({:.2g}% of the load current "
+                            "goes round it).".format(
+                                mag, fmax / 1.0e9,
+                                1.0 / (2.0 * math.pi * fmax * c_cell),
+                                100.0 * shunt))
+                        if shunt > 0.1:
+                            # C_cell = eps*dA/L, so the transverse cell face is
+                            # the knob, and meshing is the only honest fix --
+                            # said in that order.
                             lines.append(
-                                "The parasitic is a large fraction of the "
-                                "load: shorten the gap (kappa grows with its "
-                                "length), or coarsen the cells across it, or "
-                                "pre-compensate a pure resistance by "
-                                "subtracting kappa/2.")
+                                "C_cell is a large fraction of the load: refine "
+                                "the cells *transverse* to the port line "
+                                "(C_cell shrinks with their face area dA). That "
+                                "is the fix - subtracting it from the branch "
+                                "value is not.")
             for text in warnings:
                 lines.append("Note: {}.".format(text))
             self._hint.setText(" ".join(lines))

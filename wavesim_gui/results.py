@@ -1583,6 +1583,235 @@ if _GUI_AVAILABLE:
             return float(v.max())
         return float(np.percentile(v, pct))
 
+    # --- smoothing --------------------------------------------------------- #
+    # Shading between cell centres rather than painting each cell flat. Shared
+    # by the snapshot animation (which rebuilds the same resampler once and
+    # replays it per frame) and the mode plot (which needs it once).
+
+    # ~4x upsampling, capped so a fine grid does not blow up the redraw.
+    _SMOOTH_TARGET, _SMOOTH_MAX = 4, 900
+
+    def _cubic_weights(src, n_out):
+        """Catmull-Rom taps resampling *src* samples onto `n_out` uniform ones.
+
+        Returns ``(idx, w)`` with ``idx`` four index arrays into the sample
+        axis and ``w`` their four weights, so the interpolation is four
+        gathers and a dot product per frame.
+        """
+        import numpy as np
+
+        n = len(src)
+        pos = np.interp(
+            np.linspace(src[0], src[-1], n_out), src, np.arange(n, dtype=float)
+        )
+        i1 = np.clip(np.floor(pos).astype(int), 0, n - 1)
+        t = (pos - i1)[:, None] ** np.arange(4)   # [1, t, t^2, t^3]
+        idx = [np.clip(i1 + k, 0, n - 1) for k in (-1, 0, 1, 2)]
+        # Catmull-Rom basis, as polynomials in t.
+        basis = np.array([
+            [0.0, -0.5, 1.0, -0.5],
+            [1.0, 0.0, -2.5, 1.5],
+            [0.0, 0.5, 2.0, -1.5],
+            [0.0, 0.0, -0.5, 0.5],
+        ])
+        return idx, t @ basis.T                   # (n_out, 4)
+
+    def _smooth_grid(data2d, cx, cy):
+        """Resample ``(ny, nx)`` *data2d* onto a fine uniform grid.
+
+        Returns ``(fine, extent)`` for ``imshow(origin="lower")``. The one-shot
+        form of the animation's ``_make_warp``, for a picture drawn once rather
+        than replayed: same taps, no per-frame closure to keep. Adds no data --
+        the samples are cell centres either way, and this interpolates between
+        the same numbers.
+        """
+        import numpy as np
+
+        arr = np.asarray(data2d, dtype=float)
+        ny, nx = arr.shape
+        nfx = int(min(max(nx, nx * _SMOOTH_TARGET), _SMOOTH_MAX))
+        nfy = int(min(max(ny, ny * _SMOOTH_TARGET), _SMOOTH_MAX))
+        ix, wx = _cubic_weights(cx, nfx)
+        iy, wy = _cubic_weights(cy, nfy)
+        a = sum(arr[:, ix[k]] * wx[:, k] for k in range(4))
+        fine = sum(a[iy[k], :] * wy[:, k][:, None] for k in range(4))
+        return fine, [float(cx[0]), float(cx[-1]), float(cy[0]), float(cy[-1])]
+
+    def _edges_from_centres(c):
+        """Cell edges around the sample centres *c* (halfway between, ends kept)."""
+        import numpy as np
+
+        c = np.asarray(c, dtype=float)
+        if c.size < 2:
+            return np.array([c[0] - 0.5, c[0] + 0.5]) if c.size else np.zeros(2)
+        mid = 0.5 * (c[1:] + c[:-1])
+        return np.concatenate((
+            [c[0] - (mid[0] - c[0])], mid, [c[-1] + (c[-1] - mid[-1])],
+        ))
+
+    # --- arrow overlays ---------------------------------------------------- #
+    # Two pictures draw a vector field over a colour map: the snapshot
+    # animation and the solved TEM mode. They place their arrows the same way,
+    # from here, so a mode and a field frame read alike -- and so neither one
+    # can drift into the mess that per-cell striding produces (arrows longer
+    # than their own spacing, overlapping into a smear that shows neither
+    # direction nor magnitude).
+    _ARROWS_ACROSS = 56     # arrows along the longer visible axis
+    # Longest arrow, in arrow pitches. Below 1 by design: with ``pivot="mid"``
+    # an arrow reaches half its length each way, so at most half a pitch, and
+    # two neighbours at full length pointing straight at each other still leave
+    # a gap. That makes "no overlap" a property of the lattice rather than
+    # something that happens to hold on a particular field.
+    _ARROW_SPAN = 0.9
+
+    # Slim shaft, small head: this is a direction field laid over a colour map,
+    # not a chart of a handful of vectors, so the arrows must stay readable at
+    # that density without blotting out what they sit on. ``width`` is in axes
+    # widths like the length, so it tracks ``_ARROWS_ACROSS`` inversely -- a
+    # denser lattice needs a proportionally thinner arrow to keep the same
+    # shape. The head is kept short for a second reason as well -- see
+    # ``_ARROW_FLOOR``.
+    _ARROW_STYLE = dict(width=0.0019, headwidth=3.0, headlength=3.0,
+                        headaxislength=2.8, pivot="mid")
+
+    # Shortest arrow drawn, as a fraction of full length. Below ``headlength *
+    # width`` (both in axes-width units) matplotlib stops shortening the shaft
+    # and scales the whole glyph down instead: all head and no shaft, which
+    # reads as a dot. A dot carries no direction, and the colour map underneath
+    # already says the field is weak there, so those are hidden rather than
+    # drawn. Derived from the style above rather than picked, so it stays
+    # exactly at the dot boundary if the style is ever retuned.
+    _ARROW_FLOOR = (_ARROW_STYLE["headlength"] * _ARROW_STYLE["width"]
+                    * _ARROWS_ACROSS / _ARROW_SPAN)
+
+    def _nearest_index(coords, vals):
+        """Index of the sample in *coords* nearest each of *vals*."""
+        import numpy as np
+
+        n = len(coords)
+        if n < 2:
+            return np.zeros(np.shape(vals), dtype=int)
+        j = np.clip(np.searchsorted(coords, vals), 1, n - 1)
+        return np.where(vals - coords[j - 1] <= coords[j] - vals, j - 1, j)
+
+    def _arrow_lattice(cx, cy, xlim, ylim):
+        """Square-lattice arrow sites over the window *xlim* x *ylim*.
+
+        Returns ``(px, py, ix, iy)``: flat site coordinates plus the
+        nearest-cell indices to read the field at, or ``None`` if the window
+        and the sample coordinates *cx*, *cy* do not overlap.
+
+        The sites are a lattice of fixed *physical* pitch, not every k-th cell.
+        Index striding puts the same arrow count on each axis, so a long thin
+        slice (a coax down z) comes out dense across and sparse along it -- and
+        on a graded grid the cells being strided are not even the same size, so
+        the arrows bunch up wherever the mesh is fine. The pitch is one number,
+        set by the longer axis and used for *both*, so the lattice stays square
+        whatever the aspect ratio: the short axis gets however many rows fit at
+        that pitch, centred, rather than its own extent divided into the same
+        count.
+        """
+        import numpy as np
+
+        xlo, xhi = sorted(xlim)
+        ylo, yhi = sorted(ylim)
+        x0, x1 = max(xlo, cx[0]), min(xhi, cx[-1])
+        y0, y1 = max(ylo, cy[0]), min(yhi, cy[-1])
+        if x1 <= x0 or y1 <= y0:
+            return None
+        # One pitch for both axes -- the lattice is square by construction.
+        pitch = max(x1 - x0, y1 - y0) / float(_ARROWS_ACROSS)
+        nx = max(1, int(round((x1 - x0) / pitch)))
+        ny = max(1, int(round((y1 - y0) / pitch)))
+        # Centred, so the leftover strip on the short axis is split evenly
+        # rather than piling up at one edge.
+        gx = x0 + 0.5 * ((x1 - x0) - (nx - 1) * pitch) + np.arange(nx) * pitch
+        gy = y0 + 0.5 * ((y1 - y0) - (ny - 1) * pitch) + np.arange(ny) * pitch
+        px, py = np.meshgrid(gx, gy)
+        px = np.clip(px, cx[0], cx[-1]).ravel()
+        py = np.clip(py, cy[0], cy[-1]).ravel()
+        return px, py, _nearest_index(cx, px), _nearest_index(cy, py)
+
+    def _arrow_scale(ref):
+        """``quiver`` scale that draws magnitude *ref* at full arrow length.
+
+        Goes with ``scale_units="width"``: arrow length is then a fraction of
+        the axes width rather than a data distance, so a *ref* vector spans
+        ``_ARROW_SPAN`` lattice pitches whatever the view is zoomed to, instead
+        of the lattice thinning out while the arrows keep their data length.
+        """
+        return (float(ref) or 1.0) * _ARROWS_ACROSS / _ARROW_SPAN
+
+    def _arrow_reference(mags):
+        """Magnitude drawn at full arrow length, from a sample of ``|field|``.
+
+        A *percentile*, not the peak: a source cell or a conductor edge is
+        often orders of magnitude above the field filling the picture, and
+        scaling on it collapses every other arrow to nothing (unlike the colour
+        map, a too-short arrow is invisible rather than merely faint). Vectors
+        above it are clipped to full length, keeping their exact direction.
+        Exact zeros -- conductor interiors, pre-arrival frames -- are left out,
+        so the reference does not depend on how much empty domain is in view.
+        """
+        import numpy as np
+
+        arr = np.asarray(mags, dtype=float)
+        nonzero = arr[np.isfinite(arr) & (arr > 0.0)]
+        if nonzero.size == 0:
+            return 1.0
+        return float(np.percentile(nonzero, 99.0)) or float(arr.max()) or 1.0
+
+    def _add_quiver(ax, px, py, u, v, ref, color):
+        """Add an arrow overlay to *ax* without letting it touch the view.
+
+        Not ``ax.quiver``: that adds the arrows with ``autolim=True`` and then
+        requests an autoscale. The overlay is a *reader* of the view -- both
+        its sites and its scale are chosen from the current limits, and it is
+        rebuilt whenever they change -- so letting it write to the limits as
+        well closes a loop. Adding arrows re-stales the view, settling the view
+        emits ``xlim_changed``, and that rebuilds the arrows; under Qt, where
+        the paint that settles the limits comes after the figure is assembled,
+        it recurses until the stack runs out ("maximum recursion depth exceeded"
+        on opening the plot). Going through ``add_collection(..., autolim=
+        False)`` breaks the loop at the source rather than papering over it
+        with re-entrancy flags -- the same rule the geometry outlines follow.
+
+        Length is in axes width rather than data units (``scale_units``), which
+        is what keeps an arrow the same size on screen, and a ``ref`` one
+        spanning ``_ARROW_SPAN`` pitches, however the view is zoomed.
+        """
+        from matplotlib.quiver import Quiver
+
+        art = Quiver(ax, px, py, u, v, angles="xy", scale_units="width",
+                     scale=_arrow_scale(ref), color=color, zorder=3,
+                     **_ARROW_STYLE)
+        ax.add_collection(art, autolim=False)
+        return art
+
+    def _arrow_uv(u, v, ref, length=None):
+        """``quiver`` components for the vectors (*u*, *v*), drawn at *length*.
+
+        Direction is kept exact; magnitude is carried by the drawn length,
+        which defaults to the vector's own clipped at *ref* (so the strongest
+        cells saturate at full length instead of setting the scale for
+        everything else). Vectors that would draw shorter than ``_ARROW_FLOOR``
+        come back as NaN, which ``quiver`` renders as nothing at all -- the
+        weak field then fades out of the picture rather than stippling it with
+        dots. Zero-length vectors -- conductor interiors, an unreached domain
+        -- go the same way.
+        """
+        import numpy as np
+
+        u = np.asarray(u, dtype=float)
+        v = np.asarray(v, dtype=float)
+        m = np.sqrt(u ** 2 + v ** 2)
+        if length is None:
+            length = np.minimum(m, ref)
+        with np.errstate(divide="ignore", invalid="ignore"):
+            f = np.where(m > 0, length / m, 0.0)
+            f = np.where(length >= _ARROW_FLOOR * ref, f, np.nan)
+        return u * f, v * f
+
     def _plot_snapshot(obj):
         import numpy as np
 
@@ -1782,32 +2011,6 @@ if _GUI_AVAILABLE:
         groups = _section_groups()
         pec_rings = _pec_rings(groups)
 
-        # ~4x upsampling, capped so a fine grid does not blow up the redraw.
-        _SMOOTH_TARGET, _SMOOTH_MAX = 4, 900
-
-        def _cubic_weights(src, n_out):
-            """Catmull-Rom taps resampling *src* samples onto `n_out` uniform ones.
-
-            Returns ``(idx, w)`` with ``idx`` four index arrays into the sample
-            axis and ``w`` their four weights, so the interpolation is four
-            gathers and a dot product per frame.
-            """
-            n = len(src)
-            pos = np.interp(
-                np.linspace(src[0], src[-1], n_out), src, np.arange(n, dtype=float)
-            )
-            i1 = np.clip(np.floor(pos).astype(int), 0, n - 1)
-            t = (pos - i1)[:, None] ** np.arange(4)   # [1, t, t^2, t^3]
-            idx = [np.clip(i1 + k, 0, n - 1) for k in (-1, 0, 1, 2)]
-            # Catmull-Rom basis, as polynomials in t.
-            basis = np.array([
-                [0.0, -0.5, 1.0, -0.5],
-                [1.0, 0.0, -2.5, 1.5],
-                [0.0, 0.5, 2.0, -1.5],
-                [0.0, 0.0, -0.5, 0.5],
-            ])
-            return idx, t @ basis.T                   # (n_out, 4)
-
         def _make_warp(nx, ny):
             """Build the resampler for an (ny, nx) frame, plus its imshow extent."""
             cx = _centres(xedges, nx, size.x if have_size else 0.0)
@@ -1939,60 +2142,21 @@ if _GUI_AVAILABLE:
         inplane = [c for c in str(getattr(obj, "InPlane", "")).split(",") if c]
         can_quiver = len(inplane) == 2 and all(c in comps for c in inplane)
 
-        # Arrows sit on a square lattice of fixed *physical* pitch over the
-        # visible axes, not on every k-th cell. Index striding puts the same
-        # arrow count on each axis, so a long thin slice (a coax down z) comes
-        # out dense across and sparse along it -- and on a graded grid the
-        # cells being strided are not even the same size. The pitch is one
-        # number, set by the longer visible axis and used for *both*, so the
-        # lattice stays square whatever the slice's aspect ratio: the short
-        # axis gets however many rows fit at that pitch, centred, rather than
-        # its own extent divided into the same count. Sites are recomputed on
-        # zoom, and arrow length is measured in axes width rather than data
-        # units, so zooming in yields its own arrows at the same on-screen size
-        # instead of a handful of giant ones.
-        _ARROWS_ACROSS = 28     # arrows along the longer visible axis
-        _ARROW_SPAN = 1.6       # longest arrow, in arrow pitches
-
-        def _nearest(coords, vals):
-            """Index of the sample in *coords* nearest each of *vals*."""
-            n = len(coords)
-            if n < 2:
-                return np.zeros(np.shape(vals), dtype=int)
-            j = np.clip(np.searchsorted(coords, vals), 1, n - 1)
-            return np.where(vals - coords[j - 1] <= coords[j] - vals, j - 1, j)
-
+        # Arrows sit on the shared square lattice (``_arrow_lattice``), clipped
+        # to the *visible* axes: sites are recomputed on zoom, and arrow length
+        # is measured in axes width rather than data units, so zooming in
+        # yields its own arrows at the same on-screen size instead of a handful
+        # of giant ones.
         def _arrow_sites(cx, cy):
-            """Square-lattice arrow sites over the visible axes.
-
-            Returns ``(px, py, ix, iy)``: flat site coordinates plus the
-            nearest-cell indices to read the field at, or ``None`` if the view
-            and the data do not overlap.
-            """
-            xlo, xhi = sorted(ax.get_xlim())
-            ylo, yhi = sorted(ax.get_ylim())
-            x0, x1 = max(xlo, cx[0]), min(xhi, cx[-1])
-            y0, y1 = max(ylo, cy[0]), min(yhi, cy[-1])
-            if x1 <= x0 or y1 <= y0:
-                return None
-            # One pitch for both axes -- the lattice is square by construction.
-            pitch = max(x1 - x0, y1 - y0) / float(_ARROWS_ACROSS)
-            nx = max(1, int(round((x1 - x0) / pitch)))
-            ny = max(1, int(round((y1 - y0) / pitch)))
-            # Centred, so the leftover strip on the short axis is split evenly
-            # rather than piling up at one edge.
-            gx = x0 + 0.5 * ((x1 - x0) - (nx - 1) * pitch) + np.arange(nx) * pitch
-            gy = y0 + 0.5 * ((y1 - y0) - (ny - 1) * pitch) + np.arange(ny) * pitch
-            px, py = np.meshgrid(gx, gy)
-            px = np.clip(px, cx[0], cx[-1]).ravel()
-            py = np.clip(py, cy[0], cy[-1]).ravel()
-            return px, py, _nearest(cx, px), _nearest(cy, py)
+            """Arrow sites over the visible axes; ``None`` if nothing is in view."""
+            return _arrow_lattice(cx, cy, ax.get_xlim(), ax.get_ylim())
 
         def _build_quiver():
             """Create the arrow overlay, or ``None`` if its components are gone.
 
-            Scaled once for the whole run so arrow length stays comparable
-            between frames -- and between zoom levels -- instead of rescaling.
+            Sites and scale are both taken from the current view, so the
+            overlay looks the same at any zoom; one scale for the whole run
+            keeps arrow length comparable between frames.
             """
             stacks = [_frames(c) for c in inplane]
             if any(s is None or len(s) == 0 for s in stacks):
@@ -2005,55 +2169,43 @@ if _GUI_AVAILABLE:
                 return None
             px, py, ix, iy = sites
 
-            # Reference magnitude drawn at full arrow length. A *percentile*, not
-            # the peak: a source cell or a conductor edge is often orders of
-            # magnitude above the propagating field, and scaling on it collapses
-            # every other arrow to nothing (unlike the colour map, a too-short
-            # arrow is invisible rather than merely faint). Longer vectors are
-            # clipped to full length, keeping their exact direction. Taken over
-            # the whole run once and cached, so a rebuild after a zoom cannot
-            # silently change what an arrow length means; strided (and cast
-            # only then, since a CUDA run's stacks are float32 and casting all
-            # of them would transiently double the run's frames in memory).
-            if quiver["ref"] is None:
-                s0, s1 = max(1, n0 // 64), max(1, n1 // 64)
-                mags = np.sqrt(
-                    np.asarray(stacks[0][:, ::s0, ::s1], dtype=float) ** 2
-                    + np.asarray(stacks[1][:, ::s0, ::s1], dtype=float) ** 2
-                )
-                nonzero = mags[mags > 0]
-                ref = float(np.percentile(nonzero, 99.0)) if nonzero.size else 0.0
-                quiver["ref"] = ref or float(mags.max()) or 1.0
-            ref = quiver["ref"]
+            # Reference magnitude drawn at full arrow length (see
+            # ``_arrow_reference``), read at the sites in view over every frame
+            # -- so it is exactly a percentile of what the overlay will draw,
+            # and it follows the view. Zoom into a quiet corner and its own
+            # structure comes up to full length, instead of a lattice of
+            # vectors all too short to draw; the price is that a length means
+            # "strong for this view", which the colour bar -- fixed for the
+            # whole run -- is there to qualify. It does *not* follow the frame:
+            # one number for the whole run keeps the animation comparable, and
+            # a wave would otherwise pump the arrows as it passed. Frames are
+            # strided (and cast only then, since a CUDA run's stacks are
+            # float32) to keep the gather small on a long run.
+            sf = max(1, len(stacks[0]) // 256)
+            ref = _arrow_reference(np.sqrt(
+                np.asarray(stacks[0][::sf][:, ix, iy], dtype=float) ** 2
+                + np.asarray(stacks[1][::sf][:, ix, iy], dtype=float) ** 2
+            ))
             linthresh = ref / 1e3
 
             def _uv(idx):
                 # One frame, read at the arrow sites (nearest cell).
                 u = np.asarray(stacks[0][idx][ix, iy], dtype=float)
                 v = np.asarray(stacks[1][idx][ix, iy], dtype=float)
-                m = np.sqrt(u ** 2 + v ** 2)
-                with np.errstate(divide="ignore", invalid="ignore"):
-                    if log_check.isChecked():
-                        # Match the colour map's log compression, so both layers
-                        # say the same thing about a weak field.
+                length = None
+                if log_check.isChecked():
+                    # Match the colour map's log compression, so both layers
+                    # say the same thing about a weak field -- including which
+                    # arrows survive the floor, since the compression lifts a
+                    # weak one back above it.
+                    m = np.sqrt(u ** 2 + v ** 2)
+                    with np.errstate(divide="ignore", invalid="ignore"):
                         length = ref * (np.log10(1.0 + m / linthresh)
                                         / np.log10(1.0 + ref / linthresh))
-                    else:
-                        length = np.minimum(m, ref)
-                    f = np.where(m > 0, length / m, 0.0)
-                return u * f, v * f
+                return _arrow_uv(u, v, ref, length)
 
             u0, v0 = _uv(slider.value())
-            art = ax.quiver(
-                px, py, u0, v0, angles="xy",
-                # Length in axes width, not data units: that is what makes the
-                # arrows keep their size (and the `ref` arrow keep spanning
-                # _ARROW_SPAN pitches) as the view zooms.
-                scale_units="width", scale=ref * _ARROWS_ACROSS / _ARROW_SPAN,
-                color=_arrow_color(view["comp"]), width=0.005,
-                headwidth=3.5, headlength=4.5, headaxislength=4.0,
-                pivot="mid", zorder=3,
-            )
+            art = _add_quiver(ax, px, py, u0, v0, ref, _arrow_color(view["comp"]))
             quiver["art"], quiver["uv"] = art, _uv
             return art
 
@@ -2061,7 +2213,7 @@ if _GUI_AVAILABLE:
             """Arrow colour that reads against the current colour map."""
             return "white" if _one_sided(choice) else "black"
 
-        quiver = {"art": None, "uv": None, "ref": None, "busy": False}
+        quiver = {"art": None, "uv": None, "busy": False}
 
         def _resite(*_args):
             """Re-place the arrows for the current view (zoom or pan).
@@ -2594,13 +2746,21 @@ if _GUI_AVAILABLE:
             "fields": str(meta.get("fields", "")),
         }
 
-    def _draw_mode(figure, data):
-        """Draw a solved TEM mode into *figure*: φ contours + E quiver + PEC outline.
+    # What the mode window's checkboxes hold, and what a plot drawn without a
+    # window (a caller that passes no options) gets. Both default on, as the
+    # snapshot's do.
+    _MODE_VIEW_DEFAULTS = {"smooth": True, "mask": True}
+
+    def _draw_mode(figure, data, opts=None):
+        """Draw a solved TEM mode into *figure*: φ map + E quiver + PEC outline.
 
         Mirrors :func:`wavesim.viz.plot_tem_mode` but works from the raw 2D arrays
         (FreeCAD's Python cannot import the solver), drawing with its own
         matplotlib. The port's per-unit-length parameters go in an annotation box.
         *figure* is cleared first, so the mode selector can redraw in place.
+
+        *opts* is the view state from :func:`_mode_view_controls` -- which of
+        smoothing and PEC masking are on.
         """
         import math
 
@@ -2622,18 +2782,101 @@ if _GUI_AVAILABLE:
             xa = (np.arange(Na) + 0.5) * (data["da"] or 1.0) * 1.0e3
             yb = (np.arange(Nb) + 0.5) * (data["db"] or 1.0) * 1.0e3
 
-        cf = ax.contourf(xa, yb, phi.T, levels=20, cmap="RdBu_r")
-        figure.colorbar(cf, ax=ax, pad=0.02, label="potential φ (V)")
-
-        Ea, Eb = data["Ea"], data["Eb"]
-        if Ea is not None and Eb is not None:
-            step = max(1, min(Na, Nb) // 25)
-            AX, BY = np.meshgrid(xa[::step], yb[::step])
-            ax.quiver(AX, BY, Ea.T[::step, ::step], Eb.T[::step, ::step],
-                      color="k", alpha=0.7, pivot="mid")
-
+        opts = dict(_MODE_VIEW_DEFAULTS) if opts is None else opts
         pec = data["pec"]
-        if pec is not None and np.any(pec):
+        has_pec = pec is not None and np.any(pec)
+
+        # φ is painted the way a snapshot paints its field, rather than as
+        # contour bands: smoothing here means the same Catmull-Rom resample and
+        # the same bilinear imshow, and turning it off shows the solver's actual
+        # cells (pcolormesh on the cell edges, which honours a graded grid).
+        # Nothing has to be kept out of the smoother the way a snapshot keeps
+        # its conductor zeros out: φ inside the metal is that conductor's own
+        # potential and joins continuously to the field outside it, so
+        # interpolating across the surface invents no edge.
+        if opts.get("smooth", True):
+            fine, box = _smooth_grid(np.asarray(phi, dtype=float).T, xa, yb)
+            art = ax.imshow(fine, origin="lower", extent=box, cmap="RdBu_r",
+                            aspect="equal", interpolation="bilinear")
+        else:
+            art = ax.pcolormesh(_edges_from_centres(xa), _edges_from_centres(yb),
+                                np.asarray(phi, dtype=float).T, cmap="RdBu_r")
+        figure.colorbar(art, ax=ax, pad=0.02, label="potential φ (V)")
+
+        # Blank the conductors: φ is constant in there and says nothing about
+        # the mode, and painted at full scale each one is the loudest thing in
+        # the picture. Cut from the saved PEC mask at the same 0.5 level the
+        # outline below is drawn at, so the blanking and the outline are the
+        # same curve rather than two near-misses. Under the arrows, over the
+        # field map -- the zorder the snapshot's mask uses.
+        if has_pec and opts.get("mask", True):
+            ax.contourf(xa, yb, np.asarray(pec).T.astype(float),
+                        levels=[0.5, 1.5], colors=[ax.get_facecolor()],
+                        zorder=1.8)
+
+        # E on the same arrow overlay the snapshot animation uses -- a lattice
+        # of fixed physical pitch over the *visible* axes, lengths clipped to
+        # one reference magnitude -- so a solved mode and a field frame of the
+        # same port read alike. What it replaces strided the cell grid and left
+        # the lengths to matplotlib's autoscale, and on any real port that drew
+        # arrows several pitches long on a lattice as dense as the mesh: they
+        # overlapped into a smear that showed neither direction nor magnitude,
+        # worst exactly at the conductor where the field varies fastest and
+        # matters most.
+        Ea, Eb = data["Ea"], data["Eb"]
+        arrows = {"art": None, "busy": False}
+
+        def _build_arrows():
+            """Draw the arrows for the current view; ``None`` if none are in it."""
+            sites = _arrow_lattice(xa, yb, ax.get_xlim(), ax.get_ylim())
+            if sites is None:
+                return None
+            px, py, ix, iy = sites
+            # Reference over the sites in view rather than the whole
+            # cross-section: zoomed in between the conductors, where the field
+            # is a fraction of what it is at the inner one, the local structure
+            # comes up to full length instead of vanishing under the floor.
+            u_site, v_site = Ea[ix, iy], Eb[ix, iy]
+            ref = _arrow_reference(np.sqrt(u_site ** 2 + v_site ** 2))
+            u, v = _arrow_uv(u_site, v_site, ref)
+            # ``_arrow_uv`` hands back NaN for the sites it hides -- inside the
+            # metal (E is exactly zero there) and wherever the field is too weak
+            # to draw as an arrow. Nothing redraws this artist in place, so drop
+            # them outright rather than leave unrendered vertices in it.
+            keep = np.isfinite(u) & np.isfinite(v)
+            arrows["art"] = _add_quiver(ax, px[keep], py[keep], u[keep], v[keep],
+                                        ref, "black")
+            return arrows["art"]
+
+        def _resite(*_args):
+            """Re-place the arrows for the current view (zoom or pan).
+
+            A rebuild rather than a move: both the site count and the scale
+            follow the view, and ``Quiver`` fixes its arrow count at
+            construction. Without this a zoom keeps the arrows it started with,
+            so the picture thins out to a handful the further in one goes --
+            the one thing the fixed-pitch lattice is meant to prevent.
+
+            The redraw stays *inside* the busy guard. Drawing can itself settle
+            the axes limits and so re-enter this callback, and on a canvas that
+            draws synchronously that is unbounded recursion rather than one
+            wasted rebuild.
+            """
+            if arrows["busy"]:
+                return
+            arrows["busy"] = True
+            try:
+                if arrows["art"] is not None:
+                    arrows["art"].remove()
+                    arrows["art"] = None
+                _build_arrows()
+                canvas = figure.canvas
+                if canvas is not None:
+                    canvas.draw_idle()
+            finally:
+                arrows["busy"] = False
+
+        if has_pec:
             ax.contour(xa, yb, np.asarray(pec).T.astype(float),
                        levels=[0.5], colors="dimgray", linewidths=1.5)
 
@@ -2676,6 +2919,77 @@ if _GUI_AVAILABLE:
                 va="top", ha="left", fontsize=8,
                 bbox=dict(boxstyle="round", facecolor="white", alpha=0.75))
 
+        # Arrows go on last, once the axes limits have stopped moving: both the
+        # lattice and the scale are read off those limits, and every contour
+        # added above autoscales the view as it lands -- which would fire the
+        # re-site mid-assembly, over limits that are not the final ones.
+        if Ea is not None and Eb is not None:
+            Ea = np.asarray(Ea, dtype=float)
+            Eb = np.asarray(Eb, dtype=float)
+            _build_arrows()
+            # The callbacks are held by the axes' own registry, and dropped with
+            # it when the mode selector clears the figure to draw another mode.
+            ax.callbacks.connect("xlim_changed", _resite)
+            ax.callbacks.connect("ylim_changed", _resite)
+
+    def _mode_view_controls(layout, redraw, has_pec):
+        """Add the mode plot's Smooth / Mask PEC checkboxes to *layout*.
+
+        Returns the options dict :func:`_draw_mode` reads; toggling a box
+        updates it and calls *redraw*. The same two controls the snapshot
+        animation carries, worded for a solved mode -- both windows that draw a
+        mode share them, so the preview after a solve and the leaf reopened
+        later out of the tree answer to the same switches.
+        """
+        _QtCore, QtWidgets = _qt()
+
+        opts = dict(_MODE_VIEW_DEFAULTS)
+        row = QtWidgets.QHBoxLayout()
+
+        smooth = QtWidgets.QCheckBox("Smooth")
+        smooth.setChecked(opts["smooth"])
+        smooth.setToolTip(
+            "Shade between neighbouring cell centres instead of painting each\n"
+            "cell flat. φ is a point sample at each cell centre, so this adds\n"
+            "no data -- it interpolates the same numbers. Turn it off to see\n"
+            "the cells the mode was solved on."
+        )
+        row.addWidget(smooth)
+
+        if has_pec:
+            mask = QtWidgets.QCheckBox("Mask PEC")
+            mask.setChecked(opts["mask"])
+            mask.setToolTip(
+                "Blank the conductors. φ in there is that conductor's own\n"
+                "potential, constant and at the end of the colour scale, which\n"
+                "makes the metal the loudest thing in a picture that is about\n"
+                "the field between the conductors.\n"
+                "Turn it off to see what the solve actually holds in there."
+            )
+            row.addWidget(mask)
+
+            def on_mask(checked):
+                opts["mask"] = bool(checked)
+                redraw()
+
+            mask.toggled.connect(on_mask)
+
+        def on_smooth(checked):
+            opts["smooth"] = bool(checked)
+            redraw()
+
+        smooth.toggled.connect(on_smooth)
+        row.addStretch(1)
+        layout.addLayout(row)
+        return opts
+
+    def _has_pec(data):
+        """Whether *data* carries a PEC mask worth offering a switch for."""
+        import numpy as np
+
+        pec = data.get("pec")
+        return pec is not None and bool(np.any(pec))
+
     def _plot_mode(obj):
         """Open the figure of a mode leaf saved by a run (double-click in the tree)."""
         data = _mode_data_from_leaf(obj)
@@ -2685,8 +2999,14 @@ if _GUI_AVAILABLE:
         made = _make_window("Wavesim Results - {}".format(obj.Label))
         if made is None:
             return
-        dialog, figure, _layout = made
-        _draw_mode(figure, data)
+        dialog, figure, layout = made
+
+        def redraw():
+            _draw_mode(figure, data, opts)
+            dialog._canvas.draw_idle()
+
+        opts = _mode_view_controls(layout, redraw, _has_pec(data))
+        _draw_mode(figure, data, opts)
         dialog._canvas.draw()
         dialog.show()
         _register_window(dialog)
@@ -2718,6 +3038,14 @@ if _GUI_AVAILABLE:
             return False
         dialog, figure, layout = made
 
+        # Which mode the switches redraw. One entry, so the ◀ / ▶ pair and the
+        # checkboxes agree on what is on screen whichever moved last.
+        shown = {"idx": 0}
+
+        def redraw():
+            _draw_mode(figure, datas[shown["idx"]], opts)
+            dialog._canvas.draw_idle()
+
         total = len(datas)
         if total > 1:
             for idx, data in enumerate(datas):
@@ -2745,8 +3073,8 @@ if _GUI_AVAILABLE:
                 # the buttons say how many modes are left to look at.
                 prev.setEnabled(idx > 0)
                 nxt.setEnabled(idx < total - 1)
-                _draw_mode(figure, datas[idx])
-                dialog._canvas.draw_idle()
+                shown["idx"] = idx
+                redraw()
 
             def step(delta):
                 combo.setCurrentIndex(
@@ -2758,7 +3086,11 @@ if _GUI_AVAILABLE:
             nxt.clicked.connect(lambda *_: step(+1))
             prev.setEnabled(False)
 
-        _draw_mode(figure, datas[0])
+        # A mask switch if any of the modes has metal to mask -- they are all
+        # the same cross-section, so one answer covers the window.
+        opts = _mode_view_controls(layout, redraw,
+                                   any(_has_pec(d) for d in datas))
+        _draw_mode(figure, datas[0], opts)
         dialog._canvas.draw()
         dialog.show()
         _register_window(dialog)

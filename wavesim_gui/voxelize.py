@@ -604,13 +604,46 @@ def _cut_section(body_shape, z_axis, z, deflection, nudge=0.0):
     return polys
 
 
-def _layer_inside(body_shape, z_axis, z, pts, deflection, nudge=0.0):
+# Why the conformal sampler asks for ``on_surface_open`` and nothing else does.
+#
+# matplotlib's crossing rule -- which this voxeliser reproduces exactly, and
+# promises to keep reproducing -- is half-open in the row direction: a sample
+# sitting exactly on a polygon's upper horizontal edge reads inside, one on the
+# lower edge reads outside. Mirror the geometry and those two answers swap, so a
+# body that is its own mirror image does not sample as one.
+#
+# That bites the conformal fractions specifically, because they are the only
+# arrays sampled *on node lines* -- and the grid snapper puts nodes on feature
+# extents, so a round conductor's tangent planes land exactly there. Cell
+# centres (the staircase and subpixel paths) hit a surface only by coincidence,
+# which is why ``pec_mask`` mirrors cleanly on the same geometry that splits
+# ``pec_edge_open_x`` 1-against-0.
+#
+# So the tie-break is opt-in: the conformal sampler resolves an on-surface sample
+# to *open*, and every other caller keeps the old answer bit for bit.
+#
+# Open, not metal, because that is already the contract downstream. A grid-
+# aligned conductor surface has always read fully open by these fractions'
+# own measure -- ``mode_solver`` says so where it refuses to derive its node mask
+# from them ("an edge lying in a grid-aligned surface is fully open by its own
+# measure, the run holds it at zero all the same"), and shorting such an edge is
+# :func:`wavesim.parts.pec_node_mask`'s job, not this sampler's. So the bug here
+# was never the *value*; it was that two mirror-image surfaces got different
+# ones. Resolving to open settles the tie on the side everything already
+# assumes, and leaves a body's covered fractions exactly where they were
+# wherever no sample lands on a surface at all.
+def _layer_inside(body_shape, z_axis, z, pts, deflection, nudge=0.0,
+                  on_surface_open=False):
     """Boolean mask of which *pts* (XY, mm) lie inside *body_shape* at height *z*.
 
     Tests every point at once with matplotlib. XOR-ing the wires applies the
     even-odd rule, which carves holes and handles solids nested inside holes.
     Returns ``None`` when the plane misses the solid. *nudge* is
     :func:`_section_polygons`'s degenerate-plane retry.
+
+    *on_surface_open* drops the samples lying exactly *on* a wire, after the XOR
+    rather than inside it: a point on a hole's rim is on that conductor's
+    surface just as much as one on the outer rim, and the two must not cancel.
 
     For the (usual) case of points forming an axis-aligned lattice, prefer
     :func:`_layer_inside_lattice` -- same answer, without the
@@ -619,16 +652,22 @@ def _layer_inside(body_shape, z_axis, z, pts, deflection, nudge=0.0):
     import numpy as np
     from matplotlib.path import Path
 
+    from wavesim_gui.scanline import on_flat_row_points
+
     polys = _section_polygons(body_shape, z_axis, z, deflection, nudge)
     if polys is None:
         return None
     inside = np.zeros(len(pts), dtype=bool)
+    border = np.zeros(len(pts), dtype=bool)
     for poly in polys:
         inside ^= Path(poly).contains_points(pts)
-    return inside
+        if on_surface_open:
+            border |= on_flat_row_points(poly, pts)
+    return inside & ~border
 
 
-def _layer_inside_lattice(body_shape, z_axis, z, xs, ys, deflection, nudge=0.0):
+def _layer_inside_lattice(body_shape, z_axis, z, xs, ys, deflection, nudge=0.0,
+                          on_surface_open=False):
     """:func:`_layer_inside` for a lattice of sample points ``xs`` x ``ys``.
 
     Returns a ``(len(xs), len(ys))`` mask (or ``None``) rather than a flat one --
@@ -640,15 +679,18 @@ def _layer_inside_lattice(body_shape, z_axis, z, xs, ys, deflection, nudge=0.0):
     """
     import numpy as np
 
-    from wavesim_gui.scanline import lattice_inside
+    from wavesim_gui.scanline import lattice_inside, on_flat_row
 
     polys = _section_polygons(body_shape, z_axis, z, deflection, nudge)
     if polys is None:
         return None
     inside = np.zeros((len(xs), len(ys)), dtype=bool)
+    border = np.zeros((len(xs), len(ys)), dtype=bool)
     for poly in polys:
         inside ^= lattice_inside(poly, xs, ys)
-    return inside
+        if on_surface_open:
+            border |= on_flat_row(poly, xs, ys)
+    return inside & ~border
 
 
 # --------------------------------------------------------------------------- #
@@ -940,7 +982,7 @@ def _band_blocks_lattice(body_shape, z_axis, z, lat, os_, deflection, nudge=0.0)
     """
     xs, ys, mi, mj = lat
     grid = _layer_inside_lattice(body_shape, z_axis, z, xs, ys, deflection,
-                                 nudge)
+                                 nudge, on_surface_open=True)
     if grid is None:
         return None
     view = grid.reshape(xs.size // (os_ + 1), os_ + 1,
@@ -959,7 +1001,7 @@ def _band_blocks_flat(body_shape, z_axis, z, xs, ys, os_, deflection, nudge=0.0)
     py = np.tile(ys, (1, os_ + 1))
     flat = _layer_inside(body_shape, z_axis, z,
                          np.column_stack([px.ravel(), py.ravel()]), deflection,
-                         nudge)
+                         nudge, on_surface_open=True)
     if flat is None:
         return None
     return flat.reshape(xs.shape[0], os_ + 1, os_ + 1)
@@ -1068,8 +1110,13 @@ def _conformal_pec_body(covered, body_shape, nodes_mm, span, os_, on_layer=None,
                      deflection, nudge, on_layer) as prefetched:
         counted[0] = not prefetched
         for kk in range(nk + 1):
+            # Same on-surface tie-break as the fine pass below -- this lattice is
+            # the node lattice, the one the snapper lands on conductor surfaces,
+            # and the two passes have to agree or the band boundary would be
+            # decided one way and its fractions the other.
             layer = _layer_inside_lattice(body_shape, Z_AXIS, float(zn[kk]),
-                                          xn, yn, deflection, nudge)
+                                          xn, yn, deflection, nudge,
+                                          on_surface_open=True)
             if layer is not None and layer.any():
                 node_in[:, :, kk] = layer
             _tick()
@@ -1142,7 +1189,8 @@ def _conformal_pec_body(covered, body_shape, nodes_mm, span, os_, on_layer=None,
                     z = float(zb[k, m + 1])
                     if lat is None:
                         layer = _layer_inside(body_shape, Z_AXIS, z,
-                                              cross_pts, deflection, nudge)
+                                              cross_pts, deflection, nudge,
+                                              on_surface_open=True)
                         _tick()
                         if layer is not None and layer.any():
                             cross[:, m, :] = layer.reshape(n, 1 + 2 * os_)

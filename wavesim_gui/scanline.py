@@ -73,6 +73,107 @@ def _exact_toggle(x, y, x0, y0, x1, y1):
     return (((y1 - y) * (x0 - x1) >= (x1 - x) * (y0 - y1)) == (y1 >= y))
 
 
+# --------------------------------------------------------------------------- #
+# Samples lying exactly *on* the polygon
+#
+# The crossing rule above is half-open in the row direction: its ``>=`` counts a
+# vertex on the row as "above", so a sample sitting exactly on the polygon's
+# *upper* horizontal edge reads inside and one on the *lower* edge reads
+# outside. That is a legitimate convention for a fill rule -- matplotlib's, and
+# the one :func:`lattice_inside` must keep reproducing -- but it is not
+# mirror-symmetric, and the voxeliser's whole geometry contract is.
+#
+# It is not an exotic case either. The grid snapper deliberately puts nodes on
+# feature extents, so a round conductor's tangent planes land exactly on node
+# lines, and the section of a cylinder through its own axis is a rectangle whose
+# edges lie exactly along them -- no chord error to blur the tie. On the
+# bent_coax port that read ``pec_edge_open_x`` = 1 at y = 12.5 mm against 0 at
+# y = 17.5 mm on a pin centred at 15: two mirror-image edges of one conductor,
+# opposite answers, on 29 of 56 x planes.
+#
+# :func:`on_edge_lattice` and :func:`on_edge_points` locate those samples so a
+# caller can settle them symmetrically. The voxeliser resolves them to *inside*:
+# the sample is on the conductor surface, and an edge lying in a PEC surface
+# carries no tangential E, so counting it as metal is both the mirror-symmetric
+# answer and the physical one. Callers that must stay bit-compatible with
+# matplotlib simply do not ask.
+# --------------------------------------------------------------------------- #
+
+
+def _mark_spans(rows, c0, c1, n_row, nx):
+    """``(n_row, nx)`` bool: column ranges ``[c0, c1)`` marked on ``rows``."""
+    marks = np.zeros((n_row, nx + 1), dtype=np.intp)
+    keep = c1 > c0
+    if keep.any():
+        np.add.at(marks, (rows[keep], c0[keep]), 1)
+        np.add.at(marks, (rows[keep], c1[keep]), -1)
+    return np.cumsum(marks, axis=1)[:, :nx] > 0
+
+
+def on_flat_row(poly, xs, ys):
+    """``(len(xs), len(ys))`` mask of samples lying on an **exactly horizontal**
+    edge of *poly*.
+
+    Deliberately narrow. The asymmetry being settled is the row rule's alone:
+    :func:`lattice_inside` already answers a sample on a *vertical* edge the same
+    way on both sides of a body (outside, both), and only the horizontal case
+    flips with the mirror. So only the horizontal case is touched, and only when
+    the edge's two endpoints share a ``y`` **bit for bit** -- which is what an
+    exact section gives (a plane parallel to a cylinder's axis cuts it as a true
+    rectangle) and what a chord approximation of a curve does not.
+
+    That last point is the whole reason for the narrowness. Any rule with a
+    tolerance around it inherits ``Wire.discretize``'s seam: on a circle the
+    chords are placed asymmetrically, so "near an edge" is itself asymmetric,
+    and a tolerant tie-break trades a clean 1.0 mirror error for a 0.125 one
+    instead of removing it. Requiring exactness keeps curved geometry -- where
+    the fill rule was never the problem -- untouched.
+    """
+    poly = np.asarray(poly, dtype=np.float64)
+    xs = np.ascontiguousarray(xs, dtype=np.float64)
+    ys = np.ascontiguousarray(ys, dtype=np.float64)
+    nx, ny = xs.size, ys.size
+    hit = np.zeros((nx, ny), dtype=bool)
+    if nx == 0 or ny == 0 or poly.shape[0] < 3:
+        return hit
+
+    x0, y0 = poly[:, 0], poly[:, 1]
+    x1, y1 = np.roll(x0, -1), np.roll(y0, -1)
+    flat = np.nonzero((y0 == y1) & (x0 != x1))[0]
+    if flat.size == 0:
+        return hit
+
+    ex0, ex1, ey = x0[flat], x1[flat], y0[flat]
+    lo = np.searchsorted(xs, np.minimum(ex0, ex1), side="left")
+    hi = np.searchsorted(xs, np.maximum(ex0, ex1), side="right")
+    for n in range(flat.size):
+        rows = np.nonzero(ys == ey[n])[0]
+        if rows.size:
+            hit[lo[n]:hi[n], rows] = True
+    return hit
+
+
+def on_flat_row_points(poly, pts):
+    """:func:`on_flat_row` for an arbitrary ``(P, 2)`` point list."""
+    poly = np.asarray(poly, dtype=np.float64)
+    pts = np.asarray(pts, dtype=np.float64)
+    hit = np.zeros(pts.shape[0], dtype=bool)
+    if pts.shape[0] == 0 or poly.shape[0] < 3:
+        return hit
+
+    x0, y0 = poly[:, 0], poly[:, 1]
+    x1, y1 = np.roll(x0, -1), np.roll(y0, -1)
+    flat = np.nonzero((y0 == y1) & (x0 != x1))[0]
+    if flat.size == 0:
+        return hit
+
+    px, py = pts[:, 0][:, None], pts[:, 1][:, None]
+    ex0, ex1, ey = x0[flat][None, :], x1[flat][None, :], y0[flat][None, :]
+    return ((py == ey)
+            & (px >= np.minimum(ex0, ex1))
+            & (px <= np.maximum(ex0, ex1))).any(axis=1)
+
+
 def lattice_inside(poly, xs, ys):
     """Even-odd inside mask of *poly* over the lattice ``xs`` x ``ys``.
 

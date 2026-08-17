@@ -28,8 +28,8 @@ substitute for asserting the symmetry directly.
 
 What it checks
 --------------
-1. **Mirror symmetry** of ``pec_mask`` and the ``eps_*`` arrays about both
-   in-plane axes, in all three voxelisation modes (plain / subpixel /
+1. **Mirror symmetry** of ``pec_mask`` and the ``eps_*`` arrays about all three
+   axes, in all three voxelisation modes (plain / subpixel /
    conformal), on a graded grid -- the case that broke, since a uniform grid can
    hide it by keeping every cell centre clear of the window.
 2. **The conformal open fractions** are mirror-symmetric too, with the correct
@@ -64,7 +64,7 @@ from wavesim_gui import voxelize as vox                        # noqa: E402
 # A coax is the right shape for this: circular, so every tolerance question is
 # live, and its centre sits on a node while the grid is graded around it.
 A_MM, B_MM, BOX_MM = 2.5, 9.0, 20.0
-CX = CY = BOX_MM / 2.0
+CX = CY = CZ = BOX_MM / 2.0
 LEN_MM = 6.0
 NZ = 6
 
@@ -105,10 +105,36 @@ class _Mat(object):
 
 
 def build_materials():
+    """The coax lying **along** the sectioning axis: every section is a circle."""
     axis = FreeCAD.Vector(CX, CY, 0.0)
     inner = Part.makeCylinder(A_MM, LEN_MM, axis)
     outer = Part.makeCylinder(B_MM, LEN_MM, axis)
     shield = Part.makeBox(BOX_MM, BOX_MM, LEN_MM).cut(outer)
+    return [
+        _Mat("PEC", 1.0, 1.0, True,
+             [_Body(inner, "Inner"), _Body(shield, "Shield")]),
+        _Mat("Dielectric", 2.3, 1.0, False, [_Body(outer.cut(inner), "Diel")]),
+    ]
+
+
+def build_materials_transverse():
+    """The same coax lying **across** the sectioning axis -- a different failure.
+
+    The voxeliser cuts its sections on z planes. With the coax along z (above)
+    every section is a circle, so a node tangent to the bore misses the section
+    polygon by chord error and the fill rule is never asked a tie. Turn the coax
+    across the cut and each section is an exact **rectangle** whose edges lie
+    along the tangent node planes -- and matplotlib's crossing rule, which is
+    half-open in the row direction, answers the two mirror-image edges
+    differently. That is the bent_coax port's 1-against-0 split of
+    ``pec_edge_open_x``, and no round conductor on a transverse line avoids it,
+    because the snapper puts nodes on feature extents on purpose.
+    """
+    base = FreeCAD.Vector(0.0, CY, CZ)
+    x_dir = FreeCAD.Vector(1.0, 0.0, 0.0)
+    inner = Part.makeCylinder(A_MM, LEN_MM, base, x_dir)
+    outer = Part.makeCylinder(B_MM, LEN_MM, base, x_dir)
+    shield = Part.makeBox(LEN_MM, BOX_MM, BOX_MM).cut(outer)
     return [
         _Mat("PEC", 1.0, 1.0, True,
              [_Body(inner, "Inner"), _Body(shield, "Shield")]),
@@ -137,6 +163,12 @@ def nodes():
     return ax, ax.copy(), np.linspace(0.0, LEN_MM / 1000.0, NZ + 1)
 
 
+def nodes_transverse():
+    """The same graded ruler on the two axes the transverse coax is round in."""
+    ax = graded_axis()
+    return np.linspace(0.0, LEN_MM / 1000.0, NZ + 1), ax, ax.copy()
+
+
 # --------------------------------------------------------------------------- #
 # Mirror conventions
 # --------------------------------------------------------------------------- #
@@ -145,10 +177,20 @@ def nodes():
 # the quantity *spans* (an Ex edge along x, an Hz face across x) reverses; an
 # axis it sits *on* a node of maps node i <-> node N, so index 0 has no partner
 # and the comparison starts at 1.
+#
+# All **three** axes. This table was 2-tuples and the loop below ran axes 0 and 1
+# only, which is why a tangency on the third axis could sit here unseen: the
+# double-sphere spark gap (poles on z) split two identical conductors' self-
+# capacitance by 2.3% with every checked axis clean, and the bent_coax port split
+# ``pec_edge_open_x`` 1-against-0 on its own tangent plane. z is not special --
+# it was just the axis nothing asked about.
 _FRACTION_AXES = {
-    "pec_edge_open_x": ("span", "node"), "pec_edge_open_y": ("node", "span"),
-    "pec_edge_open_z": ("node", "node"), "pec_face_open_x": ("node", "span"),
-    "pec_face_open_y": ("span", "node"), "pec_face_open_z": ("span", "span"),
+    "pec_edge_open_x": ("span", "node", "node"),
+    "pec_edge_open_y": ("node", "span", "node"),
+    "pec_edge_open_z": ("node", "node", "span"),
+    "pec_face_open_x": ("node", "span", "span"),
+    "pec_face_open_y": ("span", "node", "span"),
+    "pec_face_open_z": ("span", "span", "node"),
 }
 
 
@@ -179,26 +221,47 @@ def set_fractions(fr):
      vox._CONFORMAL_CHORD_FRACTION) = fr
 
 
-def run(fractions, label, expect_symmetric=True):
+def run(fractions, label, expect_symmetric=True, geometry=None, modes=None,
+        check_axes=(0, 1, 2), known_open=()):
     set_fractions(fractions)
-    mats, nm = build_materials(), nodes()
+    build, node_fn = geometry or (build_materials, nodes)
+    mats, nm = build(), node_fn()
     emit()
     emit("%s (coarse/subpixel/conformal chord = %g / %g / %g)"
          % ((label,) + tuple(fractions)))
     for mode, kw in (("plain", {}), ("subpixel", {"subpixel": True}),
                      ("conformal", {"conformal": True})):
+        if modes is not None and mode not in modes:
+            continue
         res = vox.voxelize_materials(mats, (4.0e-4,) * 3, nodes_m=nm, **kw)
         arrays = res["arrays"]
         worst, where = 0.0, ""
+        open_worst, open_where = 0.0, ""
         for key, arr in arrays.items():
-            axes = _FRACTION_AXES.get(key, ("span", "span"))
-            for ax in (0, 1):
+            axes = _FRACTION_AXES.get(key, ("span", "span", "span"))
+            for ax in (0, 1, 2):
                 err = mirror_error(arr, ax, axes[ax])
+                if ax in known_open:
+                    if err > open_worst:
+                        open_worst, open_where = err, "%s/%s" % (key, "xyz"[ax])
+                    continue
+                if ax not in check_axes:
+                    continue
                 if err > worst:
-                    worst, where = err, "%s/%s" % (key, "xy"[ax])
+                    worst, where = err, "%s/%s" % (key, "xyz"[ax])
+        if known_open and mode == "conformal":
+            # Reported, not asserted: a separate, still-open bug (a *section*
+            # plane tangent to a curved face, not the fill rule this file's
+            # transverse case pins). Printed so it stays visible and so a change
+            # in its magnitude is noticed.
+            emit("            known open -- conformal z-tangency: "
+                 "worst %.3g on %s" % (open_worst, open_where or "-"))
         # The boolean mask has no round-off excuse, so it is held to exact.
         pm = arrays["pec_mask"]
-        mask_bad = int((pm != pm[::-1]).sum() + (pm != pm[:, ::-1]).sum())
+        pm_mirrors = (pm[::-1], pm[:, ::-1], pm[:, :, ::-1])
+        mask_bad = sum(int((pm != pm_mirrors[ax]).sum())
+                       for ax in (0, 1, 2)
+                       if ax in check_axes and ax not in known_open)
         if expect_symmetric:
             check(mask_bad == 0,
                   "%-9s pec_mask mirror-exact (%d cells differ)" % (mode, mask_bad))
@@ -216,14 +279,52 @@ def run(fractions, label, expect_symmetric=True):
                     res["counts"]["dielectric_cells"]))
 
 
+def _without_boundary_tiebreak():
+    """Disable the on-surface tie-break, the way the code behaved before it.
+
+    ``voxelize`` imports these two inside the functions that use them, so
+    replacing them on the module is enough -- and it keeps the switch here, in
+    the gate that needs it, rather than as a flag in shipping code.
+    """
+    from wavesim_gui import scanline
+
+    keep = (scanline.on_flat_row, scanline.on_flat_row_points)
+    scanline.on_flat_row = lambda poly, xs, ys: np.zeros(
+        (len(xs), len(ys)), bool)
+    scanline.on_flat_row_points = lambda poly, pts: np.zeros(len(pts), bool)
+    return keep
+
+
+def _restore_boundary_tiebreak(keep):
+    from wavesim_gui import scanline
+
+    scanline.on_flat_row, scanline.on_flat_row_points = keep
+
+
 def main():
     emit("Voxeliser mask-symmetry gate")
     emit("coax a=%.1f b=%.1f in a %.0f mm box, graded grid, centre on a node"
          % (A_MM, B_MM, BOX_MM))
+    transverse = (build_materials_transverse, nodes_transverse)
     try:
         run(SHIPPED, "shipped tolerances")
         run(PRE_FIX, "pre-fix tolerances (regression pin)",
             expect_symmetric=False)
+        set_fractions(SHIPPED)
+        run(SHIPPED, "transverse coax (sections are exact rectangles)",
+            geometry=transverse, known_open=(2,))
+        # The pin for the on-surface tie-break, conformal only -- it is the only
+        # mode that samples on node lines, so it is the only one the tie-break
+        # can move. Chord tolerance cannot serve as this pin: a plane parallel to
+        # a cylinder's axis sections it exactly, so there is no polygon error to
+        # loosen, only the fill rule's answer on the tangent lines.
+        keep = _without_boundary_tiebreak()
+        try:
+            run(SHIPPED, "transverse coax, tie-break disabled (regression pin)",
+                expect_symmetric=False, geometry=transverse,
+                modes=("conformal",), known_open=(2,))
+        finally:
+            _restore_boundary_tiebreak(keep)
     finally:
         set_fractions(SHIPPED)
 

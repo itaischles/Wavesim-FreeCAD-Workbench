@@ -27,7 +27,10 @@ be the *same* section, not a near one:
   the arrays do not depend on how the work happened to be scheduled.
 * anything the pool cannot do -- it fails to start, a worker dies, one plane
   raises -- falls back to sectioning that plane in-process. The pool is an
-  accelerator, never a second source of truth.
+  accelerator, never a second source of truth. Which is why an unanswered plane
+  comes back as :data:`_UNANSWERED` and not as ``None``: ``None`` is a *result*
+  ("this plane misses the solid"), so a batch that dies half way through must not
+  report the planes it never reached as empty geometry.
 
 ``tools/check_sectionpool.py`` is the gate: it voxelises a document with the
 pool on and off and asserts every array is bit-identical.
@@ -68,6 +71,21 @@ _BATCH_MIN_S = 0.15           # once running, the per-batch round trip floor
 # Upper bound on workers however many cores are present. Past this the OCC
 # sections are no longer the constraint and the parent's own reassembly is.
 _MAX_WORKERS = 16
+
+# What a result slot holds until a worker answers it. Deliberately a **string**,
+# because that is the "the pool could not do this plane, cut it yourself" marker
+# the caller already understands (a worker that raises on one plane returns its
+# error text), and because the one value it must not be is ``None`` -- the
+# legitimate answer for a plane that misses the solid.
+#
+# Measured, before this existed: a reader thread that died on the *first* plane it
+# read (here, a reply the parent could not unpickle -- a worker importing a
+# newer ``wavesim_gui`` than the parent had loaded, which is one edit-and-rerun
+# away in a live session) left all 1359 planes of a batch at ``None``. The caller
+# cached that as "no metal on any of these planes" and the conformal fractions
+# came back with 292 band cells per layer wrongly fully open -- a silently wrong
+# array, from a path whose whole promise is that the worst case is the old speed.
+_UNANSWERED = "<no reply from a section worker>"
 
 # How long to wait on a reader thread once its worker should have finished.
 _JOIN_TIMEOUT_S = 60.0
@@ -291,10 +309,12 @@ class SectionPool(object):
     def sections(self, shape, requests, on_progress=None):
         """Section *shape* at every ``(z, deflection, nudge)`` in *requests*.
 
-        Returns a list aligned with *requests* (each entry the polygon list
-        ``_section_polygons`` gave, or ``None`` for a plane that misses), or
-        ``None`` when the pool declined -- too small a batch, not started,
-        broken -- and the caller should do it serially.
+        Returns a list aligned with *requests* (each entry the wire list
+        ``_section_polygons`` gave, ``None`` for a plane that misses, or a
+        **string** for a plane the pool could not answer -- see
+        :data:`_UNANSWERED` -- which the caller cuts in-process), or ``None``
+        when the pool declined the whole batch -- too small, not started,
+        broken -- and the caller should do all of it serially.
 
         *on_progress* is called once per completed plane **on the calling
         thread** (Qt work must not happen on the reader threads); a truthy
@@ -317,7 +337,7 @@ class SectionPool(object):
         pending = queue.Queue()
         for idx in range(len(requests)):
             pending.put(idx)
-        results = [None] * len(requests)
+        results = [_UNANSWERED] * len(requests)
         done = [0]
         lock = threading.Lock()
         stop = threading.Event()
@@ -379,6 +399,8 @@ class SectionPool(object):
             thread.join(timeout=_JOIN_TIMEOUT_S)
 
         if failed:
+            # The planes this batch never reached are still :data:`_UNANSWERED`,
+            # so they fall through to the in-process cut this warning promises.
             FreeCAD.Console.PrintWarning(
                 "Wavesim: a section worker failed ({}); the remaining planes "
                 "are cut in-process.\n".format(failed[0]))

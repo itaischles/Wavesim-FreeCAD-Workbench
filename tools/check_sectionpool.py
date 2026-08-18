@@ -10,6 +10,14 @@ exactly. It also checks the two orderings of the sweep agree about *how many*
 section planes were cut, since a prefetch that missed planes would silently fall
 back to the serial path and pass a value check while buying nothing.
 
+A third pass runs the pool with one **deliberately broken reply**
+(:func:`_break_one_reply`) and demands those same arrays again, because "anything
+that goes wrong falls back to sectioning in-process" is a promise about answers,
+not only about speed -- and it was not kept until 2026-08-17: the planes a dead
+batch never reached came back as ``None``, which is indistinguishable from a
+plane that genuinely misses the solid, and 29% of every conformal fraction array
+came out wrong without a word.
+
 Run under ``freecadcmd`` (FreeCAD's Python; needs Part + the bundled numpy)::
 
     set WSCHECK_DOC=C:\\path\\to\\model.FCStd
@@ -72,6 +80,63 @@ def _count_sections(fn):
         voxelize._section_polygons = original
 
 
+def _break_one_reply():
+    """Make the first section reply of the run undecodable; returns the undo.
+
+    The failure a live session can actually produce: a worker that answers with
+    something the parent cannot read (it imported a newer ``wavesim_gui`` off
+    disk than the parent has loaded -- one edit-and-rerun away). What matters is
+    not the decode but what the pool does next: the batch dies part way through,
+    and every plane it never reached must come back as "cut this yourself", never
+    as ``None``, which is a *result* meaning "this plane misses the solid".
+    Filling those slots with ``None`` is measured here as 29% of every conformal
+    fraction array silently wrong -- whole band layers read as fully open.
+    """
+    original = sectionpool.SectionPool._recv
+    seen = [0]
+
+    def broken(proc):
+        reply = original(proc)
+        if isinstance(reply, tuple) and reply and reply[0] == "sec":
+            seen[0] += 1
+            if seen[0] == 1:
+                raise IOError("simulated undecodable worker reply")
+        return reply
+
+    sectionpool.SectionPool._recv = staticmethod(broken)
+
+    def undo():
+        sectionpool.SectionPool._recv = original
+
+    return undo
+
+
+def _same_arrays(serial, other, label):
+    """Compare *other* against the serial arrays element for element."""
+    ok = True
+    keys = sorted(set(serial) | set(other))
+    for key in keys:
+        a, b = serial.get(key), other.get(key)
+        if a is None or b is None:
+            print("  MISSING %s in %s" % (key, label if b is None else "serial"))
+            ok = False
+            continue
+        a, b = np.asarray(a), np.asarray(b)
+        if a.shape != b.shape:
+            print("  SHAPE   %s %s vs %s (%s)" % (key, a.shape, b.shape, label))
+            ok = False
+        elif not np.array_equal(a, b):
+            diff = int(np.count_nonzero(a != b))
+            worst = (float(np.abs(a.astype(float) - b.astype(float)).max())
+                     if a.size else 0.0)
+            print("  DIFFERS %s on %d/%d elements (max %.3e) in %s"
+                  % (key, diff, a.size, worst, label))
+            ok = False
+    if ok:
+        print("  all %d arrays bit-identical: serial vs %s" % (len(keys), label))
+    return ok
+
+
 def main():
     doc_path = os.environ.get("WSCHECK_DOC", "")
     print("check_sectionpool: workers reported by resolve_workers('auto') = %d"
@@ -104,15 +169,21 @@ def _check_document(path):
     original = wavesim_settings.load().get("voxelize_workers", "")
     results = {}
     try:
-        for label, setting in (("serial", "1"), ("pool", "auto")):
+        for label, setting in (("serial", "1"), ("pool", "auto"),
+                               ("broken", "auto")):
             stored = wavesim_settings.load()
             stored["voxelize_workers"] = setting
             wavesim_settings.save(stored)
 
-            t0 = time.perf_counter()
-            (_spec, arrays), sections = _count_sections(
-                lambda: voxelize.build_job_from_document(doc))
-            elapsed = time.perf_counter() - t0
+            undo = _break_one_reply() if label == "broken" else None
+            try:
+                t0 = time.perf_counter()
+                (_spec, arrays), sections = _count_sections(
+                    lambda: voxelize.build_job_from_document(doc))
+                elapsed = time.perf_counter() - t0
+            finally:
+                if undo is not None:
+                    undo()
             results[label] = (arrays, elapsed, sections)
             print("  %-6s %6.2f s   planes cut in-process: %d"
                   % (label, elapsed, sections))
@@ -125,26 +196,8 @@ def _check_document(path):
     pooled, p_time, p_sections = results["pool"]
 
     ok = True
-    keys = sorted(set(serial) | set(pooled))
-    for key in keys:
-        a, b = serial.get(key), pooled.get(key)
-        if a is None or b is None:
-            print("  MISSING %s in %s" % (key, "pool" if b is None else "serial"))
-            ok = False
-            continue
-        a, b = np.asarray(a), np.asarray(b)
-        if a.shape != b.shape:
-            print("  SHAPE   %s %s vs %s" % (key, a.shape, b.shape))
-            ok = False
-        elif not np.array_equal(a, b):
-            diff = int(np.count_nonzero(a != b))
-            worst = (float(np.abs(a.astype(float) - b.astype(float)).max())
-                     if a.size else 0.0)
-            print("  DIFFERS %s on %d/%d elements (max %.3e)"
-                  % (key, diff, a.size, worst))
-            ok = False
-    if ok:
-        print("  all %d arrays bit-identical" % len(keys))
+    for label in ("pool", "broken"):
+        ok = _same_arrays(serial, results[label][0], label) and ok
 
     # The pool is only doing anything if it took planes off the serial path.
     if p_sections >= s_sections:

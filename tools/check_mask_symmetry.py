@@ -35,8 +35,17 @@ What it checks
 2. **The conformal open fractions** are mirror-symmetric too, with the correct
    per-array index convention (an edge-spanning axis mirrors as a reversal, a
    node-indexed one about node ``N``).
-3. A **regression pin**: the old 0.25 tolerance still fails (1), so a revert
-   cannot pass this file silently.
+3. Two **regression pins** on where the symmetry comes from:
+
+   * with exact section curves suppressed, the old 0.25 tolerance still fails
+     (1) -- so a revert of the chord fractions cannot pass this file silently
+     wherever chords are still what a section is made of;
+   * with them on, this coax voxelises **bit-identically at both tolerances** --
+     its sections are circles and straight lines, so no chord tolerance can
+     touch them. That is the pin on the exact-curve path itself: fall back to
+     ``discretize`` and the two runs stop agreeing.
+4. A third pin on the exact axis-aligned-edge tie-break, which the transverse
+   geometry needs and no chord tolerance can substitute for.
 
 ``freecadcmd`` swallows ``stdout``, so the report is also written to
 ``tools/mask_symmetry.txt`` (override with ``MASK_SYMMETRY_REPORT``). Exits
@@ -222,10 +231,12 @@ def set_fractions(fr):
 
 
 def run(fractions, label, expect_symmetric=True, geometry=None, modes=None,
-        check_axes=(0, 1, 2), known_open=()):
+        check_axes=(0, 1, 2)):
+    """Voxelise in each mode and assert the symmetry; returns ``{mode: arrays}``."""
     set_fractions(fractions)
     build, node_fn = geometry or (build_materials, nodes)
     mats, nm = build(), node_fn()
+    out = {}
     emit()
     emit("%s (coarse/subpixel/conformal chord = %g / %g / %g)"
          % ((label,) + tuple(fractions)))
@@ -235,33 +246,21 @@ def run(fractions, label, expect_symmetric=True, geometry=None, modes=None,
             continue
         res = vox.voxelize_materials(mats, (4.0e-4,) * 3, nodes_m=nm, **kw)
         arrays = res["arrays"]
+        out[mode] = arrays
         worst, where = 0.0, ""
-        open_worst, open_where = 0.0, ""
         for key, arr in arrays.items():
             axes = _FRACTION_AXES.get(key, ("span", "span", "span"))
             for ax in (0, 1, 2):
-                err = mirror_error(arr, ax, axes[ax])
-                if ax in known_open:
-                    if err > open_worst:
-                        open_worst, open_where = err, "%s/%s" % (key, "xyz"[ax])
-                    continue
                 if ax not in check_axes:
                     continue
+                err = mirror_error(arr, ax, axes[ax])
                 if err > worst:
                     worst, where = err, "%s/%s" % (key, "xyz"[ax])
-        if known_open and mode == "conformal":
-            # Reported, not asserted: a separate, still-open bug (a *section*
-            # plane tangent to a curved face, not the fill rule this file's
-            # transverse case pins). Printed so it stays visible and so a change
-            # in its magnitude is noticed.
-            emit("            known open -- conformal z-tangency: "
-                 "worst %.3g on %s" % (open_worst, open_where or "-"))
         # The boolean mask has no round-off excuse, so it is held to exact.
         pm = arrays["pec_mask"]
         pm_mirrors = (pm[::-1], pm[:, ::-1], pm[:, :, ::-1])
         mask_bad = sum(int((pm != pm_mirrors[ax]).sum())
-                       for ax in (0, 1, 2)
-                       if ax in check_axes and ax not in known_open)
+                       for ax in (0, 1, 2) if ax in check_axes)
         if expect_symmetric:
             check(mask_bad == 0,
                   "%-9s pec_mask mirror-exact (%d cells differ)" % (mode, mask_bad))
@@ -277,6 +276,21 @@ def run(fractions, label, expect_symmetric=True, geometry=None, modes=None,
             emit("            pec_cells %d, dielectric_cells %d"
                  % (res["counts"]["pec_cells"],
                     res["counts"]["dielectric_cells"]))
+    return out
+
+
+def _without_analytic_sections():
+    """Put every section back on a chord polygon, the way it was cut before.
+
+    ``voxelize._cut_section`` offers each closed wire to ``_analytic_wire``
+    first, so replacing that one function is enough to restore ``discretize``
+    everywhere -- which is the only way left to pin what the chord tolerances buy,
+    now that this coax's own sections are exact and answer the same at any
+    tolerance.
+    """
+    keep = vox._analytic_wire
+    vox._analytic_wire = lambda wire: None
+    return keep
 
 
 def _without_boundary_tiebreak():
@@ -288,17 +302,17 @@ def _without_boundary_tiebreak():
     """
     from wavesim_gui import scanline
 
-    keep = (scanline.on_flat_row, scanline.on_flat_row_points)
-    scanline.on_flat_row = lambda poly, xs, ys: np.zeros(
+    keep = (scanline.on_axis_edge, scanline.on_axis_edge_points)
+    scanline.on_axis_edge = lambda poly, xs, ys: np.zeros(
         (len(xs), len(ys)), bool)
-    scanline.on_flat_row_points = lambda poly, pts: np.zeros(len(pts), bool)
+    scanline.on_axis_edge_points = lambda poly, pts: np.zeros(len(pts), bool)
     return keep
 
 
 def _restore_boundary_tiebreak(keep):
     from wavesim_gui import scanline
 
-    scanline.on_flat_row, scanline.on_flat_row_points = keep
+    scanline.on_axis_edge, scanline.on_axis_edge_points = keep
 
 
 def main():
@@ -307,12 +321,30 @@ def main():
          % (A_MM, B_MM, BOX_MM))
     transverse = (build_materials_transverse, nodes_transverse)
     try:
-        run(SHIPPED, "shipped tolerances")
-        run(PRE_FIX, "pre-fix tolerances (regression pin)",
-            expect_symmetric=False)
+        shipped = run(SHIPPED, "shipped tolerances")
+        # The chord fractions still decide every section a curve *has* to be
+        # discretised for (splines, tori, an ellipse off a tilted cylinder), so
+        # their pin survives -- on chord polygons, which is where they apply.
+        keep = _without_analytic_sections()
+        try:
+            run(PRE_FIX, "pre-fix tolerances, chord polygons (regression pin)",
+                expect_symmetric=False)
+        finally:
+            vox._analytic_wire = keep
+        # ...and with the exact curves back, the same coax cannot even *see* the
+        # tolerance: circles and straight lines, cut as themselves. Bit-identical
+        # arrays are the pin on that -- a silent fall back to ``discretize`` moves
+        # the shield's radius by the deflection and breaks this line.
+        loose = run(PRE_FIX, "pre-fix tolerances, exact curves (chord is moot)")
+        for mode in sorted(shipped):
+            a, b = shipped[mode], loose[mode]
+            same = (sorted(a) == sorted(b)
+                    and all(np.array_equal(a[k], b[k]) for k in a))
+            check(same, "%-9s bit-identical at both tolerances (sections are "
+                        "exact, so no chord tolerance applies)" % mode)
         set_fractions(SHIPPED)
         run(SHIPPED, "transverse coax (sections are exact rectangles)",
-            geometry=transverse, known_open=(2,))
+            geometry=transverse)
         # The pin for the on-surface tie-break, conformal only -- it is the only
         # mode that samples on node lines, so it is the only one the tie-break
         # can move. Chord tolerance cannot serve as this pin: a plane parallel to
@@ -322,7 +354,7 @@ def main():
         try:
             run(SHIPPED, "transverse coax, tie-break disabled (regression pin)",
                 expect_symmetric=False, geometry=transverse,
-                modes=("conformal",), known_open=(2,))
+                modes=("conformal",))
         finally:
             _restore_boundary_tiebreak(keep)
     finally:

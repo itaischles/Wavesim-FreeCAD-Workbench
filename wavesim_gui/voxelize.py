@@ -502,8 +502,10 @@ def _prefetched(pool, body_shape, planes, deflection, nudge=0.0, on_layer=None):
 
         cache = _SectionCache(body_shape)
         for (z, defl, nud), polys in zip(requests, results):
-            # A worker that raised on one plane leaves the sentinel; drop it and
-            # the serial path cuts that plane itself.
+            # A plane the pool could not answer -- one whose section raised, or
+            # one a dead batch never reached -- comes back as a string, never as
+            # the ``None`` that means "this plane misses the solid". Drop those
+            # and the serial path below cuts them itself.
             if not isinstance(polys, str):
                 cache.planes[(z, defl, nud)] = polys
         previous = _ACTIVE_CACHE
@@ -516,12 +518,164 @@ def _prefetched(pool, body_shape, planes, deflection, nudge=0.0, on_layer=None):
     return _run()
 
 
+# --------------------------------------------------------------------------- #
+# Exact section curves
+#
+# A section wire is only a *polygon* because ``Wire.discretize`` makes it one, and
+# that costs twice over: it inscribes (every round conductor undersized by the
+# deflection) and it walks from the wire's seam (so the polygon is not mirror-
+# symmetric, which is the whole reason the three chord fractions above are
+# tightened to 0.0025). Where OCC's cut curve is a primitive, neither is
+# necessary -- a circle is a centre and a radius, and its own equation answers a
+# sample exactly. :mod:`wavesim_gui.scanline` then samples it with no chord and no
+# seam, which is what lets the conformal span reach a body's high-side surface at
+# all (see :func:`_conformal_span`).
+#
+# Scope, deliberately: straight lines and **circular** arcs. Those are what a
+# plane cut of the geometry this workbench meets actually produces -- a coax pin,
+# a bore, a via, a rectangular trace, and any cylinder cut along or across its own
+# axis. An ellipse (a tilted cylinder), a torus section and every spline fall back
+# to the chord polygon, i.e. to exactly what ships today. A wire is carried
+# exactly only when *every* edge is one of the two kinds, since a mixed
+# representation would have to reconcile two boundary conventions along one loop.
+# --------------------------------------------------------------------------- #
+
+_FULL_TURN = 2.0 * math.pi
+
+
+def _snapped_ends(edge, curve):
+    """The edge's two endpoints, taken from its **vertices** where possible.
+
+    ``curve.value(FirstParameter)`` and the shared ``TopoDS`` vertex of the
+    neighbouring edge can differ by an ULP, and an endpoint y is exactly what the
+    crossing rule compares a sample row against -- so two edges meeting at a
+    junction must report bit-identical coordinates there, or a row landing on that
+    junction is counted by one of them and not the other, and the whole row's
+    parity flips. Returns ``(p_first, p_last)`` in parameter order.
+    """
+    p0 = curve.value(edge.FirstParameter)
+    p1 = curve.value(edge.LastParameter)
+    try:
+        pts = [v.Point for v in edge.Vertexes]
+    except Exception:
+        return p0, p1
+    if len(pts) != 2:
+        return p0, p1
+    a, b = pts
+    straight = p0.distanceToPoint(a) + p1.distanceToPoint(b)
+    swapped = p0.distanceToPoint(b) + p1.distanceToPoint(a)
+    return (a, b) if straight <= swapped else (b, a)
+
+
+def _circle_arcs(edge, circle):
+    """*edge* on *circle* as y-monotone ``(y0, y1, cx, cy, r, side)`` arcs.
+
+    ``None`` when the curve is not usable exactly: not lying in the cutting plane
+    (its axis must be z), or degenerate.
+
+    The split points are the circle's own y extrema, ``(cx, cy +- r)`` -- exact,
+    and independent of OCC's parametrisation, which is why they can be written
+    down rather than evaluated. A full circle needs no parametrisation at all: it
+    is the two semicircles between those two points.
+    """
+    axis = circle.Axis
+    if (abs(axis.x) > 1.0e-9 or abs(axis.y) > 1.0e-9
+            or abs(abs(axis.z) - 1.0) > 1.0e-9):
+        return None
+    centre = circle.Center
+    cx, cy, r = float(centre.x), float(centre.y), float(circle.Radius)
+    if not (r > 0.0):
+        return None
+
+    t0, t1 = float(edge.FirstParameter), float(edge.LastParameter)
+    if t1 < t0:
+        t0, t1 = t1, t0
+    if t1 - t0 >= _FULL_TURN - 1.0e-9:
+        return [(cy - r, cy + r, cx, cy, r, +1.0),
+                (cy - r, cy + r, cx, cy, r, -1.0)]
+
+    # y(t) = cy + r*cos(t - psi): the circle's y extrema sit at t = psi + k*pi,
+    # whichever way OCC happened to orient its X axis and normal.
+    xd = circle.XAxis
+    sign = 1.0 if axis.z > 0.0 else -1.0
+    psi = math.atan2(sign * float(xd.x), float(xd.y))
+    k_lo = int(math.floor((t0 - psi) / math.pi)) + 1
+    k_hi = int(math.ceil((t1 - psi) / math.pi)) - 1
+
+    p_first, p_last = _snapped_ends(edge, circle)
+    knots = [(t0, float(p_first.y))]
+    for k in range(k_lo, k_hi + 1):
+        knots.append((psi + k * math.pi, cy + r if k % 2 == 0 else cy - r))
+    knots.append((t1, float(p_last.y)))
+
+    arcs = []
+    for (ta, ya), (tb, yb) in zip(knots[:-1], knots[1:]):
+        if not tb > ta:
+            continue
+        # Which half of the circle this piece lies in. Its endpoints cannot
+        # answer that (a semicircle has both of them at x == cx), so ask the
+        # curve once, midway.
+        mid_x = float(circle.value(0.5 * (ta + tb)).x)
+        if mid_x == cx:
+            return None
+        arcs.append((ya, yb, cx, cy, r, 1.0 if mid_x > cx else -1.0))
+    return arcs or None
+
+
+def _analytic_wire(wire):
+    """*wire* as an exact :class:`~wavesim_gui.scanline.AnalyticWire`, or ``None``.
+
+    ``None`` -- fall back to the chord polygon -- for any wire carrying an edge
+    that is neither a straight line nor a circular arc, and for one carrying no
+    arc at all: a wire of straight lines is *already* exact (``discretize``
+    returns its own vertices), and leaving it on the polygon path keeps the
+    coarse and subpixel sweeps bit-identical there, along with matplotlib's fill
+    convention and the exact axis-aligned-edge tie-break the conformal sampler
+    settles a grid-aligned face with.
+    """
+    import numpy as np
+
+    from wavesim_gui import scanline
+
+    lines, arcs = [], []
+    try:
+        edges = wire.Edges
+    except Exception:
+        return None
+    for edge in edges:
+        try:
+            curve = edge.Curve
+            kind = type(curve).__name__
+            if kind in ("Line", "LineSegment"):
+                p0, p1 = _snapped_ends(edge, curve)
+                lines.append((float(p0.x), float(p0.y),
+                              float(p1.x), float(p1.y)))
+                continue
+            if kind in ("Circle", "ArcOfCircle"):
+                pieces = _circle_arcs(edge, getattr(curve, "Circle", curve))
+                if pieces is None:
+                    return None
+                arcs.extend(pieces)
+                continue
+        except Exception:
+            return None
+        return None
+    if not arcs or len(lines) + len(arcs) < 2:
+        return None
+    return scanline.AnalyticWire(
+        np.array(lines, dtype=np.float64).reshape(-1, 4),
+        np.array(arcs, dtype=np.float64).reshape(-1, 6))
+
+
 def _section_polygons(body_shape, z_axis, z, deflection, nudge=0.0):
-    """Cross-section of *body_shape* at height *z* as a list of XY polygons.
+    """Cross-section of *body_shape* at height *z* as a list of XY wires.
 
     Cuts the body with the horizontal plane at *z* -- one OCC section per layer
-    instead of one ``isInside`` per cell -- and turns each resulting wire into a
-    polygon (curved edges discretised to chord tolerance *deflection*). Returns
+    instead of one ``isInside`` per cell -- and turns each resulting wire into
+    either an exact :class:`~wavesim_gui.scanline.AnalyticWire` (when OCC's cut
+    curves are primitives; see :func:`_analytic_wire`) or a polygon with its
+    curved edges discretised to chord tolerance *deflection*. Both kinds answer
+    the same even-odd question and the samplers below take either. Returns
     ``None`` when the plane misses the solid (no section wires, or none that
     close), so the caller can leave that whole layer empty.
 
@@ -563,12 +717,12 @@ def _cut_section(body_shape, z_axis, z, deflection, nudge=0.0):
     import numpy as np
 
     def _at(zz):
-        """``(polygons, clean)`` at *zz*: the closed wires, and whether all were.
+        """``(wires, clean)`` at *zz*: the closed wires, and whether all were.
 
         An open wire is dropped rather than filled, because a polygon closed by
         the drawing rule instead of by the geometry is the whole-footprint fill
         :data:`_SLICE_DEAD_BAND` describes. ``clean`` is False when one was seen,
-        so the caller can prefer another plane over these polygons even though
+        so the caller can prefer another plane over these wires even though
         they are not empty.
         """
         try:
@@ -577,19 +731,26 @@ def _cut_section(body_shape, z_axis, z, deflection, nudge=0.0):
             return None, False
         if not wires:
             return None, False
-        polys, clean = [], True
+        out, clean = [], True
         for w in wires:
             try:
                 if not w.isClosed():
                     clean = False
                     continue
+            except Exception:
+                continue
+            exact = _analytic_wire(w)
+            if exact is not None:
+                out.append(exact)
+                continue
+            try:
                 verts = w.discretize(Deflection=deflection)
             except Exception:
                 continue
             if len(verts) < 3:
                 continue
-            polys.append(np.array([(v.x, v.y) for v in verts]))
-        return (polys or None), clean
+            out.append(np.array([(v.x, v.y) for v in verts]))
+        return (out or None), clean
 
     polys, clean = _at(z)
     if (polys is not None and clean) or not nudge:
@@ -606,11 +767,12 @@ def _cut_section(body_shape, z_axis, z, deflection, nudge=0.0):
 
 # Why the conformal sampler asks for ``on_surface_open`` and nothing else does.
 #
-# matplotlib's crossing rule -- which this voxeliser reproduces exactly, and
-# promises to keep reproducing -- is half-open in the row direction: a sample
-# sitting exactly on a polygon's upper horizontal edge reads inside, one on the
-# lower edge reads outside. Mirror the geometry and those two answers swap, so a
-# body that is its own mirror image does not sample as one.
+# matplotlib's crossing rule -- which this voxeliser reproduces exactly for a
+# chord polygon, and promises to keep reproducing -- is half-open in the row
+# direction: a sample sitting exactly on a polygon's upper horizontal edge reads
+# inside, one on the lower edge reads outside (and likewise across a pair of
+# vertical edges, in the column direction). Mirror the geometry and those two
+# answers swap, so a body that is its own mirror image does not sample as one.
 #
 # That bites the conformal fractions specifically, because they are the only
 # arrays sampled *on node lines* -- and the grid snapper puts nodes on feature
@@ -632,18 +794,27 @@ def _cut_section(body_shape, z_axis, z, deflection, nudge=0.0):
 # ones. Resolving to open settles the tie on the side everything already
 # assumes, and leaves a body's covered fractions exactly where they were
 # wherever no sample lands on a surface at all.
+#
+# An **exact** wire settles its own boundary samples, in every mode: it has no
+# seam, so "on this curve" is a mirror-symmetric statement about the geometry
+# rather than about which chord a sample fell under, and there is no older answer
+# for the coarse sweep to stay bit-compatible with -- the curve itself is new.
+# Hence the two loops below take the analytic border unconditionally and the
+# polygon one only when asked.
 def _layer_inside(body_shape, z_axis, z, pts, deflection, nudge=0.0,
                   on_surface_open=False):
     """Boolean mask of which *pts* (XY, mm) lie inside *body_shape* at height *z*.
 
-    Tests every point at once with matplotlib. XOR-ing the wires applies the
-    even-odd rule, which carves holes and handles solids nested inside holes.
-    Returns ``None`` when the plane misses the solid. *nudge* is
-    :func:`_section_polygons`'s degenerate-plane retry.
+    Tests every point at once. XOR-ing the wires applies the even-odd rule, which
+    carves holes and handles solids nested inside holes. Returns ``None`` when the
+    plane misses the solid. *nudge* is :func:`_section_polygons`'s
+    degenerate-plane retry.
 
-    *on_surface_open* drops the samples lying exactly *on* a wire, after the XOR
-    rather than inside it: a point on a hole's rim is on that conductor's
-    surface just as much as one on the outer rim, and the two must not cancel.
+    *on_surface_open* drops the samples lying exactly *on* a polygon's
+    axis-aligned edge, after the XOR rather than inside it: a point on a hole's
+    rim is on that conductor's surface just as much as one on the outer rim, and
+    the two must not cancel. An exact wire's on-curve samples are dropped either
+    way.
 
     For the (usual) case of points forming an axis-aligned lattice, prefer
     :func:`_layer_inside_lattice` -- same answer, without the
@@ -652,17 +823,22 @@ def _layer_inside(body_shape, z_axis, z, pts, deflection, nudge=0.0,
     import numpy as np
     from matplotlib.path import Path
 
-    from wavesim_gui.scanline import on_flat_row_points
+    from wavesim_gui.scanline import analytic_inside_points, on_axis_edge_points
 
-    polys = _section_polygons(body_shape, z_axis, z, deflection, nudge)
-    if polys is None:
+    wires = _section_polygons(body_shape, z_axis, z, deflection, nudge)
+    if wires is None:
         return None
     inside = np.zeros(len(pts), dtype=bool)
     border = np.zeros(len(pts), dtype=bool)
-    for poly in polys:
-        inside ^= Path(poly).contains_points(pts)
-        if on_surface_open:
-            border |= on_flat_row_points(poly, pts)
+    for wire in wires:
+        if isinstance(wire, np.ndarray):
+            inside ^= Path(wire).contains_points(pts)
+            if on_surface_open:
+                border |= on_axis_edge_points(wire, pts)
+            continue
+        ins, on_curve = analytic_inside_points(wire, pts)
+        inside ^= ins
+        border |= on_curve
     return inside & ~border
 
 
@@ -674,22 +850,28 @@ def _layer_inside_lattice(body_shape, z_axis, z, xs, ys, deflection, nudge=0.0,
     the same values a flat call would give for
     ``meshgrid(xs, ys, indexing="ij")``, since
     :func:`wavesim_gui.scanline.lattice_inside` reproduces matplotlib's crossing
-    rule exactly (``tools/check_scanline.py``). ``xs`` must be ascending.
-    *nudge* is :func:`_section_polygons`'s degenerate-plane retry.
+    rule exactly (``tools/check_scanline.py``) and
+    :func:`~wavesim_gui.scanline.analytic_inside` shares its layout. ``xs`` must
+    be ascending. *nudge* is :func:`_section_polygons`'s degenerate-plane retry.
     """
     import numpy as np
 
-    from wavesim_gui.scanline import lattice_inside, on_flat_row
+    from wavesim_gui.scanline import analytic_inside, lattice_inside, on_axis_edge
 
-    polys = _section_polygons(body_shape, z_axis, z, deflection, nudge)
-    if polys is None:
+    wires = _section_polygons(body_shape, z_axis, z, deflection, nudge)
+    if wires is None:
         return None
     inside = np.zeros((len(xs), len(ys)), dtype=bool)
     border = np.zeros((len(xs), len(ys)), dtype=bool)
-    for poly in polys:
-        inside ^= lattice_inside(poly, xs, ys)
-        if on_surface_open:
-            border |= on_flat_row(poly, xs, ys)
+    for wire in wires:
+        if isinstance(wire, np.ndarray):
+            inside ^= lattice_inside(wire, xs, ys)
+            if on_surface_open:
+                border |= on_axis_edge(wire, xs, ys)
+            continue
+        ins, on_curve = analytic_inside(wire, xs, ys)
+        inside ^= ins
+        border |= on_curve
     return inside & ~border
 
 
@@ -726,6 +908,31 @@ def _cell_span(nodes_mm, lo, hi, margin=1):
     a = max(0, int(overlap[0]) - margin)
     b = min(ncell, int(overlap[-1]) + 1 + margin)
     return a, b
+
+
+def _conformal_span(nodes_mm, lo, hi):
+    """:func:`_cell_span` for the conformal sampler: **one cell more** at the top.
+
+    The six fraction arrays are indexed by their cell's *low* node --
+    ``pec_edge_open_x[i,j,k]`` is the Ex edge leaving node ``(i,j,k)``, and
+    ``pec_face_open_x[i,j,k]`` the Hx face standing on x-node ``i``. So a quantity
+    lying in a body's **high-side** surface belongs to the cell just *beyond* that
+    surface -- one the body's own bounding box does not overlap. Its low-side twin
+    is its own cell's low node and always got written, which made this a mirror
+    error of a whole unit rather than a small one: measured 1.0 on
+    ``pec_edge_open_x`` at a pin's z tangent planes, one face written and its
+    mirror left at the untouched 0.
+    A cell past the box costs one node plane and one cell layer per axis and
+    writes nothing where the body is absent -- the merge below is a ``maximum``.
+
+    This can only be *landed* on exact section curves. Reaching the high-side
+    surface means sampling exactly on it, and a chord polygon answers such a
+    sample by which chord it fell under: with the extension on discretised
+    circles the axial reference coax went from a clean 0 to a 1.0 mirror error of
+    its own (see :func:`_analytic_wire`).
+    """
+    a, b = _cell_span(nodes_mm, lo, hi, margin=0)
+    return a, min(len(nodes_mm) - 1, b + 1)
 
 
 # Chord tolerance for the subpixel smoother's fine section polygons, as a
@@ -1019,8 +1226,9 @@ def _conformal_pec_body(covered, body_shape, nodes_mm, span, os_, on_layer=None,
     first would be exact and is a BREP boolean of unbounded cost, so it is not
     done; a model that needs it should fuse in CAD.
 
-    *span* is ``((ia, ib), (ja, jb), (ka, kb))`` from :func:`_cell_span` with no
-    margin -- the half-open coarse block covering the body's bounding box.
+    *span* is ``((ia, ib), (ja, jb), (ka, kb))`` from :func:`_conformal_span` --
+    the half-open coarse block covering the body's bounding box, plus the one cell
+    per axis that carries the body's high-side surface.
 
     Two passes:
 
@@ -1607,9 +1815,9 @@ def voxelize_materials(materials, cell_size_m,
         c_span = None
         if conformal and pec:
             c_span = (
-                _cell_span(nx_mm, bb.XMin, bb.XMax, margin=0),
-                _cell_span(ny_mm, bb.YMin, bb.YMax, margin=0),
-                _cell_span(nz_mm, bb.ZMin, bb.ZMax, margin=0),
+                _conformal_span(nx_mm, bb.XMin, bb.XMax),
+                _conformal_span(ny_mm, bb.YMin, bb.YMax),
+                _conformal_span(nz_mm, bb.ZMin, bb.ZMax),
             )
             n_layers += conformal_layer_estimate(c_span[2][1] - c_span[2][0],
                                                  c_ovr)

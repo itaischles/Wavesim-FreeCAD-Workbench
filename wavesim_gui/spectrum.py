@@ -45,9 +45,17 @@ On windows, for an FDTD port record specifically: these records are
 *front-loaded* -- the drive lands in the first few percent and the rest is decay
 -- so a symmetric taper ('hann', 'hamming') puts its steep rising edge right on
 top of the excitation and reshapes it (the solver's tests measure 18% error in a
-ratio taken through a Hann). ``'tukey'`` is flat across the record and tapers
-only the tail where the ringing is; it leaves a ratio intact to ~1e-7. That is
-why the plot windows offer Tukey and not Hann as the first non-trivial choice.
+ratio taken through a Hann). ``'tukey'`` is flat across the middle and ramps
+only over ``alpha/2`` of the record at each end -- 5% by default -- so it leaves
+both a ratio and an amplitude essentially intact. That is why the plot windows
+offer Tukey and not Hann as the first non-trivial choice.
+
+**Its leading ramp is not free, though.** A Tukey tapers the *start* as well as
+the tail, so a drive that lands inside the first 5% of the record is reshaped by
+it exactly the way a Hann reshapes one in the first 30% --
+``tools/check_portmatrix.py`` measured 4% error in an extracted Z-matrix from
+a pulse sitting at sample 60 of 2048, and 5e-14 from the same pulse at sample
+300. Run long enough that the drive clears the ramp, or leave the window off.
 
 Qt-free and FreeCAD-free (numpy only), so it stays importable in console mode.
 """

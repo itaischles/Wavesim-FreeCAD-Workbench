@@ -66,6 +66,7 @@ _TYPE_PROP = "WavesimType"
 _RESULTS_TYPE = "Results"   # the container group
 _RESULT_TYPE = "Result"     # a single result leaf
 _PORT_TYPE = "ResultPort"   # a per-port group holding one port's leaves
+_MATRIX_TYPE = "ResultMatrix"   # the port-matrix group and its per-drive rows
 
 # Result kinds (stored on each leaf's ResultKind property).
 _KIND_ENERGY = "energy"
@@ -90,6 +91,10 @@ _KIND_PORT_I = "port_i"
 # measurement of the pair: neither series alone produces it, and it is the
 # answer a broadband run was for.
 _KIND_IMPEDANCE = "impedance"
+# The Z/Y matrix over a chosen set of ports, extracted from one run per port
+# (see :mod:`wavesim_gui.portmatrix`). One leaf for the whole matrix, because it
+# is one measurement: no single entry of it comes from a single run.
+_KIND_ZMATRIX = "zmatrix"
 # The electrostatic run's scalar results: applied potentials, per-conductor
 # charge, field energy and the capacitance matrix. One leaf, because they are one
 # answer -- the charges are the matrix's raw material and the energy is the same
@@ -114,6 +119,7 @@ _KIND_ICONS = {
     _KIND_PORT_V: _icon("voltage.svg"),
     _KIND_PORT_I: _icon("current.svg"),
     _KIND_IMPEDANCE: _icon("impedance.svg"),
+    _KIND_ZMATRIX: _icon("matrix.svg"),
     # Not the energy icon: the electrostatic leaf's headline is the matrix, and
     # two different answers sharing a picture is how a tree stops being read.
     _KIND_CAPACITANCE: _icon("capacitance.svg"),
@@ -211,6 +217,47 @@ class PortResultContainer:
     def loads(self, state):
         if isinstance(state, dict):
             self.Type = state.get("Type", _PORT_TYPE)
+        return None
+
+    __getstate__ = dumps
+    __setstate__ = loads
+
+
+class MatrixResultContainer:
+    """``Proxy`` for the port-matrix group, and for each of its drive rows.
+
+    Two roles, one class, because they are the same kind of node: the outer
+    group holds the matrix leaf and the N drive groups, and each drive group
+    holds that run's own V/I leaves. ``DriveIndex`` is -1 on the outer group and
+    the run number on a drive.
+    """
+
+    def __init__(self, obj, drive=-1, port_name=""):
+        self.Type = _MATRIX_TYPE
+        obj.Proxy = self
+        _add_type_marker(obj, _MATRIX_TYPE)
+        for prop, ptype, value in (
+            ("DriveIndex", "App::PropertyInteger", int(drive)),
+            ("PortName", "App::PropertyString", str(port_name)),
+        ):
+            if not hasattr(obj, prop):
+                obj.addProperty(ptype, prop, "Port Matrix", "")
+                setattr(obj, prop, value)
+                obj.setEditorMode(prop, 1)
+
+    def onDocumentRestored(self, obj):
+        obj.Proxy = self
+        self.Type = getattr(self, "Type", _MATRIX_TYPE)
+
+    def execute(self, obj):
+        pass
+
+    def dumps(self):
+        return {"Type": getattr(self, "Type", _MATRIX_TYPE)}
+
+    def loads(self, state):
+        if isinstance(state, dict):
+            self.Type = state.get("Type", _MATRIX_TYPE)
         return None
 
     __getstate__ = dumps
@@ -907,6 +954,160 @@ def build_results(doc, sim, workdir, summary):
     return grp
 
 
+_MATRIX_GROUP = "Port Matrix"
+
+
+def find_matrix_results(sim):
+    """Return the existing Port Matrix group under *sim*, or ``None``.
+
+    Its outer group is the one with ``DriveIndex`` -1; the drive rows carry the
+    same type marker and would otherwise match too.
+    """
+    if sim is None:
+        return None
+    for child in sim.Group:
+        if _is_type(child, _MATRIX_TYPE) and getattr(child, "DriveIndex", 0) < 0:
+            return child
+    return None
+
+
+def _remove_matrix_results(doc, sim):
+    """Delete an existing Port Matrix group and everything under it."""
+    grp = find_matrix_results(sim)
+    if grp is None:
+        return
+
+    def _purge(node):
+        for child in list(getattr(node, "Group", []) or []):
+            _purge(child)
+        doc.removeObject(node.Name)
+
+    _purge(grp)
+
+
+def build_matrix_results(doc, sim, sweep_dir, ports):
+    """(Re)build the Port Matrix group under *sim* from a finished sweep.
+
+    A **sibling of Results, not a child of it.** The two are different
+    measurements of the document -- an ordinary Run and an N-drive sweep -- and
+    nesting the matrix inside Results would have :func:`build_results` delete it
+    the next time the user presses Run, which is the opposite of keeping both
+    (their output directories are separate for the same reason).
+
+    Under it: the matrix leaf, then one group per drive holding that run's own
+    V(t)/I(t) for **every** port, not only the driven one -- off-diagonal
+    entries of Z come from exactly those, so a matrix that looks wrong is
+    debugged by opening them.
+    """
+    from wavesim_gui import portmatrix as pm
+
+    missing = [pm.drive_dir_name(k) for k in range(len(ports))
+               if not os.path.isfile(os.path.join(
+                   sweep_dir, pm.drive_dir_name(k), "results.npz"))]
+    if missing:
+        raise pm.SweepError(
+            "The sweep output is incomplete -- no results in:\n  {}"
+            .format("\n  ".join(missing)))
+
+    sweep_dir = sweep_dir.replace("\\", "/")
+    doc.openTransaction("Wavesim: Build Port Matrix")
+    try:
+        _remove_matrix_results(doc, sim)
+
+        grp = doc.addObject("App::DocumentObjectGroupPython", "PortMatrix")
+        MatrixResultContainer(grp)
+        grp.Label = _MATRIX_GROUP
+        if grp.ViewObject is not None:
+            MatrixResultViewProvider(grp.ViewObject)
+            grp.ViewObject.Visibility = True
+        sim.addObject(grp)
+
+        leaf = doc.addObject("App::FeaturePython", "Result")
+        ResultObject(leaf, _KIND_ZMATRIX)
+        leaf.Label = "Z matrix ({n}x{n})".format(n=len(ports))
+        leaf.DataKey = ""
+        leaf.ResultsDir = sweep_dir
+        # Everything needed to rebuild the MatrixPort list at draw time: the
+        # matrix is assembled from the raw records on open, not stored, so the
+        # Window control in its window stays live and nothing can go stale
+        # against the runs it came from.
+        _store_matrix_ports(leaf, ports)
+        if leaf.ViewObject is not None:
+            ResultViewProvider(leaf.ViewObject)
+            leaf.ViewObject.Visibility = True
+        grp.addObject(leaf)
+
+        kinds = {pm.FAMILY_MODAL: (_KIND_PORT_V, _KIND_PORT_I),
+                 pm.FAMILY_LUMPED: (_KIND_LUMPED_V, _KIND_LUMPED_I)}
+        for drive, driven in enumerate(ports):
+            row = doc.addObject("App::DocumentObjectGroupPython", "Drive")
+            MatrixResultContainer(row, drive=drive, port_name=driven.name)
+            row.Label = "Drive {}: {}".format(drive + 1, driven.name)
+            if row.ViewObject is not None:
+                MatrixResultViewProvider(row.ViewObject)
+                row.ViewObject.Visibility = True
+            drive_dir = os.path.join(sweep_dir,
+                                     pm.drive_dir_name(drive)).replace("\\", "/")
+            for port in ports:
+                kind_v, kind_i = kinds[port.family]
+                for kind, key, what in ((kind_v, port.key_v, "voltage"),
+                                        (kind_i, port.key_i, "current")):
+                    sub = doc.addObject("App::FeaturePython", "Result")
+                    ResultObject(sub, kind)
+                    # The drive number is in the label as well as in the group
+                    # above it: N drives record the same N ports, so without it
+                    # every label past the first drive collides and FreeCAD
+                    # appends "001" -- which reads as a different quantity
+                    # rather than as the same one under a different drive.
+                    sub.Label = "D{} · {} {}".format(drive + 1, port.name, what)
+                    sub.DataKey = key
+                    sub.ResultsDir = drive_dir
+                    if sub.ViewObject is not None:
+                        ResultViewProvider(sub.ViewObject)
+                        sub.ViewObject.Visibility = True
+                    row.addObject(sub)
+            grp.addObject(row)
+    except Exception:
+        doc.abortTransaction()
+        raise
+    doc.commitTransaction()
+    doc.recompute()
+    FreeCAD.Console.PrintMessage(
+        "Wavesim: port matrix added to the tree (double-click it to view).\n")
+    return grp
+
+
+def _store_matrix_ports(leaf, ports):
+    """Stash the port list on the matrix leaf as three parallel lists.
+
+    Three lists rather than one packed string because FreeCAD gives them to the
+    property editor as readable rows, and because a name is not enough to find
+    a port's arrays again -- the family and the spec index are what name them.
+    """
+    for prop, ptype, value in (
+        ("PortNames", "App::PropertyStringList", [p.name for p in ports]),
+        ("PortFamilies", "App::PropertyStringList", [p.family for p in ports]),
+        ("PortIndices", "App::PropertyIntegerList", [p.index for p in ports]),
+    ):
+        if not hasattr(leaf, prop):
+            leaf.addProperty(ptype, prop, "Port Matrix", "")
+            leaf.setEditorMode(prop, 1)
+        setattr(leaf, prop, value)
+
+
+def _matrix_ports_of(leaf):
+    """Rebuild the :class:`~wavesim_gui.portmatrix.MatrixPort` list from a leaf."""
+    from wavesim_gui import portmatrix as pm
+
+    names = list(getattr(leaf, "PortNames", []) or [])
+    families = list(getattr(leaf, "PortFamilies", []) or [])
+    indices = list(getattr(leaf, "PortIndices", []) or [])
+    if not (len(names) == len(families) == len(indices)) or len(names) < 2:
+        return []
+    return [pm.MatrixPort(f, i, n)
+            for f, i, n in zip(families, indices, names)]
+
+
 def _store_snapshot_components(leaf, field, comps, inplane):
     """Record which field (and components) a snapshot leaf's stacks hold.
 
@@ -1259,6 +1460,34 @@ if _GUI_AVAILABLE:
         __getstate__ = dumps
         __setstate__ = loads
 
+    class MatrixResultViewProvider(visibility.DisplayModeMixin):
+        """Tree icon for the Port Matrix group and each of its drive rows."""
+
+        def __init__(self, vobj):
+            vobj.Proxy = self
+
+        def attach(self, vobj):
+            self.ViewObject = vobj
+            self.Object = vobj.Object
+            self.attach_display_mode(vobj)
+
+        def getIcon(self):
+            obj = getattr(self, "Object", None)
+            # A drive row is one run of the sweep, so it wears the Run icon; the
+            # group that owns them wears the matrix.
+            if obj is not None and getattr(obj, "DriveIndex", -1) >= 0:
+                return _icon("run.svg")
+            return _icon("matrix.svg")
+
+        def dumps(self):
+            return None
+
+        def loads(self, state):
+            return None
+
+        __getstate__ = dumps
+        __setstate__ = loads
+
     class ResultViewProvider(visibility.DisplayModeMixin):
         """Tree view provider for a result leaf; double-click opens its plot.
 
@@ -1406,6 +1635,8 @@ if _GUI_AVAILABLE:
                 _plot_port_current(obj)
             elif kind == _KIND_IMPEDANCE:
                 _plot_impedance(obj)
+            elif kind == _KIND_ZMATRIX:
+                _plot_zmatrix(obj)
             elif kind == _KIND_SNAPSHOT:
                 _plot_snapshot(obj)
             elif kind == _KIND_MODE:
@@ -1495,8 +1726,10 @@ if _GUI_AVAILABLE:
     #: Tukey leads the non-trivial ones deliberately: an FDTD port record is
     #: front-loaded (the drive lands in the first few percent, the rest is
     #: decay), so a symmetric Hann puts its steep rising edge on top of the
-    #: excitation and reshapes it, while a Tukey is flat across the record and
-    #: tapers only the tail where the ringing actually is.
+    #: excitation and reshapes it, while a Tukey is flat across the middle and
+    #: ramps over only 5% at each end. Its *leading* ramp is not free either --
+    #: a drive inside the first 5% of the record gets clipped by it, measured
+    #: at 4% error in an extracted Z-matrix (see :mod:`wavesim_gui.spectrum`).
     _WINDOW_CHOICES = (
         ("none (as recorded)", None),
         ("Tukey", "tukey"),
@@ -1737,7 +1970,9 @@ if _GUI_AVAILABLE:
             "amplitudes. For a truncated one, Tukey: an FDTD record is\n"
             "front-loaded, so a symmetric Hann lands its rising edge on the\n"
             "excitation and reshapes it, while a Tukey is flat across the\n"
-            "record and tapers only the ringing tail."
+            "middle and ramps over only 5% at each end.\n"
+            "That leading 5% still clips a drive landing inside it, so on a\n"
+            "short run compare the answer against no window at all."
         )
         row.addWidget(win_box)
         row.addStretch(1)
@@ -2045,7 +2280,8 @@ if _GUI_AVAILABLE:
             "Taper applied to both series before transforming. A ratio is safe\n"
             "under a window as long as V and I get the same one, which they do\n"
             "here. Tukey for a record that ends mid-ring -- see the note on\n"
-            "the plot when it does."
+            "the plot when it does. Its ramp covers the first 5% of the record\n"
+            "as well as the last, so it clips a drive that lands that early."
         )
         row.addWidget(win_box)
         row.addStretch(1)
@@ -2066,6 +2302,413 @@ if _GUI_AVAILABLE:
         win_box.currentIndexChanged.connect(on_window)
         draw(figure, opts)
         return opts
+
+    # ------------------------------------------------------------------ #
+    # Port matrix Z(f) / Y(f)
+    # ------------------------------------------------------------------ #
+
+    #: What the N×N grid can draw per entry. Every one of these is a reading of
+    #: the *matrix entry itself*, which is why none of them names a T or a Π: a
+    #: topology is a choice laid over the matrix, and the point of showing the
+    #: matrix is that it does not require one. The two "equivalent" views are
+    #: still per-entry -- ``Im(Z_ij)/ω`` is the inductance that entry behaves
+    #: as, and a curve that is *flat* is the statement that the entry is lumped
+    #: over this band. That flatness check is worth more than the λ/10 rule of
+    #: thumb, because it is measured on the structure rather than assumed.
+    _MATRIX_VIEWS = (
+        ("R and X", "parts"),
+        ("Magnitude |Z| (log)", "bode"),
+        ("Equivalent L  (Im/ω)", "leq"),
+        ("Equivalent C  (−1/ω·Im)", "ceq"),
+    )
+
+    def _matrix_data(obj, opts, cache=None):
+        """Assemble the matrix from the sweep's raw records under *opts*.
+
+        Assembled from the records on demand rather than stored anywhere: it is
+        a few dozen FFTs of a few thousand points, nothing beside the runs that
+        produced them, and it keeps the Window control live with no saved copy
+        that could go stale against the sweep on disk. *cache* memoises within
+        one window, since the grid, the cursor line and the table all want the
+        same matrix and only a control change invalidates it.
+        """
+        from wavesim_gui import portmatrix as pm
+
+        key = (opts.get("window"), opts.get("quantity"))
+        if cache is not None and cache.get("key") == key:
+            return cache["data"]
+
+        ports = _matrix_ports_of(obj)
+        if not ports:
+            raise ValueError(
+                "This leaf does not carry a usable port list; re-run the sweep.")
+        data = pm.assemble(str(obj.ResultsDir), ports,
+                           window=opts.get("window"))
+        if opts.get("quantity") == "Y":
+            data = dict(data, z=pm.admittance(data["z"]), quantity="Y")
+        else:
+            data = dict(data, quantity="Z")
+        if cache is not None:
+            cache["key"], cache["data"] = key, data
+        return data
+
+    def _matrix_entry_curves(values, freqs, view, quantity):
+        """``(curves, ylabel)`` for one entry, per the selected view.
+
+        *curves* is a list of ``(y, style, label)``.
+        """
+        import numpy as np
+
+        unit = "S" if quantity == "Y" else "Ω"
+        re_name, im_name = ("G", "B") if quantity == "Y" else ("R", "X")
+        if view == "bode":
+            return ([(np.abs(values), "-", "|{}|".format(quantity))],
+                    "|{}| ({})".format(quantity, unit))
+        if view in ("leq", "ceq"):
+            w = 2.0 * np.pi * freqs
+            with np.errstate(divide="ignore", invalid="ignore"):
+                if view == "leq":
+                    y = np.where(w > 0, values.imag / w, np.nan)
+                    return [(y, "-", "L")], "L (H)"
+                y = np.where((w > 0) & (values.imag != 0),
+                             -1.0 / (w * values.imag), np.nan)
+                return [(y, "-", "C")], "C (F)"
+        return ([(values.real, "-", re_name), (values.imag, "--", im_name)],
+                "{}, {} ({})".format(re_name, im_name, unit))
+
+    #: Percentile the matrix grid's shared y-limit is taken at. A structure with
+    #: any resonance in band has poles in Z (a half-wave line's Z11 goes to
+    #: infinity at every multiple of v/2L), so scaling on the true peak draws
+    #: two spikes and renders every other entry as a flat line on the axis --
+    #: the same failure, and the same fix, as the snapshot maps' clip
+    #: percentile. Curves run off the top; that is what a pole should look like.
+    _MATRIX_CLIP_PCT = 98.0
+
+    def _robust_matrix_ylim(entries, log=False):
+        """A y-limit shared by every entry of the grid, robust to poles.
+
+        **Shared**, because comparability across entries is the reason to draw a
+        matrix as a grid at all: per-entry autoscaling would blow a near-zero
+        off-diagonal up to full scale and make an isolated port pair look
+        strongly coupled. ``(None, None)`` when there is nothing finite to scale
+        on, leaving matplotlib to autoscale.
+        """
+        import numpy as np
+
+        pool = []
+        for curves in entries.values():
+            for y, _style, _label in curves:
+                finite = y[np.isfinite(y)]
+                if log:
+                    finite = finite[finite > 0]
+                if finite.size:
+                    pool.append(finite)
+        if not pool:
+            return None, None
+        allv = np.concatenate(pool)
+        if log:
+            return (float(np.percentile(allv, 100.0 - _MATRIX_CLIP_PCT)) / 2.0,
+                    float(np.percentile(allv, _MATRIX_CLIP_PCT)) * 2.0)
+        span = float(np.percentile(np.abs(allv), _MATRIX_CLIP_PCT))
+        if not span > 0:
+            return None, None
+        lo, hi = float(allv.min()), float(allv.max())
+        # Symmetric only when the data really does straddle zero -- an
+        # equivalent-L view that is entirely positive should not spend half its
+        # height below the axis.
+        if lo < 0 < hi:
+            return -1.15 * span, 1.15 * span
+        return (-1.15 * span, 0.1 * span) if hi <= 0 else (-0.1 * span,
+                                                           1.15 * span)
+
+    def _draw_zmatrix(figure, obj, opts, cache=None):
+        """Draw the N×N grid of matrix entries into *figure*."""
+        import numpy as np
+
+        from wavesim_gui import portmatrix as pm
+
+        data = _matrix_data(obj, opts, cache)
+        z, freqs, valid = data["z"], data["freqs"], data["valid"]
+        names, quantity = data["names"], data["quantity"]
+        n = len(names)
+        if not valid.any():
+            ax = figure.add_subplot(111)
+            ax.axis("off")
+            ax.text(0.5, 0.5,
+                    "No frequency bin is reportable.\n\n"
+                    "Either the drives put no energy in a common band, or the "
+                    "N runs did not probe\nN independent states of the "
+                    "structure (see the conditioning strip).",
+                    ha="center", va="center", fontsize=10)
+            return
+
+        funit = _freq_unit(obj)
+        scale = units.freq_to_si(1.0, funit)
+        f = freqs / scale
+        view = opts.get("view", "parts")
+        # Only the reportable span is drawn: outside it every entry is NaN, and
+        # letting the axis run to Nyquist would put the whole matrix in the
+        # leftmost pixel column.
+        f_lo, f_hi = float(f[valid].min()), float(f[valid].max())
+
+        # Every entry is computed before anything is drawn, because the y-limit
+        # is shared across the grid -- see _robust_matrix_ylim.
+        entries = {}
+        ylabel = ""
+        for i in range(n):
+            for j in range(n):
+                entries[(i, j)], ylabel = _matrix_entry_curves(
+                    z[:, i, j], freqs, view, quantity)
+        lo, hi = _robust_matrix_ylim(entries, log=(view == "bode"))
+
+        # One row of axes per port, plus a short quality strip underneath. The
+        # strip is not decoration: it is the only place the reader can see that
+        # a band they are about to trust was extracted from a near-singular
+        # system, or from runs that disagree about reciprocity.
+        # tight_layout cannot handle a gridspec with its own spacing, so the
+        # margins are set explicitly instead.
+        figure.set_layout_engine("none")
+        gs = figure.add_gridspec(n + 1, n, height_ratios=[3] * n + [1.7],
+                                 hspace=0.45, wspace=0.32,
+                                 left=0.11, right=0.92, top=0.90, bottom=0.09)
+        share = None
+        for i in range(n):
+            for j in range(n):
+                ax = figure.add_subplot(gs[i, j], sharex=share)
+                share = share or ax
+                for k, (y, style, label) in enumerate(entries[(i, j)]):
+                    ax.plot(f, y, style, lw=1.2, color="C{}".format(k),
+                            label=label)
+                if view == "bode":
+                    ax.set_yscale("log")
+                elif view == "parts":
+                    ax.axhline(0.0, color="0.6", lw=0.7)
+                if lo is not None:
+                    ax.set_ylim(lo, hi)
+                ax.grid(True, alpha=0.3)
+                ax.tick_params(labelsize=7)
+                ax.set_title("{}$_{{{}{}}}$".format(quantity, i + 1, j + 1),
+                             fontsize=9, pad=3)
+                if j == 0:
+                    ax.set_ylabel(ylabel, fontsize=8)
+                if i == 0 and j == n - 1:
+                    ax.legend(fontsize=7, loc="upper left")
+                if i == n - 1:
+                    ax.set_xlabel(funit, fontsize=8)
+
+        # Two quantities, two axes: reciprocity lives around 1e-14 and the
+        # condition number around 1e0-1e7, and sharing one log decade range
+        # would render both as flat lines at the edges of the strip.
+        ax_q = figure.add_subplot(gs[n, :], sharex=share)
+        recip = pm.reciprocity_error(z)
+        ax_q.semilogy(f, recip, lw=1.1, color="#8c564b")
+        ax_q.set_ylabel("reciprocity", fontsize=7, color="#8c564b")
+        ax_q.tick_params(axis="y", labelsize=6, colors="#8c564b")
+        ax_q.tick_params(axis="x", labelsize=7)
+        ax_q.set_xlabel("frequency ({})".format(funit), fontsize=8)
+        ax_q.grid(True, which="major", alpha=0.3)
+
+        ax_c = ax_q.twinx()
+        # The condition number raw, not normalised: 1 is a perfectly
+        # conditioned set of drives and the cutoff is an absolute number, so
+        # scaling it to its own peak would hide exactly the approach to that
+        # cutoff the strip exists to show.
+        ax_c.semilogy(f, np.where(valid, data["cond"], np.nan), lw=1.1,
+                      ls="--", color="#7f7f7f")
+        ax_c.set_ylabel("conditioning", fontsize=7, color="#7f7f7f")
+        ax_c.tick_params(axis="y", labelsize=6, colors="#7f7f7f")
+        ax_q.set_title(
+            "|Z$_{ij}$−Z$_{ji}$| / max|Z|  (solid)      "
+            "drive conditioning, 1 = ideal  (dashed)", fontsize=7, pad=2)
+
+        share.set_xlim(f_lo, f_hi)
+        figure.suptitle(
+            "{} matrix  —  {}".format(quantity, ",  ".join(
+                "{}: {}".format(k + 1, name) for k, name in enumerate(names))),
+            fontsize=9)
+
+    def _matrix_table_text(obj, opts, freq_hz, cache=None):
+        """The matrix at one frequency, as fixed-width text."""
+        import numpy as np
+
+        data = _matrix_data(obj, opts, cache)
+        z, freqs, valid = data["z"], data["freqs"], data["valid"]
+        names, quantity = data["names"], data["quantity"]
+        if not valid.any():
+            return "No reportable bin."
+        idx = int(np.argmin(np.abs(freqs[valid] - freq_hz)))
+        bin_index = int(np.flatnonzero(valid)[idx])
+        funit = _freq_unit(obj)
+        scale = units.freq_to_si(1.0, funit)
+        unit = "S" if quantity == "Y" else "Ω"
+        lines = ["{} at {:.6g} {}   ({})".format(
+            quantity, freqs[bin_index] / scale, funit, unit)]
+        width = max(len(name) for name in names)
+        head = " " * (width + 2) + "".join(
+            "{:>24}".format(name[:22]) for name in names)
+        lines.append(head)
+        for i, name in enumerate(names):
+            row = "{:<{w}}  ".format(name[:width], w=width)
+            for j in range(len(names)):
+                value = z[bin_index, i, j]
+                row += "{:>24}".format("{:+.4g} {:+.4g}j".format(
+                    value.real, value.imag))
+            lines.append(row)
+        return "\n".join(lines)
+
+    def _plot_zmatrix(obj):
+        """Open the port-matrix window: an N×N grid, plus the matrix at a cursor.
+
+        The grid is the answer and the table is how a number gets read off it.
+        Neither commits to an equivalent circuit -- a T or a Π is a *choice* of
+        topology laid over this matrix, and which one is right is a modelling
+        decision that belongs to whoever is reading, not to the extraction.
+        """
+        _QtCore, QtWidgets = _qt()
+        ports = _matrix_ports_of(obj)
+        if not ports:
+            _missing(obj)
+            return
+
+        made = _make_window("Wavesim Results - {}".format(obj.Label))
+        if made is None:
+            return
+        dialog, figure, layout = made
+        dialog.resize(980, 760)
+        opts = {"view": "parts", "window": None, "quantity": "Z"}
+
+        row = QtWidgets.QHBoxLayout()
+        row.addWidget(QtWidgets.QLabel("View:"))
+        view_box = QtWidgets.QComboBox()
+        for text, _key in _MATRIX_VIEWS:
+            view_box.addItem(text)
+        view_box.setToolTip(
+            "Every view reads the matrix entries themselves; none of them\n"
+            "assumes a T or a Pi. 'Equivalent L' and 'Equivalent C' are that\n"
+            "entry's own reading -- a curve that is flat across the band is\n"
+            "the statement that the entry really is lumped there, which is a\n"
+            "measurement rather than the lambda/10 rule of thumb."
+        )
+        row.addWidget(view_box)
+
+        row.addSpacing(10)
+        quantity_box = QtWidgets.QComboBox()
+        quantity_box.addItems(["Z (impedance)", "Y = Z⁻¹ (admittance)"])
+        quantity_box.setToolTip(
+            "The same measurement, inverted per frequency bin. A shunt element\n"
+            "is legible in Y where it is buried in Z, and the other way round."
+        )
+        row.addWidget(quantity_box)
+
+        row.addSpacing(10)
+        row.addWidget(QtWidgets.QLabel("Window:"))
+        win_box = QtWidgets.QComboBox()
+        for text, _key in _WINDOW_CHOICES:
+            win_box.addItem(text)
+        win_box.setToolTip(
+            "Taper applied to every record in the sweep before transforming.\n"
+            "Safe for the ratios because all 2N² series get the same one."
+        )
+        row.addWidget(win_box)
+        row.addStretch(1)
+        layout.addLayout(row)
+
+        cursor_row = QtWidgets.QHBoxLayout()
+        cursor_row.addWidget(QtWidgets.QLabel("Read at:"))
+        slider = QtWidgets.QSlider(_QtCore.Qt.Horizontal)
+        slider.setRange(0, 1000)
+        slider.setValue(500)
+        slider.setToolTip("Frequency the table below is evaluated at.")
+        cursor_row.addWidget(slider, 1)
+        layout.addLayout(cursor_row)
+
+        table = QtWidgets.QPlainTextEdit()
+        table.setReadOnly(True)
+        table.setLineWrapMode(QtWidgets.QPlainTextEdit.NoWrap)
+        font = table.font()
+        font.setFamily("Consolas")
+        table.setFont(font)
+        table.setMaximumHeight(150)
+        layout.addWidget(table)
+
+        # The reportable span, plus the memo the grid / cursor / table share so
+        # moving the slider does not re-transform the whole sweep.
+        span = {"lo": 0.0, "hi": 0.0, "line": []}
+        cache = {}
+
+        def cursor_hz():
+            return span["lo"] + (span["hi"] - span["lo"]) * slider.value() / 1000.0
+
+        def refresh_table():
+            if span["hi"] <= span["lo"]:
+                table.setPlainText("No reportable bin.")
+                return
+            try:
+                table.setPlainText(
+                    _matrix_table_text(obj, opts, cursor_hz(), cache))
+            except Exception as exc:
+                table.setPlainText("Could not read the matrix: {}".format(exc))
+
+        def draw_cursor():
+            """Put a vertical line at the cursor on every subplot."""
+            for line in span["line"]:
+                try:
+                    line.remove()
+                except Exception:
+                    pass
+            span["line"] = []
+            if span["hi"] <= span["lo"]:
+                return
+            scale = units.freq_to_si(1.0, _freq_unit(obj))
+            x = cursor_hz() / scale
+            for ax in figure.axes:
+                span["line"].append(
+                    ax.axvline(x, color="#d62728", lw=0.9, alpha=0.7))
+            dialog._canvas.draw_idle()
+
+        def redraw():
+            def paint(fig):
+                _draw_zmatrix(fig, obj, opts, cache)
+                try:
+                    data = _matrix_data(obj, opts, cache)
+                    valid = data["valid"]
+                    if valid.any():
+                        span["lo"] = float(data["freqs"][valid].min())
+                        span["hi"] = float(data["freqs"][valid].max())
+                    else:
+                        span["lo"] = span["hi"] = 0.0
+                except Exception:
+                    span["lo"] = span["hi"] = 0.0
+                span["line"] = []
+
+            _redraw_guarded(dialog, paint)
+            refresh_table()
+            draw_cursor()
+
+        def on_view(index):
+            opts["view"] = _MATRIX_VIEWS[index][1]
+            redraw()
+
+        def on_quantity(index):
+            opts["quantity"] = "Y" if index else "Z"
+            redraw()
+
+        def on_window(index):
+            opts["window"] = _WINDOW_CHOICES[index][1]
+            redraw()
+
+        def on_slider(_value):
+            refresh_table()
+            draw_cursor()
+
+        view_box.currentIndexChanged.connect(on_view)
+        quantity_box.currentIndexChanged.connect(on_quantity)
+        win_box.currentIndexChanged.connect(on_window)
+        slider.valueChanged.connect(on_slider)
+
+        redraw()
+        dialog.show()
+        _register_window(dialog)
 
     # Colour-scale clip percentiles offered for snapshot maps, strongest first.
     # 100 means "scale on the true peak" (the old behaviour).

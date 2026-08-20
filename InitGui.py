@@ -95,8 +95,13 @@ class WavesimWorkbench(Gui.Workbench):
                 "Wavesim_AddVoltageMonitor",
                 "Wavesim_AddCurrentMonitor",
             )
-            # The solve itself, alone: it is the one button that costs minutes.
-            add_group("Wavesim_Run")
+            # The solves, together: the two buttons that cost minutes. The port
+            # matrix is the same run repeated once per port with the drive
+            # moved, so it belongs beside Run rather than among the monitors --
+            # and importing the module is what registers it.
+            from wavesim_gui import portmatrix  # noqa: F401
+
+            add_group("Wavesim_Run", "Wavesim_PortMatrix")
         except Exception as exc:
             FreeCAD.Console.PrintError(
                 "Wavesim: failed to load commands module ({}: {})\n".format(

@@ -1,0 +1,22 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24">
+  <defs>
+    <linearGradient id="mdiag" x1="4" y1="4" x2="20" y2="20" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#4fb9a5"/><stop offset="1" stop-color="#12695a"/>
+    </linearGradient>
+  </defs>
+  <!-- the bracket pair that makes a grid of numbers read as a matrix -->
+  <path d="M5.6 1.6 H1.8 V22.4 H5.6 M18.4 1.6 H22.2 V22.4 H18.4" fill="none"
+        stroke="#157a68" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+  <!-- off-diagonal entries: the couplings only a multi-drive sweep reaches -->
+  <g fill="#a8ded2">
+    <rect x="12.6" y="4.4" width="4.4" height="3.4" rx="0.9"/>
+    <rect x="7.0" y="10.3" width="4.4" height="3.4" rx="0.9"/>
+    <rect x="12.6" y="10.3" width="4.4" height="3.4" rx="0.9"/>
+    <rect x="7.0" y="16.2" width="4.4" height="3.4" rx="0.9"/>
+  </g>
+  <!-- the diagonal: what a single run already gives you -->
+  <g fill="url(#mdiag)">
+    <rect x="7.0" y="4.4" width="4.4" height="3.4" rx="0.9"/>
+    <rect x="12.6" y="16.2" width="4.4" height="3.4" rx="0.9"/>
+  </g>
+</svg>

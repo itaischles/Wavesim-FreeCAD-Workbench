@@ -85,6 +85,11 @@ _KIND_LUMPED_I = "lumped_i"  # lumped R/L/C port current I(t)
 # referenced to the port's own Z_ref -- which the plot says out loud.
 _KIND_PORT_V = "port_v"
 _KIND_PORT_I = "port_i"
+# Z(f) = V(f)/I(f) at a port that recorded both -- modal, SPICE or lumped. One
+# leaf per port rather than a view on the V leaf, because it is a different
+# measurement of the pair: neither series alone produces it, and it is the
+# answer a broadband run was for.
+_KIND_IMPEDANCE = "impedance"
 # The electrostatic run's scalar results: applied potentials, per-conductor
 # charge, field energy and the capacitance matrix. One leaf, because they are one
 # answer -- the charges are the matrix's raw material and the energy is the same
@@ -108,6 +113,7 @@ _KIND_ICONS = {
     # and the group they sit in already says which port they belong to.
     _KIND_PORT_V: _icon("voltage.svg"),
     _KIND_PORT_I: _icon("current.svg"),
+    _KIND_IMPEDANCE: _icon("impedance.svg"),
     # Not the energy icon: the electrostatic leaf's headline is the matrix, and
     # two different answers sharing a picture is how a tree stops being read.
     _KIND_CAPACITANCE: _icon("capacitance.svg"),
@@ -231,7 +237,7 @@ class ResultObject:
             obj.addProperty(
                 "App::PropertyString", "ResultKind", "Result",
                 "Kind of result: energy, dissipation, probe, snapshot, mode, "
-                "voltage, current or a SPICE port series",
+                "voltage, current, impedance or a SPICE port series",
             )
             obj.ResultKind = kind
             obj.setEditorMode("ResultKind", 1)
@@ -253,6 +259,14 @@ class ResultObject:
                 "Field quantity recorded (probe/snapshot)",
             )
             obj.setEditorMode("Component", 1)
+        # An impedance leaf is the one kind built from *two* series: DataKey is
+        # the voltage's and this is the current's. Empty everywhere else.
+        if not hasattr(obj, "CurrentKey"):
+            obj.addProperty(
+                "App::PropertyString", "CurrentKey", "Result",
+                "Key of the paired current array (impedance leaves only)",
+            )
+            obj.setEditorMode("CurrentKey", 1)
 
     def onDocumentRestored(self, obj):
         obj.Proxy = self
@@ -599,6 +613,22 @@ def _fill_dead(data, dead, layers=_DEAD_FILL_LAYERS):
     return val
 
 
+def _impedance_leaf(new_leaf, keys, name, v_key, i_key, parent=None):
+    """Add the ``Z(f)`` leaf for a port that recorded both V(t) and I(t).
+
+    Every port family that records a pair gets one -- modal, SPICE, lumped --
+    and they all reach it the same way, so the three loops in
+    :func:`build_results` call this rather than each growing a copy. Returns the
+    new leaf (for the caller to stamp its port meta on), or ``None`` when either
+    series is missing: half a pair is not an impedance, and an empty leaf that
+    errors on double-click is worse than no leaf.
+    """
+    if v_key + "_values" not in keys or i_key + "_values" not in keys:
+        return None
+    return new_leaf("{} impedance".format(name), _KIND_IMPEDANCE, v_key,
+                    parent=parent, current_key=i_key)
+
+
 def build_results(doc, sim, workdir, summary):
     """(Re)build the Results group under *sim* from a finished run.
 
@@ -638,13 +668,15 @@ def build_results(doc, sim, workdir, summary):
             grp.ViewObject.Visibility = True
         sim.addObject(grp)
 
-        def _new_leaf(name, kind, data_key, component="", parent=None):
+        def _new_leaf(name, kind, data_key, component="", parent=None,
+                      current_key=""):
             leaf = doc.addObject("App::FeaturePython", "Result")
             ResultObject(leaf, kind)
             leaf.Label = name
             leaf.DataKey = data_key
             leaf.ResultsDir = workdir
             leaf.Component = component
+            leaf.CurrentKey = current_key
             if leaf.ViewObject is not None:
                 ResultViewProvider(leaf.ViewObject)
                 # A result leaf exists or it does not -- there is no hidden
@@ -730,6 +762,8 @@ def build_results(doc, sim, workdir, summary):
             if "spice_{}i_values".format(idx) in keys:
                 _new_leaf("{} current".format(name), _KIND_SPICE_I,
                           "spice_{}i".format(idx), parent=parent)
+            _impedance_leaf(_new_leaf, keys, name, "spice_{}v".format(idx),
+                            "spice_{}i".format(idx), parent=parent)
 
         # Lumped R/L/C ports: the same V(t)/I(t) pair. A lumped port has no mode
         # and so no port group -- it is a line element, and its two leaves sit
@@ -742,6 +776,11 @@ def build_results(doc, sim, workdir, summary):
                 if key + "_values" not in keys:
                     continue
                 leaf = _new_leaf("{} {}".format(name, label), kind, key)
+                _store_lumped_meta(leaf, meta)
+            leaf = _impedance_leaf(_new_leaf, keys, name,
+                                   "lumped_{}v".format(idx),
+                                   "lumped_{}i".format(idx))
+            if leaf is not None:
                 _store_lumped_meta(leaf, meta)
 
         # Modal ports: the V(t)/I(t) the port's own impedance sheet recorded --
@@ -761,6 +800,11 @@ def build_results(doc, sim, workdir, summary):
                                  parent=parent)
                 # The plot annotates Z_ref, so the leaf carries it too rather
                 # than reaching back into its group at draw time.
+                _store_port_meta(leaf, meta)
+            leaf = _impedance_leaf(_new_leaf, keys, name,
+                                   "port_{}v".format(si), "port_{}i".format(si),
+                                   parent=parent)
+            if leaf is not None:
                 _store_port_meta(leaf, meta)
 
         # Snapshots (frame stacks). Capture the slice's physical extent from the
@@ -1360,6 +1404,8 @@ if _GUI_AVAILABLE:
                 _plot_port_voltage(obj)
             elif kind == _KIND_PORT_I:
                 _plot_port_current(obj)
+            elif kind == _KIND_IMPEDANCE:
+                _plot_impedance(obj)
             elif kind == _KIND_SNAPSHOT:
                 _plot_snapshot(obj)
             elif kind == _KIND_MODE:
@@ -1388,13 +1434,22 @@ if _GUI_AVAILABLE:
             "or deleted:\n{}".format(getattr(obj, "ResultsDir", "?")),
         )
 
-    def _plot_series(obj, ylabel, title, color, annotate=None):
+    def _plot_series(obj, ylabel, title, color, annotate=None, quantity=None):
         """1D time-series plot shared by the energy/probe/voltage/current leaves.
 
         Reads ``<DataKey>_times`` / ``<DataKey>_values`` from the leaf's
         ``results.npz`` and draws them in a non-modal window. *annotate*, if
         given, is called as ``annotate(ax, times_si, values)`` once the curve is
         drawn, for a per-kind derived quantity (see :func:`_plot_dissipation`).
+
+        *quantity* (``'V'`` or ``'I'``) marks a port-like series and adds the
+        **domain switch**: the same record seen in time or in frequency, in one
+        window rather than two leaves. It names the quantity because that is
+        what fixes the transform's half-step stagger -- a voltage is E-derived
+        and a current H-derived, and getting it wrong is what turns a lossless
+        structure's Z into one with a resistance (see
+        :mod:`wavesim_gui.spectrum`). Leaves that are neither (energy,
+        dissipation, probe) keep the plain time plot.
         """
         workdir = str(obj.ResultsDir)
         key = str(obj.DataKey)
@@ -1403,24 +1458,309 @@ if _GUI_AVAILABLE:
         if times is None or values is None:
             _missing(obj)
             return
-        unit = _time_unit(obj)
-        t = [units.time_from_si(float(v), unit) for v in times]
 
         made = _make_window("Wavesim Results - {}".format(obj.Label))
         if made is None:
             return
-        dialog, figure, _layout = made
-        ax = figure.add_subplot(111)
-        ax.plot(t, values, color=color)
-        ax.set_xlabel("time ({})".format(unit))
-        ax.set_ylabel(ylabel)
-        ax.set_title(title)
-        ax.grid(True, alpha=0.3)
-        if annotate is not None:
-            annotate(ax, times, values)
+        dialog, figure, layout = made
+
+        def draw_time(fig):
+            unit = _time_unit(obj)
+            t = [units.time_from_si(float(v), unit) for v in times]
+            ax = fig.add_subplot(111)
+            ax.plot(t, values, color=color)
+            ax.set_xlabel("time ({})".format(unit))
+            ax.set_ylabel(ylabel)
+            ax.set_title(title)
+            ax.grid(True, alpha=0.3)
+            if annotate is not None:
+                annotate(ax, times, values)
+
+        if quantity is None:
+            draw_time(figure)
+        else:
+            _add_domain_switch(dialog, layout, draw_time,
+                               lambda fig, opts: _draw_series_spectrum(
+                                   fig, obj, times, values, quantity, color,
+                                   opts))
         dialog._canvas.draw()
         dialog.show()
         _register_window(dialog)
+
+    # ------------------------------------------------------------------ #
+    # Frequency domain
+    # ------------------------------------------------------------------ #
+
+    #: Window tapers offered in the frequency views, in the order shown.
+    #: Tukey leads the non-trivial ones deliberately: an FDTD port record is
+    #: front-loaded (the drive lands in the first few percent, the rest is
+    #: decay), so a symmetric Hann puts its steep rising edge on top of the
+    #: excitation and reshapes it, while a Tukey is flat across the record and
+    #: tapers only the tail where the ringing actually is.
+    _WINDOW_CHOICES = (
+        ("none (as recorded)", None),
+        ("Tukey", "tukey"),
+        ("Exponential", "exponential"),
+        ("Hann", "hann"),
+        ("Hamming", "hamming"),
+    )
+
+    #: Out-of-band cutoff: a bin counts as carrying signal when it stands at
+    #: least this fraction of its own spectrum's peak. Sets the default x-limit
+    #: and, for a ratio, which bins are worth dividing.
+    _BAND_FLOOR = 1e-3
+
+    #: Warn on the figure when the last 5% of a record still reaches this much
+    #: of its peak -- the transform of a record that ends mid-ring smears every
+    #: sharp feature across neighbouring bins.
+    _DECAY_TOL = 0.01
+
+    def _freq_unit(obj):
+        return units.get_frequency_unit(active_simulation(obj.Document))
+
+    def _spectrum_of(times, values, quantity, opts):
+        """Transform one recorded series under the Window box's current choice.
+
+        *quantity* is ``'V'`` or ``'I'``; it chooses the stagger the transform
+        divides back out, and the unit the spectrum announces.
+        """
+        from wavesim_gui import spectrum as spec
+
+        stagger = spec.STAGGER_H if quantity == "I" else spec.STAGGER_E
+        unit = "A" if quantity == "I" else "V"
+        return spec.spectrum(times, values, window=opts.get("window"),
+                             stagger=stagger, label=quantity, unit=unit)
+
+    def _set_band_xlim(ax, spectra, scale):
+        """Limit the frequency axis to the band the data actually supports.
+
+        An rfft of an FDTD record runs to Nyquist -- hundreds of GHz for a
+        microwave mesh -- typically far past anything the excitation
+        illuminated. Left to autoscale, every one of these plots would be a
+        spike in the leftmost pixel column.
+        """
+        import numpy as np
+
+        from wavesim_gui import spectrum as spec
+
+        _lo, hi = spec.usable_band(*spectra, floor=_BAND_FLOOR)
+        if np.isfinite(hi) and hi > 0.0:
+            ax.set_xlim(0.0, 1.05 * hi / scale)
+
+    def _fit_ylim(ax, freqs, mag, scale, floor_db=100.0):
+        """Scale a magnitude axis to what is *inside* the frequency window.
+
+        Autoscaling would take in the whole rfft, which runs to Nyquist -- for a
+        microwave mesh, hundreds of GHz of out-of-band numerical floor that the
+        x-limit already hides. The visible curve then occupies the top decade of
+        a ten-decade axis. Floored at *floor_db* below the peak as well, so a
+        band edge that dives into round-off cannot stretch the axis either.
+
+        Returns ``True`` if a log axis is worth it -- the visible curve spans
+        more than a decade. Under that, a log axis labels a flat 50 Ω line
+        "5.06 × 10¹", which is not a reading.
+        """
+        import numpy as np
+
+        hi = ax.get_xlim()[1] * scale
+        m = mag[(freqs <= hi) & np.isfinite(mag) & (mag > 0.0)]
+        if not m.size:
+            return False
+        peak, low = float(m.max()), float(m.min())
+        low = max(low, peak * 10.0 ** (-floor_db / 20.0))
+        wide = peak > 10.0 * low
+        if wide:
+            ax.set_ylim(low / 2.0, peak * 2.0)
+        return wide
+
+    def _shade_band(ax, spectra, scale, unit):
+        """Shade the frequencies where every given spectrum clears the floor.
+
+        Outside it the excitation put no energy, so any Z read there would be
+        the quotient of two round-off numbers -- which is why the impedance
+        curves are blank there rather than wild.
+        """
+        import numpy as np
+
+        from wavesim_gui import spectrum as spec
+
+        lo, hi = spec.usable_band(*spectra, floor=_BAND_FLOOR)
+        if not (np.isfinite(lo) and np.isfinite(hi) and hi > lo):
+            return
+        ax.axvspan(lo / scale, hi / scale, color="0.5", alpha=0.12, zorder=0,
+                   label="excited band {:.3g}-{:.3g} {}".format(
+                       lo / scale, hi / scale, unit))
+
+    def _decay_warning(records, opts):
+        """The "this record ends mid-ring" note, or ``None``.
+
+        Silent once a window is on: the taper is the answer to it, and a note
+        that never goes away stops being read.
+        """
+        from wavesim_gui import spectrum as spec
+
+        if opts.get("window") is not None:
+            return None
+        worst = max((spec.tail_ratio(v) for v in records), default=0.0)
+        if worst <= _DECAY_TOL:
+            return None
+        return ("record ends mid-ring ({:.0%} of peak in the last 5%)\n"
+                "-- features smear; try a Tukey window or a longer run"
+                .format(worst))
+
+    def _redraw_guarded(dialog, paint):
+        """Run *paint* on the window's figure, showing a failure in the figure.
+
+        The switches call this from Qt slots, where an escaping exception is
+        not merely a failed plot -- it surfaces as an unhandled error in the
+        event loop, and the window is left showing the *previous* view's
+        picture under the new combo setting. A record the transform rejects
+        (non-uniform timestamps, a single sample) says so on the canvas
+        instead, and the box can be moved back.
+        """
+        figure = dialog._figure
+        figure.clear()
+        try:
+            paint(figure)
+        except Exception as exc:
+            FreeCAD.Console.PrintError(
+                "Wavesim: could not draw this view: {}\n".format(exc))
+            figure.clear()
+            ax = figure.add_subplot(111)
+            ax.axis("off")
+            ax.text(0.5, 0.5, "Could not draw this view:\n{}".format(exc),
+                    ha="center", va="center", wrap=True, fontsize=9)
+        dialog._canvas.draw_idle()
+
+    def _corner_text(ax, lines, va="top", y=0.95):
+        """Draw *lines* in a boxed corner note, the shared annotation style."""
+        if not lines:
+            return
+        ax.text(0.98, y, "\n".join(lines), transform=ax.transAxes,
+                ha="right", va=va, fontsize=9,
+                bbox=dict(boxstyle="round", fc="white", ec="0.7", alpha=0.85))
+
+    def _draw_series_spectrum(figure, obj, times, values, quantity, color,
+                              opts):
+        """|X(f)| or its phase for one recorded series -- the frequency half of
+        a voltage/current window.
+
+        The companion to the time plot, not a replacement: this is where the
+        excitation's band is legible, which is the first thing to check before
+        reading any Z off the same run.
+        """
+        import numpy as np
+
+        s = _spectrum_of(times, values, quantity, opts)
+        funit = _freq_unit(obj)
+        scale = units.freq_to_si(1.0, funit)
+
+        ax = figure.add_subplot(111)
+        f = s.freqs / scale
+        view = opts.get("view")
+        if view == "phase":
+            ax.plot(f, s.phase_deg(), color=color,
+                    label="∠{}(f)".format(quantity))
+            ax.set_ylabel("phase of {}(f) (deg)".format(quantity))
+            # Unwrapped, so this runs to many turns for a delayed pulse and the
+            # ±90° guides the Z panel draws would mean nothing here. Only zero
+            # is a landmark.
+            ax.axhline(0.0, color="0.6", lw=0.7, ls=":")
+        elif view == "db":
+            db = s.db
+            ax.plot(f, db, color=color, label="|{}(f)|".format(quantity))
+            ax.set_ylabel("|{}(f)| (dB re 1 {}/Hz)".format(quantity, s.unit))
+            finite = db[np.isfinite(db)]
+            if finite.size:
+                # A fixed 100 dB below the peak rather than autoscaling: deep
+                # enough to show a notch, shallow enough to keep the numerical
+                # floor and its noise out of the picture.
+                top = float(finite.max())
+                ax.set_ylim(top - 100.0, top + 6.0)
+        else:
+            ax.plot(f, s.magnitude, color=color,
+                    label="|{}(f)|".format(quantity))
+            ax.set_ylabel("|{}(f)| ({}/Hz)".format(quantity, s.unit))
+
+        _shade_band(ax, [s], scale, funit)
+        _set_band_xlim(ax, [s], scale)
+        if view not in ("phase", "db"):
+            # After the x-limit, which is what "visible" means here.
+            ax.set_yscale("log" if _fit_ylim(ax, s.freqs, s.magnitude, scale)
+                          else "linear")
+        ax.set_xlabel("frequency ({})".format(funit))
+        ax.set_title("{} spectrum".format(str(obj.Label)))
+        ax.grid(True, which="both", alpha=0.3)
+        ax.legend(fontsize=9, loc="upper left")
+        _corner_text(ax, [t for t in (_decay_warning([values], opts),) if t])
+
+    def _add_domain_switch(dialog, layout, draw_time, draw_freq):
+        """Add the "View / Window" control row that swaps a window's domain.
+
+        One window, two domains: the time series a run recorded and its
+        transform are the same measurement, and making the user open a second
+        leaf to see the other one is how the two stop being compared. *draw_time*
+        takes the figure; *draw_freq* takes the figure and the options dict.
+        The Window box only means anything to the transform, so it is greyed in
+        the time view rather than removed -- it stays where the eye left it.
+        """
+        _QtCore, QtWidgets = _qt()
+        figure = dialog._figure
+
+        opts = {"view": "time", "window": None}
+        views = (("Time domain", "time"),
+                 ("Spectrum |X(f)|", "mag"),
+                 ("Spectrum |X(f)| (dB)", "db"),
+                 ("Spectrum phase", "phase"))
+
+        row = QtWidgets.QHBoxLayout()
+        row.addWidget(QtWidgets.QLabel("View:"))
+        view_box = QtWidgets.QComboBox()
+        for text, _key in views:
+            view_box.addItem(text)
+        view_box.setToolTip(
+            "The same record in time or in frequency. The spectrum is what\n"
+            "shows the band the excitation actually covered -- outside it a\n"
+            "V/I ratio is the quotient of two round-off numbers."
+        )
+        row.addWidget(view_box)
+
+        row.addSpacing(12)
+        row.addWidget(QtWidgets.QLabel("Window:"))
+        win_box = QtWidgets.QComboBox()
+        for text, _key in _WINDOW_CHOICES:
+            win_box.addItem(text)
+        win_box.setEnabled(False)
+        win_box.setToolTip(
+            "Taper applied before transforming. Leave it off for a record that\n"
+            "has rung down -- it is the only choice that preserves absolute\n"
+            "amplitudes. For a truncated one, Tukey: an FDTD record is\n"
+            "front-loaded, so a symmetric Hann lands its rising edge on the\n"
+            "excitation and reshapes it, while a Tukey is flat across the\n"
+            "record and tapers only the ringing tail."
+        )
+        row.addWidget(win_box)
+        row.addStretch(1)
+        layout.addLayout(row)
+
+        def redraw():
+            _redraw_guarded(dialog, lambda fig: (
+                draw_time(fig) if opts["view"] == "time"
+                else draw_freq(fig, opts)))
+
+        def on_view(index):
+            opts["view"] = views[index][1]
+            win_box.setEnabled(opts["view"] != "time")
+            redraw()
+
+        def on_window(index):
+            opts["window"] = _WINDOW_CHOICES[index][1]
+            redraw()
+
+        view_box.currentIndexChanged.connect(on_view)
+        win_box.currentIndexChanged.connect(on_window)
+        draw_time(figure)
+        return opts
 
     def _plot_energy(obj):
         # Titled from the leaf label so the two regions' plots are told apart.
@@ -1457,32 +1797,38 @@ if _GUI_AVAILABLE:
 
     def _plot_voltage(obj):
         _plot_series(
-            obj, "voltage (V)", "Voltage: ∫E·dl vs. time", "#2ca02c"
+            obj, "voltage (V)", "Voltage: ∫E·dl vs. time", "#2ca02c",
+            quantity="V",
         )
 
     def _plot_current(obj):
         _plot_series(
-            obj, "current (A)", "Current: ∮H·dl vs. time", "#9467bd"
+            obj, "current (A)", "Current: ∮H·dl vs. time", "#9467bd",
+            quantity="I",
         )
 
     def _plot_spice_voltage(obj):
         _plot_series(
-            obj, "voltage (V)", "SPICE port voltage vs. time", "#2ca02c"
+            obj, "voltage (V)", "SPICE port voltage vs. time", "#2ca02c",
+            quantity="V",
         )
 
     def _plot_spice_current(obj):
         _plot_series(
-            obj, "current (A)", "SPICE port current vs. time", "#9467bd"
+            obj, "current (A)", "SPICE port current vs. time", "#9467bd",
+            quantity="I",
         )
 
-    def _lumped_note(obj):
-        """Annotate a lumped port's plot with its network and its cell's gap C.
+    def _lumped_lines(obj):
+        """A lumped port's network and its cell's gap C, as annotation lines.
 
         Worth the corner of the figure for the same reason the panel says it
         before the run: the element delivers exactly the R/L/C it was given, but
         the cells it bridges keep ``C_cell`` across it, so a V/I pair read against
         the nominal value quietly disagrees by that shunt — and ``C_cell`` came
-        from the mesh, not from the network the label names.
+        from the mesh, not from the network the label names. On the Z(f) plot it
+        is the same caveat, made concrete: the curve is the element *and* the
+        shunt in parallel.
         """
         network = str(getattr(obj, "Network", "") or "")
         c_cell = getattr(obj, "CellCapacitance", None)
@@ -1490,45 +1836,47 @@ if _GUI_AVAILABLE:
         if c_cell is not None and c_cell == c_cell and c_cell > 0.0:  # not NaN
             lines.append("cell gap C = {:.4g} fF in parallel".format(
                 1.0e15 * float(c_cell)))
-        if not lines:
-            return None
+        return lines
 
-        def _annotate(ax, _times, _values):
-            ax.text(0.98, 0.95, "\n".join(lines), transform=ax.transAxes,
-                    ha="right", va="top", fontsize=9,
-                    bbox=dict(boxstyle="round", fc="white", ec="0.7",
-                              alpha=0.85))
-
-        return _annotate
-
-    def _plot_lumped_voltage(obj):
-        _plot_series(obj, "voltage (V)", "Lumped port voltage vs. time",
-                     "#2ca02c", annotate=_lumped_note(obj))
-
-    def _plot_lumped_current(obj):
-        _plot_series(obj, "current (A)", "Lumped port current vs. time",
-                     "#9467bd", annotate=_lumped_note(obj))
-
-    def _zref_note(obj):
-        """Annotate a modal port's V/I plot with the impedance it is referenced
-        to, or ``None`` when the leaf carries none (a run predating it).
+    def _zref_lines(obj):
+        """The impedance a modal port's V/I pair is referenced to, as lines.
 
         Worth the corner of the figure: the pair is only half the story on its
         own -- Z_ref is what turns it into incident/outgoing wave amplitudes
         ``(V ± Z_ref·I)/2``, and it is a property of this port's own discrete
-        mode, not a number to look up elsewhere.
+        mode, not a number to look up elsewhere. Empty when the leaf carries
+        none (a run predating it).
         """
+        z_ref = _zref_of(obj)
+        return [] if z_ref is None else ["Z$_{{ref}}$ = {:.4g} Ω".format(z_ref)]
+
+    def _zref_of(obj):
+        """The leaf's ``ReferenceImpedance`` as a positive float, or ``None``."""
         z_ref = getattr(obj, "ReferenceImpedance", None)
         if z_ref is None or z_ref != z_ref or z_ref <= 0.0:   # None / NaN
             return None
+        return float(z_ref)
+
+    def _corner_note(lines):
+        """An *annotate* callback drawing *lines* in the figure's corner, or
+        ``None`` when there is nothing to say."""
+        if not lines:
+            return None
 
         def _note(ax, _times, _values):
-            ax.text(0.98, 0.95, "Z$_{{ref}}$ = {:.4g} Ω".format(float(z_ref)),
-                    transform=ax.transAxes, ha="right", va="top", fontsize=9,
-                    bbox=dict(boxstyle="round", fc="white", ec="0.7",
-                              alpha=0.85))
+            _corner_text(ax, lines)
 
         return _note
+
+    def _plot_lumped_voltage(obj):
+        _plot_series(obj, "voltage (V)", "Lumped port voltage vs. time",
+                     "#2ca02c", annotate=_corner_note(_lumped_lines(obj)),
+                     quantity="V")
+
+    def _plot_lumped_current(obj):
+        _plot_series(obj, "current (A)", "Lumped port current vs. time",
+                     "#9467bd", annotate=_corner_note(_lumped_lines(obj)),
+                     quantity="I")
 
     def _plot_port_voltage(obj):
         # The modal projection of the plane E, not a line integral -- said in
@@ -1536,7 +1884,7 @@ if _GUI_AVAILABLE:
         # on the port plane.
         _plot_series(
             obj, "voltage (V)", "Modal port voltage vs. time", "#2ca02c",
-            annotate=_zref_note(obj),
+            annotate=_corner_note(_zref_lines(obj)), quantity="V",
         )
 
     def _plot_port_current(obj):
@@ -1544,8 +1892,180 @@ if _GUI_AVAILABLE:
         # the power the port delivers inward.
         _plot_series(
             obj, "current (A)", "Modal port current vs. time (into the domain)",
-            "#9467bd", annotate=_zref_note(obj),
+            "#9467bd", annotate=_corner_note(_zref_lines(obj)), quantity="I",
         )
+
+    # ------------------------------------------------------------------ #
+    # Port impedance Z(f)
+    # ------------------------------------------------------------------ #
+
+    def _plot_impedance(obj):
+        """Open a port's ``Z(f) = V(f)/I(f)`` window.
+
+        Two views of the same complex curve, because they answer different
+        questions. **Bode** -- |Z| over the phase -- is how a resonance and its
+        Q are read, and where ±90° says "purely reactive".
+        **R and X** puts the real and imaginary parts on one linear axis, which
+        is where the lumped content is legible: a series inductance is a
+        straight line X = 2πfL through the origin, and a zero crossing of X is
+        a resonance. A log-magnitude view compresses exactly those features.
+
+        Gaps in the curves are not missing data: they are the bins masked as
+        out-of-band, where the excitation put no energy and the ratio would be
+        two round-off numbers divided. If the plot is mostly gap, switch either
+        V or I leaf to its spectrum view and look at what the drive covered.
+        """
+        workdir = str(obj.ResultsDir)
+        v_key = str(obj.DataKey)
+        i_key = str(getattr(obj, "CurrentKey", "") or "")
+        v_times = _load_array(workdir, v_key + "_times")
+        v_values = _load_array(workdir, v_key + "_values")
+        i_values = _load_array(workdir, i_key + "_values")
+        if v_times is None or v_values is None or i_values is None:
+            _missing(obj)
+            return
+
+        made = _make_window("Wavesim Results - {}".format(obj.Label))
+        if made is None:
+            return
+        dialog, figure, layout = made
+
+        def draw(fig, opts):
+            _draw_impedance(fig, obj, v_times, v_values, i_values, opts)
+
+        _add_impedance_switch(dialog, layout, draw)
+        dialog._canvas.draw()
+        dialog.show()
+        _register_window(dialog)
+
+    def _impedance_of(obj, times, v_values, i_values, opts):
+        """``Z(f)`` from the leaf's pair, both transformed the same way.
+
+        Same window on both -- which is what makes a taper safe for a ratio --
+        and each with its own stagger: V is E-derived and I is the impressed
+        current half a step behind it. Dividing them as recorded would put an
+        ``exp(+jπf·dt)`` on Z, which shows up as a *resistance* a lossless
+        structure does not have (see :mod:`wavesim_gui.spectrum`).
+        """
+        from wavesim_gui import spectrum as spec
+
+        v = _spectrum_of(times, v_values, "V", opts)
+        i = _spectrum_of(times, i_values, "I", opts)
+        return v, i, spec.impedance(v, i, floor=_BAND_FLOOR)
+
+    def _draw_impedance(figure, obj, times, v_values, i_values, opts):
+        """Draw the Bode or R/X view of a port's Z(f) into *figure*."""
+        v, i, z = _impedance_of(obj, times, v_values, i_values, opts)
+        funit = _freq_unit(obj)
+        scale = units.freq_to_si(1.0, funit)
+        f = z.freqs / scale
+        z_ref = _zref_of(obj)
+        # The lumped caveat and the truncation warning belong on every view; the
+        # Z_ref line only where the Bode panel does not already draw it.
+        notes = _lumped_lines(obj)
+        warn = _decay_warning([v_values, i_values], opts)
+
+        if opts.get("view") == "parts":
+            ax = figure.add_subplot(111)
+            ax.plot(f, z.real, lw=1.3, color="#1f77b4", label="R = Re Z")
+            ax.plot(f, z.imag, lw=1.3, ls="--", color="#d62728",
+                    label="X = Im Z")
+            ax.axhline(0.0, color="0.6", lw=0.8)   # X = 0 marks a resonance
+            ax.set_ylabel("R, X (Ω)")
+            ax.set_xlabel("frequency ({})".format(funit))
+            ax.set_title("{}: R and X".format(str(obj.Label)))
+            ax.grid(True, alpha=0.3)
+            ax.legend(fontsize=9, loc="upper left")
+            _set_band_xlim(ax, [v, i], scale)
+            _corner_text(ax, _zref_lines(obj) + notes
+                         + ([warn] if warn else []))
+            return
+
+        ax_mag = figure.add_subplot(211)
+        ax_ph = figure.add_subplot(212, sharex=ax_mag)
+        ax_mag.plot(f, z.magnitude, lw=1.3, color="#1f77b4", label="|Z|")
+        ax_mag.set_ylabel("|Z| (Ω)")
+        if z_ref is not None:
+            # The port's own reference impedance drawn where |Z| can be read
+            # against it: a matched termination sits on this line.
+            ax_mag.axhline(z_ref, color="0.6", lw=0.8, ls=":",
+                           label="Z$_{{ref}}$ = {:.4g} Ω".format(z_ref))
+        ax_mag.grid(True, which="both", alpha=0.3)
+        ax_mag.legend(fontsize=9, loc="upper left")
+        ax_mag.set_title("{}: magnitude and phase".format(str(obj.Label)))
+
+        ax_ph.plot(f, z.phase_deg(), lw=1.3, color="#d62728")
+        ax_ph.set_ylabel("∠Z (deg)")
+        ax_ph.set_xlabel("frequency ({})".format(funit))
+        ax_ph.grid(True, which="both", alpha=0.3)
+        # ±90° is a purely reactive port and 0° a purely resistive one: the
+        # lines a lumped extraction is read against.
+        for y in (-90.0, 0.0, 90.0):
+            ax_ph.axhline(y, color="0.6", lw=0.7, ls=":")
+
+        _set_band_xlim(ax_mag, [v, i], scale)
+        # Log only if the visible |Z| spans more than a decade -- a matched port
+        # is a flat line, and a log axis labels that "5.06 × 10¹" rather than
+        # "50.6". Out-of-band bins are already NaN, so "visible" is the whole
+        # curve here and the autoscaled linear axis includes the Z_ref line.
+        if _fit_ylim(ax_mag, z.freqs, z.magnitude, scale):
+            ax_mag.set_yscale("log")
+        # Notes go on the phase panel: the magnitude panel's upper-right is
+        # where a resonance peak lands.
+        _corner_text(ax_ph, notes + ([warn] if warn else []))
+
+    def _add_impedance_switch(dialog, layout, draw):
+        """The Z(f) window's "View / Window" row -- same idea as the domain
+        switch, but both entries are already frequency, so the Window box is
+        always live."""
+        _QtCore, QtWidgets = _qt()
+        figure = dialog._figure
+
+        opts = {"view": "bode", "window": None}
+        views = (("Bode (|Z| and phase)", "bode"), ("R and X", "parts"))
+
+        row = QtWidgets.QHBoxLayout()
+        row.addWidget(QtWidgets.QLabel("View:"))
+        view_box = QtWidgets.QComboBox()
+        for text, _key in views:
+            view_box.addItem(text)
+        view_box.setToolTip(
+            "Bode reads a resonance and its Q; R and X is where an L or a C\n"
+            "is read off -- a series inductance is the straight line\n"
+            "X = 2πfL, and a zero crossing of X is a resonance."
+        )
+        row.addWidget(view_box)
+
+        row.addSpacing(12)
+        row.addWidget(QtWidgets.QLabel("Window:"))
+        win_box = QtWidgets.QComboBox()
+        for text, _key in _WINDOW_CHOICES:
+            win_box.addItem(text)
+        win_box.setToolTip(
+            "Taper applied to both series before transforming. A ratio is safe\n"
+            "under a window as long as V and I get the same one, which they do\n"
+            "here. Tukey for a record that ends mid-ring -- see the note on\n"
+            "the plot when it does."
+        )
+        row.addWidget(win_box)
+        row.addStretch(1)
+        layout.addLayout(row)
+
+        def redraw():
+            _redraw_guarded(dialog, lambda fig: draw(fig, opts))
+
+        def on_view(index):
+            opts["view"] = views[index][1]
+            redraw()
+
+        def on_window(index):
+            opts["window"] = _WINDOW_CHOICES[index][1]
+            redraw()
+
+        view_box.currentIndexChanged.connect(on_view)
+        win_box.currentIndexChanged.connect(on_window)
+        draw(figure, opts)
+        return opts
 
     # Colour-scale clip percentiles offered for snapshot maps, strongest first.
     # 100 means "scale on the true peak" (the old behaviour).

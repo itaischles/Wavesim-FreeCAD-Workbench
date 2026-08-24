@@ -68,10 +68,12 @@ class WavesimWorkbench(Gui.Workbench):
         try:
             from wavesim_gui import commands  # noqa: F401  (registers commands)
 
-            # Model setup: the container and what the geometry is made of.
+            # Model setup: the container, what the geometry is made of, and
+            # where the mesh needs to be finer than the automatic sizing.
             add_group(
                 "Wavesim_NewSimulation",
                 "Wavesim_AssignMaterial",
+                "Wavesim_RefineBody",
             )
             # Sources and ports: everything that puts energy into the domain or
             # terminates it. SPICE TEM ports are a drive mode of the Modal Port

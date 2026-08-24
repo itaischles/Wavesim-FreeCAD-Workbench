@@ -941,6 +941,7 @@ if _GUI_AVAILABLE:
     # import from this module.
     from wavesim_gui import materials  # noqa: F401  (registers Wavesim_AssignMaterial)
     from wavesim_gui import domain  # noqa: F401  (registers the Domain object/VP)
+    from wavesim_gui import refine  # noqa: F401  (registers Wavesim_RefineBody)
     from wavesim_gui import source  # noqa: F401  (registers Wavesim_AddSource)
     from wavesim_gui import modal_port  # noqa: F401  (registers Wavesim_AddModalPort)
     from wavesim_gui import gaussian_beam  # noqa: F401  (registers Wavesim_AddGaussianBeam)

@@ -40,6 +40,11 @@ The mesh is built per axis, independently:
   body leaves its own tangent plane within a cell and needs nothing, a gently
   curved one is the pathological case. Off by default (Domain's
   ``CurvatureRefinement`` = 1).
+* **Manual refinement.** A body the user has marked (Wavesim -> Refine Body
+  Mesh, :mod:`wavesim_gui.refine`) tightens the target over its own bounding box
+  to ``span / N`` for the cell count *N* it carries on that axis -- see
+  :func:`collect_refinement_caps`. Same cap shape as the material refinement
+  below, and the smallest cap covering a gap wins.
 * **Material refinement.** Each dielectric body tightens the coarse target over
   the axis interval it spans to its own per-medium resolution
   ``c0 / (fmax * N_lambda * sqrt(eps_r * mu_r))`` (see
@@ -513,6 +518,53 @@ def collect_material_caps(sim, domain, materials):
     return caps
 
 
+def collect_refinement_caps(materials):
+    """Per-axis **manual** cell-size caps ``(lo_mm, hi_mm, target_mm)``.
+
+    A body carrying :mod:`wavesim_gui.refine`'s per-axis cell counts asks for at
+    least *N* cells across its own bounding box on that axis, so the cap target
+    is simply ``span / N``. Emitted in exactly the shape
+    :func:`collect_material_caps` uses, and concatenated with it in
+    :func:`build_domain_nodes`, because the two are the same statement -- "cells
+    over this interval are at most this big" -- arrived at from different
+    directions: one from the medium's wavelength, one from the user. The
+    smallest cap covering a gap wins (:func:`_gap_coarse`), which is what makes
+    a manual request able to refine an already-refined dielectric but never to
+    *coarsen* one.
+
+    The span comes from the same :func:`_exact_bbox` :func:`collect_axis_snaps`
+    walks, so each cap edge is already a forced grid line -- the invariant
+    :func:`_gap_coarse`'s midpoint test relies on. Nothing is emitted for a body
+    with no request (an axis count of 0), so a document with no refinement builds
+    a bit-identical mesh.
+
+    Note *N* is a **floor**: with no interior forced line inside the span the
+    fill lays exactly *N* cells, but a planar face, a cylinder silhouette or a
+    circle centre line splits the span first, and each sub-gap is then tiled to
+    at least its own share. That it is a floor at all -- rather than something
+    the fill's ``floor``-and-stretch can undercut -- is :func:`_exact_target`'s
+    doing, which is why these caps travel on to :func:`build_axis_nodes` a
+    second time as ``exact_caps``. The Domain's ``MinCellSize`` still floors the
+    result there, and outranks the count.
+    """
+    from wavesim_gui import refine as refine_mod
+    from wavesim_gui import voxelize as vox
+
+    caps = ([], [], [])
+    for shape, _eps, _mu, _pec, _sigma, body in vox._gather(materials):
+        counts = refine_mod.body_cell_counts(body)
+        if not any(counts):
+            continue
+        bb = _exact_bbox(shape)
+        spans = ((bb.XMin, bb.XMax), (bb.YMin, bb.YMax), (bb.ZMin, bb.ZMax))
+        for a in range(3):
+            n = counts[a]
+            lo, hi = spans[a]
+            if n > 0 and hi > lo:
+                caps[a].append((lo, hi, (hi - lo) / n))
+    return caps
+
+
 def _gap_coarse(a, b, coarse, caps):
     """Coarse cell target (mm) for the interval ``[a, b]`` given material *caps*.
 
@@ -527,6 +579,51 @@ def _gap_coarse(a, b, coarse, caps):
         if lo <= mid <= hi and t < target:
             target = t
     return target
+
+
+def _exact_target(a, b, target, exact_caps):
+    """*target* tightened so the fill lays a **whole** number of cells, rounded up.
+
+    :func:`_graded_widths` tiles a gap of width *w* with ``floor(w / target)``
+    cells and absorbs the remainder by stretching them, so a cell routinely runs
+    up to 2x the target it was asked for. That is longstanding and harmless for a
+    resolution target derived from a wavelength -- nobody counts those cells --
+    but it is fatal to a request phrased as *a count*: a 4 mm body asked for 5
+    cells, whose span a slot splits into 1.5/1.0/1.5 mm, gets one stretched cell
+    per piece and comes out with **3**, coarser than the 1 mm background it was
+    supposed to refine.
+
+    Over an interval that asked for a count, the target is therefore shrunk to
+    ``w / ceil(w / target)`` -- the largest size that divides the gap evenly and
+    is no coarser than asked -- which makes ``floor`` and ``ceil`` agree and the
+    stretch vanish. The same 4 mm body then meshes 2+2+2 and the count really is
+    a floor.
+
+    Deliberately **not** applied to the wavelength-derived caps: that would be
+    the "fix the fill so cells never exceed the coarse target" variant, which
+    costs cells and timestep in every existing model. Here it is confined to the
+    bodies a user explicitly marked, so nothing else moves.
+
+    For the same reason the rounding is done on **the manual target alone** and
+    only then compared with *target*, rather than on whatever cap happened to
+    win. A wavelength target is an irrational number (``c0`` is 299792458 m/s),
+    so it essentially never divides a gap evenly: rounding *it* up adds a cell
+    nobody asked for -- measured as a 13th cell across a 6 mm slab whose own
+    0.49965 mm sizing already gave 12, merely because the body also carried a
+    much coarser manual request. Taking the minimum at the end keeps the rule
+    one-directional: a manual request can only ever refine.
+    """
+    if not exact_caps or target <= 0.0:
+        return target
+    w = b - a
+    if w <= 0.0:
+        return target
+    mid = 0.5 * (a + b)
+    asked = min((t for lo, hi, t in exact_caps if lo <= mid <= hi and t > 0.0),
+                default=None)
+    if asked is None:
+        return target
+    return min(target, w / max(int(math.ceil(w / asked - 1.0e-9)), 1))
 
 
 # --------------------------------------------------------------------------- #
@@ -721,7 +818,7 @@ def _graded_widths(w, hL, hR, H, r):
 
 
 def build_axis_nodes(snaps, lo, hi, coarse, ratio, pad_lo, pad_hi, min_cell=0.0,
-                     caps=(), line_sizes=(), centres=()):
+                     caps=(), line_sizes=(), centres=(), exact_caps=()):
     """Graded node coordinates (mm) for one axis, PML pad cells included.
 
     Parameters
@@ -755,6 +852,12 @@ def build_axis_nodes(snaps, lo, hi, coarse, ratio, pad_lo, pad_hi, min_cell=0.0,
         Circle-centre *candidates* (:func:`collect_axis_snaps`), promoted to
         forced lines only where they cost no cells (:func:`_insert_centre_lines`).
         Empty ⇒ no centre lines.
+    exact_caps : iterable of (lo_mm, hi_mm, target_mm)
+        The subset of *caps* that asked for a cell **count** rather than a
+        resolution (:func:`collect_refinement_caps`). Over these intervals the
+        gap target is rounded so the fill lays a whole number of cells and its
+        usual stretch cannot come out coarser than asked -- see
+        :func:`_exact_target`. Empty ⇒ every gap tiles exactly as it always did.
 
     Returns a strictly-increasing list of node coordinates. The inner region is
     tiled so every gap between forced lines is resolved with cells no larger than
@@ -772,9 +875,13 @@ def build_axis_nodes(snaps, lo, hi, coarse, ratio, pad_lo, pad_hi, min_cell=0.0,
     gaps = [b - a for a, b in zip(forced[:-1], forced[1:])]
 
     # Per-gap coarse target: the void size, tightened where a material body covers
-    # the gap (its shorter wavelength wants smaller cells), then floored by the
-    # min-cell limit so material refinement can't undercut it either.
-    gap_coarse = [max(_gap_coarse(a, b, coarse, caps), min_cell)
+    # the gap (its shorter wavelength wants smaller cells), rounded to a whole
+    # cell count where a body asked for one, then floored by the min-cell limit
+    # so neither refinement can undercut it. The min-cell floor is applied last
+    # on purpose: it is the one limit the user set globally, so it outranks an
+    # exact count, and the panel says as much.
+    gap_coarse = [max(_exact_target(a, b, _gap_coarse(a, b, coarse, caps),
+                                    exact_caps), min_cell)
                   for a, b in zip(forced[:-1], forced[1:])]
 
     # Intrinsic desired size per interval (small gaps want small cells) and, from
@@ -875,8 +982,13 @@ def build_domain_nodes(sim, domain, force_pml_faces=(), modal_faces=()):
     # Per-axis material cell-size caps: higher-index bodies refine their band
     # below the coarse (background) target. Scaled alongside ``coarse`` in the
     # cell-count guard below, so a grid that must be coarsened to fit coarsens
-    # material regions and void together.
-    caps = collect_material_caps(sim, domain, materials)
+    # material regions and void together. A body's *manual* "N cells across"
+    # request is the same kind of cap and simply joins the list -- the smallest
+    # one covering a gap wins, so a manual request can refine a dielectric band
+    # further but never coarsen it (nor be coarsened by it).
+    material_caps = collect_material_caps(sim, domain, materials)
+    manual_caps = collect_refinement_caps(materials)
+    caps = tuple(list(material_caps[a]) + manual_caps[a] for a in range(3))
     # Grazing-surface refinement. Collected after the snaps it attaches to, and
     # allowed to extend them for tangencies no bounding box reaches.
     curvature = float(getattr(domain, "CurvatureRefinement", 1.0))
@@ -889,6 +1001,12 @@ def build_domain_nodes(sim, domain, force_pml_faces=(), modal_faces=()):
         scaled_caps = tuple(
             [(lo, hi, t * scale) for lo, hi, t in caps[a]] for a in range(3)
         )
+        # The manual intervals are scaled the same way and handed over a second
+        # time, as the ones whose cell count must come out whole. A coarsened
+        # rebuild honours the *scaled* count, not the one that did not fit.
+        scaled_manual = tuple(
+            [(lo, hi, t * scale) for lo, hi, t in manual_caps[a]] for a in range(3)
+        )
         # Scaled alongside ``coarse`` for the same reason as the caps. The sag
         # term really goes as ``scale**2`` (it is quadratic in the transverse
         # cell), so this under-coarsens slightly -- acceptable in what is already
@@ -900,7 +1018,7 @@ def build_domain_nodes(sim, domain, force_pml_faces=(), modal_faces=()):
             build_axis_nodes(
                 snaps[a], los[a], his[a], coarse_mm[a] * scale, ratio,
                 pad_lo[a], pad_hi[a], min_cell_mm, scaled_caps[a],
-                scaled_sizes[a], centres[a],
+                scaled_sizes[a], centres[a], scaled_manual[a],
             )
             for a in range(3)
         )

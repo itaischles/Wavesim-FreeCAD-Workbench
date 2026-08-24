@@ -29,3 +29,6 @@ Resources/excitation.png
 
 # Report written by tools/check_lumped_geometry.py
 tools/lumped_geometry.txt
+
+# Report written by tools/check_body_refinement.py
+tools/body_refinement.txt

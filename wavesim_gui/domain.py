@@ -815,6 +815,13 @@ _GRID_PLANE_PROPS = (
 # Set once the planes have been parked on the min faces (see place_grid_planes).
 _GRID_PLANES_PLACED = "GridPlanesPlaced"
 
+# Whether each of those three planes is drawn at all, in the same x/y/z order.
+# Default **on**, so a document that predates them looks exactly as it did. What
+# they are for is the cross-section tool (``crosssection.py``), which shows the
+# mesh on the plane it is cutting and switches the other two off -- three grids
+# at once is unreadable next to a sectioned model.
+_GRID_SHOW_PROPS = ("ShowGridPlaneX", "ShowGridPlaneY", "ShowGridPlaneZ")
+
 # The per-axis arrays of snapped (geometry-forced) grid lines -- a subset of
 # ``NodesX/Y/Z``, kept only so the 3D preview can draw them bold.
 _SNAP_PROPS = ("SnapsX", "SnapsY", "SnapsZ")
@@ -843,6 +850,16 @@ def _ensure_grid_plane_props(obj):
         )
         obj.setEditorMode(_GRID_PLANES_PLACED, 2)   # hidden bookkeeping
         setattr(obj, _GRID_PLANES_PLACED, False)
+    for prop, (_position_prop, _axis, plane) in zip(_GRID_SHOW_PROPS,
+                                                    _GRID_PLANE_PROPS):
+        if not hasattr(obj, prop):
+            obj.addProperty(
+                "App::PropertyBool", prop, "Grid",
+                "Whether the {} cell-grid plane is drawn. On by default, so a "
+                "domain shows the mesh on all three; the cross-section tool "
+                "leaves only the plane it cuts on.".format(plane),
+            )
+            setattr(obj, prop, True)
 
 
 def place_grid_planes(obj):
@@ -881,6 +898,16 @@ def grid_plane_positions_mm(domain):
         pos = float(value.Value) if value is not None else lo
         out.append(min(max(pos, min(lo, hi)), max(lo, hi)))
     return tuple(out)
+
+
+def grid_plane_visibility(domain):
+    """Which of the three cell-grid planes are drawn, as ``(x, y, z)`` bools.
+
+    Defaults to all three for a domain saved before the properties existed --
+    the behaviour every document had -- so this can only ever *hide* a plane
+    somebody asked to hide.
+    """
+    return tuple(bool(getattr(domain, prop, True)) for prop in _GRID_SHOW_PROPS)
 
 
 def _ensure_es_bc_props(obj):
@@ -1367,7 +1394,7 @@ if _GUI_AVAILABLE:
                        obj.PmlMin, obj.PmlMax)
 
         def _grid_segments(self, mn, mx, nodes_x, nodes_y, nodes_z,
-                           snaps=None, plane=None, interior=None):
+                           snaps=None, plane=None, interior=None, show=None):
             """Line segments for the three orthogonal cell grids.
 
             Returns ``(thin, bold, pml)``, each an ``(points, indices)`` pair for
@@ -1402,8 +1429,14 @@ if _GUI_AVAILABLE:
             split: the snapper puts no forced line in the shell (the CPML needs a
             constant width there), so a bold line only ever *crosses* one, and
             cutting it would hide the feature it marks.
+
+            *show* is the matching triple of per-plane visibility flags (the
+            Domain's ``ShowGridPlaneX/Y/Z``); a plane switched off contributes no
+            segments at all, to either set. Defaults to all three on, which is
+            what every domain drew before the flags existed.
             """
             px, py, pz = plane if plane is not None else (mn.x, mn.y, mn.z)
+            show_x, show_y, show_z = show if show is not None else (True, True, True)
             snaps = snaps if snaps is not None else ([], [], [])
             thin_pts, thin_idx = [], []
             bold_pts, bold_idx = [], []
@@ -1504,18 +1537,21 @@ if _GUI_AVAILABLE:
 
             # (varying axis, endpoint pair) for every line of the three planes.
             def lines(ax, ay, az):
-                for x in ax:                       # XY grid at z = pz
-                    yield 1, (x, mn.y, pz), (x, mx.y, pz)
-                for y in ay:
-                    yield 0, (mn.x, y, pz), (mx.x, y, pz)
-                for y in ay:                       # YZ grid at x = px
-                    yield 2, (px, y, mn.z), (px, y, mx.z)
-                for z in az:
-                    yield 1, (px, mn.y, z), (px, mx.y, z)
-                for x in ax:                       # XZ grid at y = py
-                    yield 2, (x, py, mn.z), (x, py, mx.z)
-                for z in az:
-                    yield 0, (mn.x, py, z), (mx.x, py, z)
+                if show_z:                         # XY grid at z = pz
+                    for x in ax:
+                        yield 1, (x, mn.y, pz), (x, mx.y, pz)
+                    for y in ay:
+                        yield 0, (mn.x, y, pz), (mx.x, y, pz)
+                if show_x:                         # YZ grid at x = px
+                    for y in ay:
+                        yield 2, (px, y, mn.z), (px, y, mx.z)
+                    for z in az:
+                        yield 1, (px, mn.y, z), (px, mx.y, z)
+                if show_y:                         # XZ grid at y = py
+                    for x in ax:
+                        yield 2, (x, py, mn.z), (x, py, mx.z)
+                    for z in az:
+                        yield 0, (mn.x, py, z), (mx.x, py, z)
 
             for axis, p0, p1 in lines(xs, ys, zs):
                 add_split(p0, p1, axis)
@@ -1563,6 +1599,7 @@ if _GUI_AVAILABLE:
             sets = self._grid_segments(
                 mn, mx, nodes_x, nodes_y, nodes_z, snaps=snaps,
                 plane=grid_plane_positions_mm(obj), interior=interior,
+                show=grid_plane_visibility(obj),
             )
             for (coords, lines), (pts, idx) in zip(pairs, sets):
                 coords.point.setValues(0, len(pts), pts)
@@ -1579,7 +1616,8 @@ if _GUI_AVAILABLE:
                         "Dx", "Dy", "Dz",
                         "NodesX", "NodesY", "NodesZ",
                         "SnapsX", "SnapsY", "SnapsZ",
-                        "GridPlaneX", "GridPlaneY", "GridPlaneZ"):
+                        "GridPlaneX", "GridPlaneY", "GridPlaneZ",
+                        "ShowGridPlaneX", "ShowGridPlaneY", "ShowGridPlaneZ"):
                 self._rebuild_grid()
 
         def getDisplayModes(self, vobj):

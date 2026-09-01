@@ -28,6 +28,8 @@ here, so this module needs to know how to find an owner's children -- not what a
 Material or a monitor is.
 """
 
+import contextlib
+
 import FreeCAD
 
 
@@ -77,6 +79,29 @@ def owners_of(child):
 def is_restoring():
     """True while a document is being loaded (see the module docstring)."""
     return _restoring > 0
+
+
+@contextlib.contextmanager
+def suppressed():
+    """Hide every ``Visibility`` write in the block from the linking hooks.
+
+    For a caller that shows or hides geometry for reasons of its own and must
+    not have that read as the user's intent. The cross-section preview is the
+    case this exists for: it hides each body to put a cut copy in its place, and
+    without this :meth:`_VisibilityObserver.slotChangedObject` would pull the
+    owning Material's eye down to off -- so tearing the preview down would leave
+    the tree claiming the material is hidden when its bodies are back.
+
+    Sets the same ``_busy`` flag the module's own writes use, and restores
+    whatever it was (so nesting inside one of those writes is safe).
+    """
+    global _busy
+    previous = _busy
+    _busy = True
+    try:
+        yield
+    finally:
+        _busy = previous
 
 
 def apply_to_children(owner, state):

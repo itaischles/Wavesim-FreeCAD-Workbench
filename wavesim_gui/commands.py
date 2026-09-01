@@ -993,3 +993,4 @@ if _GUI_AVAILABLE:
     from wavesim_gui import lumped_port  # noqa: F401  (registers Wavesim_AddLumpedPort)
     from wavesim_gui import monitors  # noqa: F401  (registers the monitor commands)
     from wavesim_gui import results  # noqa: F401  (registers result proxies/VPs)
+    from wavesim_gui import crosssection  # noqa: F401  (registers Wavesim_CrossSection)

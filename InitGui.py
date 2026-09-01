@@ -112,6 +112,10 @@ class WavesimWorkbench(Gui.Workbench):
             from wavesim_gui import portmatrix  # noqa: F401
 
             add_group("Wavesim_Run", "Wavesim_PortMatrix")
+            # Viewing: cuts the model open on a grid plane. Its own group
+            # because it changes nothing in the model and runs nothing --
+            # it is how you look at what the other buttons built.
+            add_group("Wavesim_CrossSection")
         except Exception as exc:
             FreeCAD.Console.PrintError(
                 "Wavesim: failed to load commands module ({}: {})\n".format(

@@ -1347,10 +1347,20 @@ def _store_electrostatic_meta(leaf, meta):
 
     charges = meta.get("charges") or {}
     potentials = meta.get("potentials") or {}
-    names = sorted(set(charges) | set(potentials))
+    # A floating conductor's potential is an output of the solve, so it comes
+    # from a different key -- and storing 0.0 for it (which is what reading only
+    # ``potentials`` would do) would report the one number it definitely is not.
+    floating = meta.get("floating") or {}
+    found = meta.get("floating_potentials") or {}
+    names = sorted(set(charges) | set(potentials) | set(floating))
     _add("Conductors", "App::PropertyStringList", names)
     _add("Potentials", "App::PropertyFloatList",
-         [float(potentials.get(n, 0.0)) for n in names])
+         [float(found.get(n, potentials.get(n, 0.0))) for n in names])
+    # How each conductor got that potential, so the table can say which of the
+    # numbers beside it was asked for and which was measured.
+    _add("Conditions", "App::PropertyStringList",
+         ["floating" if n in floating else
+          "driven" if n in potentials else "grounded" for n in names])
     _add("Charges", "App::PropertyFloatList",
          [float(charges.get(n, 0.0)) for n in names])
     _add("FieldEnergy", "App::PropertyFloat", float(meta.get("energy", 0.0)))
@@ -3732,6 +3742,7 @@ if _GUI_AVAILABLE:
         names = list(getattr(obj, "Conductors", []) or [])
         potentials = list(getattr(obj, "Potentials", []) or [])
         charges = list(getattr(obj, "Charges", []) or [])
+        conditions = list(getattr(obj, "Conditions", []) or [])
         cap_names = list(getattr(obj, "CapNames", []) or [])
         flat = [float(v) for v in (getattr(obj, "CapMaxwell", []) or [])]
 
@@ -3756,23 +3767,34 @@ if _GUI_AVAILABLE:
         # the solved equations balanced, not a re-integration of the field, so it
         # agrees with the matrix below by construction.
         layout.addWidget(QtWidgets.QLabel("<b>Conductors</b>"))
-        table = QtWidgets.QTableWidget(len(names), 3)
-        table.setHorizontalHeaderLabels(["Conductor", "Potential (V)", "Charge (C)"])
+        table = QtWidgets.QTableWidget(len(names), 4)
+        table.setHorizontalHeaderLabels(
+            ["Conductor", "Held", "Potential (V)", "Charge (C)"])
         table.verticalHeader().setVisible(False)
         for row, name in enumerate(names):
             volts = potentials[row] if row < len(potentials) else 0.0
             charge = charges[row] if row < len(charges) else 0.0
+            held = conditions[row] if row < len(conditions) else "driven"
             for col, text in enumerate(
-                    (name, "{:g}".format(volts), "{:.6g}".format(charge))):
+                    (name, held, "{:g}".format(volts), "{:.6g}".format(charge))):
                 item = QtWidgets.QTableWidgetItem(text)
                 item.setFlags(_QtCore.Qt.ItemIsEnabled | _QtCore.Qt.ItemIsSelectable)
-                if col:
+                if col > 1:
                     item.setTextAlignment(
                         _QtCore.Qt.AlignRight | _QtCore.Qt.AlignVCenter)
                 table.setItem(row, col, item)
         table.resizeColumnsToContents()
         table.setMaximumHeight(220)
         layout.addWidget(table)
+
+        if any(c == "floating" for c in conditions):
+            note = QtWidgets.QLabel(
+                "A <b>floating</b> conductor's charge is what was asked for and "
+                "its potential is what the solve found — the other way round "
+                "from a driven one, where the potential is the input and the "
+                "charge the answer.")
+            note.setWordWrap(True)
+            layout.addWidget(note)
 
         if cap_names and len(flat) == len(cap_names) ** 2:
             n = len(cap_names)

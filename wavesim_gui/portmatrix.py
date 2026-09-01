@@ -536,7 +536,7 @@ if _GUI_AVAILABLE:
 
     import os as _os
 
-    from wavesim_gui.commands import active_simulation
+    from wavesim_gui.commands import active_simulation, fdtd_only_active
 
     _WB_DIR = _os.path.join(FreeCAD.getUserAppDataDir(), "Mod",
                             "wavesim-workbench")
@@ -796,6 +796,9 @@ if _GUI_AVAILABLE:
                 "Output: {d}".format(n=len(ports), d=sweep_dir))
 
         def IsActive(self):
-            return active_simulation(FreeCAD.ActiveDocument) is not None
+            # A port sweep is a run per port with the drive moved, and an
+            # electrostatic run has no drive to move -- the same reason the
+            # source and port buttons grey out in that mode.
+            return fdtd_only_active()
 
     Gui.addCommand("Wavesim_PortMatrix", CommandPortMatrix())

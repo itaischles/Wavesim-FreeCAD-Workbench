@@ -2341,6 +2341,7 @@ def _electrostatic_spec(sim, dom, vox, monitors):
     from wavesim_gui.commands import MODE_ELECTROSTATIC, extract_capacitance
 
     potentials = materials_mod.conductor_potentials(sim)
+    floating = _floating_spec(sim)
     names = list(vox.get("pec_names") or {})
     # Extraction energises one conductor at a time, so it needs at least two:
     # a lone conductor in a box has a capacitance only to the box, which is a
@@ -2348,8 +2349,8 @@ def _electrostatic_spec(sim, dom, vox, monitors):
     capacitance = bool(extract_capacitance(sim)) and len(names) >= 2
 
     boundary = domain_mod.electrostatic_boundary(dom)
-    for message in _electrostatic_warnings(sim, dom, potentials, boundary,
-                                           capacitance):
+    for message in _electrostatic_warnings(sim, dom, potentials, floating,
+                                           boundary, capacitance):
         FreeCAD.Console.PrintWarning("Wavesim: " + message + "\n")
 
     return {
@@ -2359,6 +2360,10 @@ def _electrostatic_spec(sim, dom, vox, monitors):
         "steps": 0,
         "electrostatic": {
             "potentials": potentials,
+            # {name: coulombs} for every conductor whose potential the solve is
+            # to find rather than be told. Disjoint from ``potentials`` by
+            # construction -- the solver refuses a part in both.
+            "floating": floating,
             "boundary": boundary,
             "capacitance": capacitance,
             # Which planes to save, taken from the snapshot monitors: same
@@ -2375,7 +2380,33 @@ def _electrostatic_spec(sim, dom, vox, monitors):
     }
 
 
-def _electrostatic_warnings(sim, dom, potentials, boundary, capacitance):
+def _floating_spec(sim):
+    """``{name: coulombs}`` for every conductor the run must let float.
+
+    Two sources, and the second is the whole reason this is not just
+    ``materials.conductor_charges``. A body the user set to Floating is named
+    here, as a driven one is named in ``potentials``. But a *document default*
+    of Floating also has to be stated body by body, because the solver's own
+    default for a conductor nobody names is **ground** -- so a lump nobody asked
+    anything of would silently be grounded instead. Only lumps with no request
+    on them at all are added that way; one that touches a driven or a floating
+    body inherits on the grid and must stay unnamed, exactly as before.
+    """
+    from wavesim_gui import materials as materials_mod
+    from wavesim_gui import potentials as potentials_mod
+
+    entries, groups = potentials_mod.resolve(sim)
+    out = dict(materials_mod.conductor_charges(sim))
+    for entry in entries:
+        group = groups[entry["group"]]
+        if (entry["origin"] == potentials_mod.ORIGIN_DEFAULT
+                and group["condition"] == potentials_mod.COND_FLOATING):
+            out[entry["name"]] = float(group["charge"])
+    return out
+
+
+def _electrostatic_warnings(sim, dom, potentials, floating, boundary,
+                            capacitance):
     """Console warnings worth giving before an electrostatic run starts.
 
     Cheap checks the user can act on now; the solver makes the authoritative
@@ -2388,6 +2419,7 @@ def _electrostatic_warnings(sim, dom, potentials, boundary, capacitance):
     from wavesim_gui import materials as materials_mod
     from wavesim_gui import domain as domain_mod
     from wavesim_gui import lumped_port as lumped_mod
+    from wavesim_gui import potentials as potentials_mod
 
     out = []
     # A conductor sitting on a Ground face is shorted to it. Harmless while that
@@ -2396,11 +2428,28 @@ def _electrostatic_warnings(sim, dom, potentials, boundary, capacitance):
     # driven to 1 V. Said here rather than left to surface halfway through.
     if capacitance:
         out.extend(_grounded_face_shorts(dom, sim, boundary))
-    if not potentials:
+    # Two bodies that touch are one conductor and cannot hold two potentials.
+    # The solver refuses that pairing outright, so say it here, before the
+    # voxeliser spends minutes on the geometry that would be thrown away.
+    for conflict in potentials_mod.conflicts(sim):
+        out.append(potentials_mod.describe_conflict(conflict))
+
+    # A floating body touching a Dirichlet wall is not floating -- the wall
+    # holds it -- and the solver refuses it outright rather than pretending.
+    # Unlike the ground-short check above this is not a capacitance-only
+    # problem: it fails the very first solve.
+    out.extend(_floating_face_shorts(dom, sim, boundary, floating))
+
+    if not materials_mod.conductors(sim):
         out.append(
             "electrostatic run with no PEC bodies: nothing holds a potential, "
             "so the field has no source. Assign bodies to a PEC material.")
-    elif len(set(potentials.values())) == 1:
+    elif not potentials:
+        out.append(
+            "no conductor is held at a potential: every one of them is either "
+            "floating or grounded, so nothing drives the field. Press Set "
+            "Potential and give at least one of them a voltage.")
+    elif len(set(potentials.values())) == 1 and _all_conductors_driven(sim):
         out.append(
             "every conductor is at {:g} V, so the field is uniformly that "
             "potential and every charge is zero. Set at least two different "
@@ -2419,6 +2468,145 @@ def _electrostatic_warnings(sim, dom, potentials, boundary, capacitance):
         out.append(
             "electrostatic mode ignores {} — there is no time axis for them to "
             "act on.".format(", ".join(ignored)))
+    return out
+
+
+def _all_conductors_driven(sim):
+    """True when every PEC body carries an explicit potential.
+
+    The "everything is at one potential" warning only holds if there is nothing
+    else in the model: one driven conductor plus a body that defaults to ground
+    (or floats, and so is not at that potential at all) is a perfectly ordinary
+    problem, and warning about it would be wrong.
+    """
+    from wavesim_gui import materials as materials_mod
+
+    return all(materials_mod.body_potential_is_set(body)
+               for body, _name, _volts in materials_mod.conductors(sim))
+
+
+def _floating_face_shorts(dom, sim, boundary, floating):
+    """Warn about each floating conductor that reaches a Dirichlet domain face.
+
+    Same geometry test as :func:`_grounded_face_shorts` -- the grid bounds, not
+    the drawn box, because that is where the condition is applied -- but a
+    harder consequence: a shorted *driven* conductor is only a problem once
+    extraction drives it, while a shorted *floating* one has no solution at all
+    and the solver raises on the first solve.
+    """
+    if not floating:
+        return []
+    dirichlet = {face for face, value in (boundary or {}).items()
+                 if value != "neumann"}
+    if not dirichlet:
+        return []
+
+    out = []
+    contacts = _conductor_face_contacts(dom, sim)
+    for name in sorted(floating):
+        hit = sorted(contacts.get(name, set()) & dirichlet)
+        if hit:
+            out.append(
+                "floating conductor {!r} reaches the domain face(s) {}, which "
+                "are held at a potential. A conductor shorted to a driven wall "
+                "is not floating — it is at that wall's potential — and the "
+                "solver refuses it on the first solve. Move it off the face, "
+                "set those faces to Symmetry, or give the body a potential "
+                "instead.".format(name, ", ".join(hit)))
+    return out
+
+
+def _conductor_face_contacts(dom, sim):
+    """``{name: {face key, ...}}`` for every conductor reaching a domain wall.
+
+    The check is against the **grid** bounds (the node arrays, which include the
+    PML pad) rather than the drawn domain box, because that is where a boundary
+    condition is actually applied. Shared by the two warnings below, which ask
+    the same geometric question of different boundary conditions.
+    """
+    from wavesim_gui import materials as materials_mod
+    from wavesim_gui import domain as domain_mod
+
+    try:
+        nodes = domain_mod.node_coords_m(dom)
+    except Exception:
+        return {}
+    if not all(len(a) >= 2 for a in nodes):
+        return {}
+    lo = [float(a[0]) * _MM_PER_M for a in nodes]
+    hi = [float(a[-1]) * _MM_PER_M for a in nodes]
+    # Half the smallest cell: a body reaching within that of the wall lands on
+    # the boundary node once voxelised.
+    tol = 0.5 * min(min(float(a[i + 1] - a[i]) for i in range(len(a) - 1))
+                    for a in nodes) * _MM_PER_M
+
+    faces = (("xmin", 0, "XMin", lo), ("xmax", 0, "XMax", hi),
+             ("ymin", 1, "YMin", lo), ("ymax", 1, "YMax", hi),
+             ("zmin", 2, "ZMin", lo), ("zmax", 2, "ZMax", hi))
+    out = {}
+    for body, name, _volts in materials_mod.conductors(sim):
+        shape = getattr(body, "Shape", None)
+        if shape is None:
+            continue
+        bb = shape.BoundBox
+        touching = {key for key, axis, attr, bound in faces
+                    if abs(getattr(bb, attr) - bound[axis]) <= tol}
+        if touching:
+            out[name] = touching
+    return out
+
+
+def _grounded_face_shorts(dom, sim, boundary):
+    """Warn about each conductor that reaches a Ground domain face.
+
+    Extraction drives every conductor to 1 V in turn, so a conductor touching a
+    face held at 0 V has no solution then even though the potential solve before
+    it was fine.
+    """
+    grounded = {face for face, value in (boundary or {}).items()
+                if value == "ground"}
+    out = []
+    for name, touching in sorted(_conductor_face_contacts(dom, sim).items()):
+        hit = sorted(touching & grounded)
+        if hit:
+            out.append(
+                "conductor {!r} reaches the grounded domain face(s) {}, so "
+                "extracting its capacitance shorts it to the wall and the run "
+                "will fail there. Set those faces to Symmetry (right for a "
+                "shielded structure — the mutual capacitances stay exact), add "
+                "background spacing, or clear Extract capacitance."
+                .format(name, ", ".join(hit)))
+    return out
+
+
+def _floating_face_shorts(dom, sim, boundary, floating):
+    """Warn about each floating conductor that reaches a Dirichlet domain face.
+
+    Same geometry test as :func:`_grounded_face_shorts` -- the grid bounds, not
+    the drawn box, because that is where the condition is applied -- but a
+    harder consequence: a shorted *driven* conductor is only a problem once
+    extraction drives it, while a shorted *floating* one has no solution at all
+    and the solver raises on the first solve.
+    """
+    if not floating:
+        return []
+    dirichlet = {face for face, value in (boundary or {}).items()
+                 if value != "neumann"}
+    if not dirichlet:
+        return []
+
+    out = []
+    contacts = _conductor_face_contacts(dom, sim)
+    for name in sorted(floating):
+        hit = sorted(contacts.get(name, set()) & dirichlet)
+        if hit:
+            out.append(
+                "floating conductor {!r} reaches the domain face(s) {}, which "
+                "are held at a potential. A conductor shorted to a driven wall "
+                "is not floating — it is at that wall's potential — and the "
+                "solver refuses it on the first solve. Move it off the face, "
+                "set those faces to Symmetry, or give the body a potential "
+                "instead.".format(name, ", ".join(hit)))
     return out
 
 

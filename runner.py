@@ -151,6 +151,13 @@ job.json schema (Session 2)
                       # drive is required. p0 is the "+" terminal.
       "electrostatic": {                      # required when mode == "electrostatic"
         "potentials": {"trace": 5.0, "gnd": 0.0},  # volts, keyed by part name
+        "floating": {"shield": 0.0},          # optional; coulombs, keyed by part
+                                    # name. Those parts are equipotentials whose
+                                    # VOLTAGE the solve finds, holding the charge
+                                    # given (0 = neutral). Disjoint from
+                                    # "potentials": a part in both is a
+                                    # contradiction the solver refuses. A part in
+                                    # neither is grounded at 0 V.
         "boundary": "ground" | "neumann" | {"xmin": "ground", ...},
         "capacitance": true,                  # also extract the C matrix
         "method": "auto",                     # 'auto'|'direct'|'cg'
@@ -355,7 +362,18 @@ therefore the **dual** cells (:func:`_node_dual_edges`), not ``grid.x``: that
 array holds the N+1 boundaries of N cells while these are N samples sitting at
 nodes, and drawing one against the other shifts the picture half a cell.
 
-``summary["electrostatic"]`` carries the applied potentials, the per-conductor
+A conductor may instead be left **floating** (``electrostatic.floating``, a
+charge per part): it is still an equipotential, but the number pinned is its
+total charge and its potential is an unknown of the solve — an unconnected trace
+picking up a voltage, an unbiased guard ring, a charged isolated body. The two
+are exclusive per part, and a part in neither is grounded at 0 V. Grounded and
+floating are easy to blur and are not the same conductor: grounded is 0 V holding
+whatever charge that takes, floating is 0 C sitting at whatever potential that
+takes. The found voltages come back in
+``summary["electrostatic"]["floating_potentials"]``.
+
+``summary["electrostatic"]`` carries the applied potentials, the charges asked of
+any floating parts and the potentials they settled at, the per-conductor
 charge, the field energy, and -- when asked for -- the capacitance matrix in both
 conventions. ``maxwell[i][j]`` is dQ_i/dV_j with every other conductor grounded,
 which is what a field solve measures; ``mutual`` is the two-terminal capacitance
@@ -1204,11 +1222,12 @@ def _run_electrostatic(ws, np, grid, job, workdir, voxel_summary):
     """
     cfg = job.get("electrostatic") or {}
     potentials = dict(cfg.get("potentials") or {})
+    floating = dict(cfg.get("floating") or {})
     boundary = cfg.get("boundary") or "ground"
     method = str(cfg.get("method", "auto"))
 
     known = set(getattr(grid, "pec_names", None) or {})
-    missing = sorted(set(potentials) - known)
+    missing = sorted((set(potentials) | set(floating)) - known)
     if missing:
         # Names come from job.json and the labels from materials.npz; they are
         # written together, so a mismatch means the two files are from different
@@ -1225,6 +1244,12 @@ def _run_electrostatic(ws, np, grid, job, workdir, voxel_summary):
     es = ws.Electrostatics(grid)
     for name, volts in potentials.items():
         es.set_potential(name, float(volts))
+    # A floating part is an equipotential holding a fixed charge, its voltage an
+    # unknown of the solve. Exclusive with a potential per part -- the workbench
+    # never emits a name in both, and the solver would let the last call win
+    # silently, so the two loops must not overlap.
+    for name, charge in floating.items():
+        es.set_floating(name, float(charge))
     t0 = time.perf_counter()
     sol = es.solve(boundary=boundary, method=method)
     wall_time = time.perf_counter() - t0
@@ -1307,6 +1332,13 @@ def _run_electrostatic(ws, np, grid, job, workdir, voxel_summary):
 
     es_summary = {
         "potentials": potentials,
+        # What each floating conductor was asked to hold, and the potential it
+        # settled at -- the answer that was being asked for, and the only number
+        # here that is an output rather than an input. Taken from the solution
+        # rather than recomputed, so it is the value the fields were built from.
+        "floating": floating,
+        "floating_potentials": {
+            name: float(sol.potential_of(name)) for name in sorted(floating)},
         "charges": charges,
         "energy": float(sol.energy),
         "method": sol.method,

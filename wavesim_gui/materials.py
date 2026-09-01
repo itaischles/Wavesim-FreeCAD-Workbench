@@ -194,33 +194,111 @@ def is_material(obj):
 # will set it.
 POTENTIAL_PROP = "WavesimPotential"
 
+# What that number means, in three states. A body is *not* simply "at 0 V" when
+# nobody set it: it inherits the condition of any conductor it touches, and only
+# a lump nobody set at all falls back to the document default. Collapsing that
+# into "everything carries a potential" is exactly what made the solver refuse a
+# defaulted body touching a driven one -- see :mod:`wavesim_gui.potentials`.
+MODE_PROP = "WavesimConductorMode"
+MODE_DEFAULT = "Default"
+MODE_POTENTIAL = "Potential"
+MODE_FLOATING = "Floating"
+CONDUCTOR_MODES = [MODE_DEFAULT, MODE_POTENTIAL, MODE_FLOATING]
+
+# Net charge in **coulombs** on a floating body: SI, because it goes into
+# job.json and on to ``Electrostatics.set_floating`` unconverted, and because
+# there is no FreeCAD unit for charge to carry it. The panel shows picocoulombs;
+# this is the only place the two meet.
+CHARGE_PROP = "WavesimFloatingCharge"
+
+# The boolean this replaced, read once on migration. Never written.
+_LEGACY_SET_PROP = "WavesimPotentialSet"
+
 
 def ensure_potential_prop(body):
-    """Add the potential property to *body* if it has none. Returns *body*.
+    """Add the conductor-condition properties to *body*. Returns *body*.
 
     Idempotent and guarded: a body type that refuses dynamic properties must not
     break material assignment, which is the common path this sits on.
     """
-    if body is None or hasattr(body, POTENTIAL_PROP):
+    if body is None:
         return body
-    try:
-        body.addProperty(
-            "App::PropertyFloat", POTENTIAL_PROP, "Wavesim",
-            "Potential in volts held on this conductor by an electrostatic "
-            "run. Ignored by a full-wave run, where a PEC body is a boundary "
-            "condition and has no potential to speak of.",
-        )
-        setattr(body, POTENTIAL_PROP, 0.0)
-    except Exception:
-        pass
+    if not hasattr(body, POTENTIAL_PROP):
+        try:
+            body.addProperty(
+                "App::PropertyFloat", POTENTIAL_PROP, "Wavesim",
+                "Potential in volts held on this conductor by an electrostatic "
+                "run. Applied only when WavesimConductorMode is 'Potential'. "
+                "Ignored by a full-wave run, where a PEC body is a boundary "
+                "condition and has no potential to speak of.",
+            )
+            setattr(body, POTENTIAL_PROP, 0.0)
+        except Exception:
+            pass
+    if not hasattr(body, CHARGE_PROP):
+        try:
+            body.addProperty(
+                "App::PropertyFloat", CHARGE_PROP, "Wavesim",
+                "Net charge in coulombs on this conductor when it is left "
+                "floating. 0 is the ordinary case -- a body that was neutral "
+                "before the field arrived stays neutral. Applied only when "
+                "WavesimConductorMode is 'Floating'.",
+            )
+            setattr(body, CHARGE_PROP, 0.0)
+        except Exception:
+            pass
+    if not hasattr(body, MODE_PROP):
+        try:
+            body.addProperty(
+                "App::PropertyEnumeration", MODE_PROP, "Wavesim",
+                "What an electrostatic run does with this conductor. "
+                "'Potential' holds it at WavesimPotential; 'Floating' lets the "
+                "solve find its potential while it holds WavesimFloatingCharge; "
+                "'Default' means it is not asked for -- it takes the condition "
+                "of any conductor it touches, and falls back to the "
+                "Simulation's UnsetConductorMode if it touches none.",
+            )
+            setattr(body, MODE_PROP, CONDUCTOR_MODES)
+            # Back-fill for a document written before the property existed,
+            # where every PEC body carried a potential and 0.0 meant "not
+            # touched". A non-zero value was deliberate, so it reads as driven;
+            # a zero one reads as Default, which is the same physics either way
+            # -- an unset body with no driven neighbour is grounded at 0 V.
+            legacy = getattr(body, _LEGACY_SET_PROP, None)
+            was_set = bool(body_potential(body)) if legacy is None                 else bool(legacy)
+            setattr(body, MODE_PROP,
+                    MODE_POTENTIAL if was_set else MODE_DEFAULT)
+        except Exception:
+            pass
     return body
 
 
-def body_potential(body):
-    """Potential in volts assigned to *body*; 0 V when it carries none.
+def conductor_mode(body):
+    """``MODE_DEFAULT`` / ``MODE_POTENTIAL`` / ``MODE_FLOATING`` for *body*.
 
-    0 V is both the useful default (an enclosure or a ground plane is normally
-    exactly that) and what the solver would do with an unnamed conductor anyway.
+    A body with no property at all is a pre-property document being read
+    outside :func:`ensure_potential_prop`; a non-zero potential on one is the
+    same back-fill the property itself gets.
+    """
+    if body is None:
+        return MODE_DEFAULT
+    try:
+        mode = str(getattr(body, MODE_PROP, "") or "")
+        if mode in CONDUCTOR_MODES:
+            return mode
+        return MODE_POTENTIAL if body_potential(body) else MODE_DEFAULT
+    except Exception:
+        return MODE_DEFAULT
+
+
+def body_potential(body):
+    """Potential in volts stored on *body*; 0 V when it carries none.
+
+    The stored number regardless of whether it is *applied* -- switching a body
+    to Default or Floating keeps its value, so switching back comes to what was
+    typed. Use :func:`conductor_mode` to ask whether it counts, and
+    :func:`wavesim_gui.potentials.resolve` for what the body is actually held
+    at once inheritance is worked out.
     """
     try:
         return float(getattr(body, POTENTIAL_PROP, 0.0))
@@ -228,11 +306,57 @@ def body_potential(body):
         return 0.0
 
 
-def set_body_potential(body, volts):
-    """Assign *volts* to *body*, adding the property if it is missing."""
+def body_charge(body):
+    """Net charge in coulombs stored on *body* for when it floats; 0 by default."""
+    try:
+        return float(getattr(body, CHARGE_PROP, 0.0))
+    except Exception:
+        return 0.0
+
+
+def body_potential_is_set(body):
+    """True when *body* is explicitly held at :func:`body_potential`."""
+    return conductor_mode(body) == MODE_POTENTIAL
+
+
+def body_is_floating(body):
+    """True when *body* is explicitly left to find its own potential."""
+    return conductor_mode(body) == MODE_FLOATING
+
+
+def set_conductor_mode(body, mode, volts=None, charge=None):
+    """Set *body*'s condition, and optionally the two numbers behind it.
+
+    The numbers are written whatever the mode, so a body switched to Default
+    keeps what was typed for when it is switched back; only *mode* decides which
+    of them an electrostatic run reads.
+    """
     ensure_potential_prop(body)
-    if hasattr(body, POTENTIAL_PROP):
+    if volts is not None and hasattr(body, POTENTIAL_PROP):
         setattr(body, POTENTIAL_PROP, float(volts))
+    if charge is not None and hasattr(body, CHARGE_PROP):
+        setattr(body, CHARGE_PROP, float(charge))
+    if hasattr(body, MODE_PROP) and mode in CONDUCTOR_MODES:
+        setattr(body, MODE_PROP, mode)
+
+
+def set_body_potential(body, volts):
+    """Hold *body* at *volts*, adding the properties if they are missing."""
+    set_conductor_mode(body, MODE_POTENTIAL, volts=volts)
+
+
+def set_body_floating(body, charge=0.0):
+    """Let *body* find its own potential while holding *charge* coulombs."""
+    set_conductor_mode(body, MODE_FLOATING, charge=charge)
+
+
+def clear_body_potential(body):
+    """Stop asking anything of *body*; it inherits, or takes the default.
+
+    The numbers themselves are kept, so a body cleared and set again comes back
+    to the values that were typed rather than to zero.
+    """
+    set_conductor_mode(body, MODE_DEFAULT)
 
 
 def is_pec(mat):
@@ -285,9 +409,42 @@ def conductors(sim):
     return out
 
 
+def conductor_material(sim, body):
+    """The PEC Material *body* is assigned to, or ``None``."""
+    for mat in find_materials(sim):
+        if is_pec(mat) and body in (getattr(mat, "Bodies", []) or []):
+            return mat
+    return None
+
+
 def conductor_potentials(sim):
-    """``{name: volts}`` for every PEC body in *sim* (the job.json potentials)."""
-    return {name: volts for _body, name, volts in conductors(sim)}
+    """``{name: volts}`` for the PEC bodies *explicitly* held at a potential.
+
+    This is what job.json carries, and the omissions are the point. The solver
+    pins potentials **body by body** on the voxelised grid: a lump of metal with
+    one named potential holds it -- including every part fused to it -- and a
+    lump with none is grounded at 0 V. So naming only the bodies the user
+    actually set is what makes a touching body inherit rather than fight.
+
+    Emitting a potential for every body (which is what this did before the
+    ``WavesimPotentialSet`` flag existed) made an unset body an explicit 0 V
+    claim on the same conductor, and the solver refused the pair -- the failure
+    this arrangement removes. See :mod:`wavesim_gui.potentials`.
+    """
+    return {name: volts for body, name, volts in conductors(sim)
+            if body_potential_is_set(body)}
+
+
+def conductor_charges(sim):
+    """``{name: coulombs}`` for the PEC bodies explicitly left **floating**.
+
+    The companion to :func:`conductor_potentials`, and just as selective: a body
+    is named here only if the user asked it to float. One that merely touches a
+    floating body is left out and picks the condition up on the grid, exactly as
+    a driven neighbour's is picked up.
+    """
+    return {name: body_charge(body) for body, name, _volts in conductors(sim)
+            if body_is_floating(body)}
 
 
 def materials_group(sim):
@@ -692,28 +849,18 @@ if _GUI_AVAILABLE:
             self._bodies_label = QtWidgets.QLabel(self._bodies_text())
             self._bodies_label.setWordWrap(True)
 
-            # Per-conductor potentials, shown only for a PEC material. This is
-            # the one place every conductor in the model is visible at once,
-            # which is what makes a missing or duplicated potential obvious --
-            # the property editor shows them one body at a time.
-            self._pot_table = QtWidgets.QTableWidget(0, 2)
-            self._pot_table.setHorizontalHeaderLabels(["Body", "Potential (V)"])
-            self._pot_table.verticalHeader().setVisible(False)
-            self._pot_table.setEditTriggers(
-                QtWidgets.QAbstractItemView.AllEditTriggers
-            )
-            header = self._pot_table.horizontalHeader()
-            try:
-                header.setSectionResizeMode(0, QtWidgets.QHeaderView.Stretch)
-            except AttributeError:      # PySide2/Qt5 spelling
-                header.setResizeMode(0, QtWidgets.QHeaderView.Stretch)
-            self._pot_table.setMaximumHeight(180)
-            self._fill_potentials()
+            # Potentials are edited in their own panel (Set Potential), not
+            # here: a potential belongs to a conductor, a conductor can span two
+            # materials, and inheritance between touching bodies only makes
+            # sense with all of them on screen at once. This panel keeps the
+            # doorway so a PEC material still says where they live.
+            self._pot_btn = QtWidgets.QPushButton("Set potentials...")
+            self._pot_btn.clicked.connect(self._open_potentials)
 
             self._pot_hint = QtWidgets.QLabel(
-                "Used by an electrostatic run: each body is held at its "
-                "potential. Bodies that touch are one conductor and cannot sit "
-                "at two potentials."
+                "Used by an electrostatic run. A body left unset takes the "
+                "potential of any conductor it touches, and is grounded at 0 V "
+                "only if it touches none."
             )
             self._pot_hint.setWordWrap(True)
 
@@ -725,7 +872,7 @@ if _GUI_AVAILABLE:
             layout.addRow("Conductivity (S/m):", self._sigma)
             layout.addRow(self._loss_hint)
             layout.addRow("Assigned bodies:", self._bodies_label)
-            layout.addRow("Potentials:", self._pot_table)
+            layout.addRow("Potentials:", self._pot_btn)
             layout.addRow(self._pot_hint)
             self._layout = layout
 
@@ -807,46 +954,28 @@ if _GUI_AVAILABLE:
                 return "(none -- drag bodies here)"
             return ", ".join(b.Label for b in bodies)
 
-        def _fill_potentials(self):
-            """Populate the potential table from the material's bodies."""
-            from PySide import QtCore
-            try:
-                from PySide import QtWidgets
-            except ImportError:
-                from PySide import QtGui as QtWidgets
-            bodies = list(getattr(self.obj, "Bodies", []) or [])
-            self._pot_bodies = bodies
-            self._pot_table.setRowCount(len(bodies))
-            for row, body in enumerate(bodies):
-                name = QtWidgets.QTableWidgetItem(str(body.Label))
-                name.setFlags(name.flags() & ~QtCore.Qt.ItemIsEditable)
-                self._pot_table.setItem(row, 0, name)
-                spin = QtWidgets.QDoubleSpinBox()
-                spin.setRange(-1.0e9, 1.0e9)
-                spin.setDecimals(4)
-                spin.setSingleStep(0.5)
-                spin.setSuffix(" V")
-                spin.setValue(body_potential(body))
-                self._pot_table.setCellWidget(row, 1, spin)
+        def _open_potentials(self):
+            """Hand over to the Set Potential panel, committing this one first.
 
-        def _write_potentials(self):
-            """Push the table's values onto the bodies (inside the caller's
-            transaction). A no-op for a material that is not PEC: a dielectric
-            has no potential to hold, and writing one would leave a stale value
-            behind if it is later made a conductor."""
-            if not self._pec.isChecked():
+            Both are task panels and FreeCAD shows one at a time, so the edits
+            in front of the user have to land before the other opens -- dropping
+            them silently to make room is the one outcome nobody wants.
+            """
+            from wavesim_gui import potentials as potentials_mod
+
+            sim = self.sim or active_simulation(
+                getattr(self.obj, "Document", None) or FreeCAD.ActiveDocument)
+            if not self.accept():
                 return
-            for row, body in enumerate(getattr(self, "_pot_bodies", [])):
-                spin = self._pot_table.cellWidget(row, 1)
-                if spin is not None:
-                    set_body_potential(body, spin.value())
+            if sim is not None:
+                potentials_mod.open_potential_panel(sim)
 
         def _set_potentials_visible(self, visible):
-            """Show/hide the potential table, its label and its note."""
-            show = bool(visible) and self._pot_table.rowCount() > 0
-            self._pot_table.setVisible(show)
+            """Show/hide the potentials row -- a dielectric holds none."""
+            show = bool(visible)
+            self._pot_btn.setVisible(show)
             self._pot_hint.setVisible(show)
-            label = self._layout.labelForField(self._pot_table)
+            label = self._layout.labelForField(self._pot_btn)
             if label is not None:
                 label.setVisible(show)
 
@@ -927,7 +1056,6 @@ if _GUI_AVAILABLE:
                 if self.obj.Pec:
                     for body in getattr(self.obj, "Bodies", []) or []:
                         ensure_potential_prop(body)
-                self._write_potentials()
             except Exception:
                 doc.abortTransaction()
                 raise

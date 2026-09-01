@@ -38,7 +38,7 @@ import os
 
 import FreeCAD
 
-from wavesim_gui.commands import active_simulation
+from wavesim_gui.commands import active_simulation, fdtd_only_active
 from wavesim_gui import domain as domain_mod
 from wavesim_gui import labels as labels_mod
 from wavesim_gui import modal_port as modal_mod
@@ -979,7 +979,7 @@ if _GUI_AVAILABLE:
             _open_line_panel(port, created=True)
 
         def IsActive(self):
-            return active_simulation(FreeCAD.ActiveDocument) is not None
+            return fdtd_only_active()
 
     class CommandAddSpiceTEMPort:
         """Create a SPICE TEM port on a domain face and open its editor."""
@@ -1016,7 +1016,7 @@ if _GUI_AVAILABLE:
             _open_tem_panel(port, created=True)
 
         def IsActive(self):
-            return active_simulation(FreeCAD.ActiveDocument) is not None
+            return fdtd_only_active()
 
     Gui.addCommand("Wavesim_AddSpiceLinePort", CommandAddSpiceLinePort())
     Gui.addCommand("Wavesim_AddSpiceTEMPort", CommandAddSpiceTEMPort())

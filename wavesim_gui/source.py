@@ -36,7 +36,7 @@ import os
 
 import FreeCAD
 
-from wavesim_gui.commands import active_simulation
+from wavesim_gui.commands import active_simulation, fdtd_only_active
 from wavesim_gui import expressions, labels as labels_mod, units
 from wavesim_gui import excitation as exc
 
@@ -838,6 +838,6 @@ if _GUI_AVAILABLE:
             _open_source_panel(src, created=True)
 
         def IsActive(self):
-            return active_simulation(FreeCAD.ActiveDocument) is not None
+            return fdtd_only_active()
 
     Gui.addCommand("Wavesim_AddSource", CommandAddSource())

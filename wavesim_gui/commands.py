@@ -355,6 +355,33 @@ def _ensure_solver_mode_props(obj):
             "potentials are all that is wanted.",
         )
         obj.ExtractCapacitance = True
+    if not hasattr(obj, "UnsetConductorMode"):
+        obj.addProperty(
+            "App::PropertyEnumeration", "UnsetConductorMode", "Run",
+            "Electrostatic mode: what happens to a PEC body that is neither "
+            "held at a potential nor touching one that is. 'Grounded' pins it "
+            "at 0 V, holding whatever charge that takes; 'Floating' leaves its "
+            "potential to the solve and holds it at zero net charge instead. "
+            "The two are easy to blur and are not the same conductor.",
+        )
+        obj.UnsetConductorMode = UNSET_LABELS
+        obj.UnsetConductorMode = UNSET_LABELS[0]
+
+
+# What an unset conductor does, for a document that says nothing: grounded, which
+# is what every electrostatic run did before floating bodies existed.
+UNSET_GROUND = "ground"
+UNSET_FLOAT = "float"
+UNSET_LABELS = ["Grounded (0 V)", "Floating (0 C)"]
+_UNSET_TOKENS = dict(zip(UNSET_LABELS, (UNSET_GROUND, UNSET_FLOAT)))
+
+
+def unset_conductor_mode(sim):
+    """``UNSET_GROUND`` or ``UNSET_FLOAT`` for *sim*'s un-set PEC bodies."""
+    if sim is None:
+        return UNSET_GROUND
+    return _UNSET_TOKENS.get(str(getattr(sim, "UnsetConductorMode", "")),
+                             UNSET_GROUND)
 
 
 def solver_mode(sim):
@@ -371,6 +398,20 @@ def solver_mode(sim):
 def is_electrostatic(sim):
     """True when *sim* is set to solve electrostatics rather than time-step."""
     return solver_mode(sim) == MODE_ELECTROSTATIC
+
+
+def fdtd_only_active(doc=None):
+    """``IsActive`` for a command that only means something in a full-wave run.
+
+    Sources, ports and beams all drive a time axis, and an electrostatic run has
+    none -- ``voxelize._electrostatic_warnings`` says as much before the solve
+    and the runner ignores them. Greying the buttons says it earlier, at the
+    point where one would be added, and does it the way FreeCAD says to: a
+    disabled command stays visible, so the toolbar does not change shape as the
+    solver mode is switched.
+    """
+    sim = active_simulation(FreeCAD.ActiveDocument if doc is None else doc)
+    return sim is not None and not is_electrostatic(sim)
 
 
 def extract_capacitance(sim):
@@ -942,6 +983,7 @@ if _GUI_AVAILABLE:
     from wavesim_gui import materials  # noqa: F401  (registers Wavesim_AssignMaterial)
     from wavesim_gui import domain  # noqa: F401  (registers the Domain object/VP)
     from wavesim_gui import refine  # noqa: F401  (registers Wavesim_RefineBody)
+    from wavesim_gui import potentials  # noqa: F401  (registers Wavesim_SetPotential)
     from wavesim_gui import source  # noqa: F401  (registers Wavesim_AddSource)
     from wavesim_gui import modal_port  # noqa: F401  (registers Wavesim_AddModalPort)
     from wavesim_gui import gaussian_beam  # noqa: F401  (registers Wavesim_AddGaussianBeam)

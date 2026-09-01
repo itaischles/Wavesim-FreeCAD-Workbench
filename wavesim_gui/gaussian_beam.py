@@ -68,7 +68,7 @@ import os
 
 import FreeCAD
 
-from wavesim_gui.commands import active_simulation
+from wavesim_gui.commands import active_simulation, fdtd_only_active
 from wavesim_gui import domain as domain_mod
 from wavesim_gui import excitation as exc
 from wavesim_gui import labels as labels_mod
@@ -823,6 +823,6 @@ if _GUI_AVAILABLE:
             _open_beam_panel(beam, created=True)
 
         def IsActive(self):
-            return active_simulation(FreeCAD.ActiveDocument) is not None
+            return fdtd_only_active()
 
     Gui.addCommand("Wavesim_AddGaussianBeam", CommandAddGaussianBeam())

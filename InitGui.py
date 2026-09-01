@@ -81,12 +81,20 @@ class WavesimWorkbench(Gui.Workbench):
             # Wavesim_AddSpiceTEMPort command stays registered for backward
             # compatibility with documents that still hold legacy SpiceTEMPort
             # objects, as does the old Wavesim_AddTEMSource id.
+            #
+            # Wavesim_SetPotential is the electrostatic member of the group: it
+            # is what drives that solve, the way the others drive a time-domain
+            # one. The two halves are mutually exclusive by IsActive -- the
+            # first five grey out in electrostatic mode, Set Potential greys out
+            # in full-wave mode -- so the group is always half disabled and the
+            # toolbar never changes shape.
             add_group(
                 "Wavesim_AddSource",
                 "Wavesim_AddModalPort",
                 "Wavesim_AddGaussianBeam",
                 "Wavesim_AddLumpedPort",
                 "Wavesim_AddSpiceLinePort",
+                "Wavesim_SetPotential",
             )
             # Monitors: everything that records, point to whole-domain.
             add_group(

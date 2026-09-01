@@ -40,7 +40,7 @@ then matplotlib's vectorised point-in-polygon over that layer's cell centres
 original ``isInside``-per-cell sweep, which was O(N^3) BREP point queries.
 
 The geometry is left to stop where the CAD stops -- nothing is extruded to meet a
-port. A modal port's face carries no PML pad and no background gap (see
+port. A modal port's face carries no PML shell and no background gap (see
 ``domain.modal_port_faces``), so the domain face lands exactly on the material
 bound and the port plane cuts the real cross-section. The port then terminates
 the line at Z0 there; a conductor carried *past* it would put a second Z0 in
@@ -220,7 +220,7 @@ def combined_bbox_mm(sim, materials):
 
     The domain auto-sizes to this combined box, so a source, snapshot slice,
     voltage/current monitor curve, SPICE line port or lumped port placed outside
-    the material bounds (or in the PML) enlarges the domain to contain it.
+    the material bounds enlarges the domain to contain it.
     Returns ``None`` when there is nothing to bound.
     """
     bbox = materials_bbox_mm(materials)
@@ -235,10 +235,13 @@ def combined_bbox_mm(sim, materials):
 def _grid_extent(bbox, cell_mm, spacing_lo_mm, spacing_hi_mm, pad_lo, pad_hi):
     """Per-axis ``(counts, origin_mm)`` for the given sizing.
 
-    The inner region is the material bounds grown by ``spacing_lo_mm`` /
+    The grid is the material bounds grown by ``spacing_lo_mm`` /
     ``spacing_hi_mm`` on the low/high side of each axis and rounded up to whole
-    cells; ``pad_lo``/``pad_hi`` add the per-side PML cells outside that. The
-    origin is the min corner of the *padded* grid.
+    cells. ``pad_lo``/``pad_hi`` are the per-side PML cells, which sit **inside**
+    that box (its outermost cells *are* the absorber) and so add nothing to the
+    extent -- they only impose a floor of ``pad_lo + pad_hi + 1`` cells, below
+    which the solver would quietly make the axis's PML inert. The origin is the
+    min corner of the box, absorber included.
     """
     exts = (bbox.XLength, bbox.YLength, bbox.ZLength)
     mins = (bbox.XMin, bbox.YMin, bbox.ZMin)
@@ -247,10 +250,8 @@ def _grid_extent(bbox, cell_mm, spacing_lo_mm, spacing_hi_mm, pad_lo, pad_hi):
     for a in range(3):
         grown = exts[a] + float(spacing_lo_mm[a]) + float(spacing_hi_mm[a])
         inner = max(1, int(math.ceil(grown / cell_mm[a])))
-        counts.append(inner + int(pad_lo[a]) + int(pad_hi[a]))
-        origin.append(
-            mins[a] - float(spacing_lo_mm[a]) - int(pad_lo[a]) * cell_mm[a]
-        )
+        counts.append(max(inner, int(pad_lo[a]) + int(pad_hi[a]) + 1))
+        origin.append(mins[a] - float(spacing_lo_mm[a]))
     return tuple(counts), tuple(origin)
 
 
@@ -1553,12 +1554,17 @@ def voxelize_materials(materials, cell_size_m,
         :func:`build_job_from_document`, which refuses to run without a Grid).
     spacing_lo_m, spacing_hi_m : tuple of float
         Background gap (metres) added outside the material bounds on the low/high
-        side of x, y, z, before any PML padding. From the Domain object's
-        per-face ``Spacing*`` properties (all zero with no domain).
+        side of x, y, z. From the Domain object's per-face ``Spacing*``
+        properties (all zero with no domain). This is the whole extent: the
+        absorber is taken out of the inside of it, so the gap is also what buys
+        clearance between the geometry and the PML -- and a zero gap deliberately
+        hands the geometry to the absorber, which is how a body is carried out to
+        infinity.
     pad_lo, pad_hi : tuple of int
-        Per-axis PML padding in cells on the low/high side of x, y, z. From the
-        Domain's per-face boundary settings; the legacy default is 8 cells all
-        round (room for PML when no domain has been defined yet).
+        Per-axis PML depth in cells at the low/high face of x, y, z, taken from
+        **inside** the box (they add no extent, only a floor of
+        ``pad_lo + pad_hi + 1`` cells per axis). From the Domain's per-face
+        boundary settings; the legacy default is 8 cells all round.
     extra_points_mm : iterable of (x, y, z)
         Extra world-mm points the grid must contain (the source positions). The
         bounding box is grown to include them so a source outside the material
@@ -1568,7 +1574,7 @@ def voxelize_materials(materials, cell_size_m,
         which only bound their normal axis). Grows the box on that axis only.
     nodes_m : tuple of array, optional
         Explicit per-axis node coordinates ``(x, y, z)`` in **world metres**
-        (strictly increasing, PML pad cells included) from the Domain's graded
+        (strictly increasing, absorber cells included) from the Domain's graded
         grid. When given, the grid extent/cell centres come from these directly
         and *cell_size_m*/*spacing_**/*pad_lo*/*pad_hi*/*extra_** are ignored (the
         node arrays already bake them in). When ``None`` (the uniform default),
@@ -1660,7 +1666,8 @@ def voxelize_materials(materials, cell_size_m,
     if not entries:
         raise ValueError("No solid bodies are assigned to any material.")
 
-    # Per-axis node coordinates (world mm) spanning the padded grid. Either
+    # Per-axis node coordinates (world mm) spanning the whole grid, absorber
+    # cells included. Either
     # supplied explicitly (the Domain's graded grid) or derived as a uniform grid
     # bounding the geometry + extras. Both then share one centre-based sweep.
     if nodes_m is not None:
@@ -1993,6 +2000,86 @@ def voxelize_materials(materials, cell_size_m,
     }
 
 
+# Material arrays checked for invariance through a PML shell, and the relative
+# difference above which a cell counts as varying. The tolerance is not there to
+# be lenient about geometry: it is there because subpixel smoothing writes
+# slightly different epsilon into the outermost cell of the grid (its stencil
+# has no neighbour on the far side), and that is a boundary artefact rather than
+# a body that ends inside the absorber. A body that really does stop, bend or
+# change section in the shell moves whole cells between materials, which is
+# orders of magnitude past 1%.
+_SHELL_CHECK_KEYS = ("eps_x", "eps_y", "eps_z", "mu_x", "mu_y", "mu_z",
+                     "sigma_x", "sigma_y", "sigma_z", "pec_mask")
+_SHELL_RTOL = 1.0e-2
+
+
+def pml_shell_warnings(arrays, pad_lo, pad_hi, pml_faces):
+    """Messages for absorbing faces whose geometry is not invariant through them.
+
+    A CPML terminates a *cross-section*, not a volume: it absorbs cleanly only
+    what runs straight out through it unchanged. Since the absorber now lies
+    inside the domain box, geometry can reach it -- which is the point, a trace
+    or a substrate carried out through the shell is how a structure is taken to
+    infinity instead of ending at a wall -- but a body that stops, bends or
+    changes section *inside* the shell reflects off its own discontinuity, and
+    the reflection looks exactly like a mediocre absorber rather than like a
+    modelling mistake.
+
+    Producing invariant geometry there is the user's job; this only says when it
+    has not happened, before the run rather than after. Each absorbing face is
+    compared against the layer at its own inner edge -- the section the shell
+    should be extruding -- and reported with the count of cells that differ, so
+    a stray fillet reads differently from a body that ends halfway in.
+    """
+    import numpy as np
+
+    keys = [k for k in _SHELL_CHECK_KEYS if k in arrays]
+    faces = set(pml_faces or ())
+    for axis_i, axis in enumerate(("x", "y", "z")):
+        for high, depth in ((False, int(pad_lo[axis_i])),
+                            (True, int(pad_hi[axis_i]))):
+            face = axis + ("1" if high else "0")
+            if depth <= 0 or face not in faces:
+                continue
+            worst_key, worst_cells, total = None, 0, 0
+            for key in keys:
+                arr = np.asarray(arrays[key])
+                n = arr.shape[axis_i]
+                if n <= depth:
+                    continue
+                cut = [slice(None)] * 3
+                ref = [slice(None)] * 3
+                if high:
+                    cut[axis_i] = slice(n - depth, n)
+                    ref[axis_i] = slice(n - depth, n - depth + 1)
+                else:
+                    cut[axis_i] = slice(0, depth)
+                    ref[axis_i] = slice(depth - 1, depth)
+                slab = arr[tuple(cut)]
+                layer = arr[tuple(ref)]
+                if slab.dtype == bool:
+                    bad = slab != layer
+                else:
+                    scale = np.maximum(np.abs(layer.astype(np.float64)), 1.0e-30)
+                    bad = np.abs(slab.astype(np.float64) - layer) > _SHELL_RTOL * scale
+                cells = int(np.count_nonzero(bad))
+                total = slab.size
+                if cells > worst_cells:
+                    worst_key, worst_cells = key, cells
+            if worst_cells:
+                yield (
+                    "the {} absorber is not invariant along {}: {:,} of {:,} "
+                    "cells in its {}-cell shell differ from the section at its "
+                    "inner edge ({}). A PML terminates what runs straight out "
+                    "through it; a body that ends, bends or changes "
+                    "cross-section inside the shell reflects off its own "
+                    "discontinuity. Carry it out to the {} face, or raise that "
+                    "face's background spacing until the geometry clears the "
+                    "shell.".format(face, axis, worst_cells, total, depth,
+                                    worst_key, face)
+                )
+
+
 def _report_conformal(active, counts, threshold):
     """Console report after a voxelisation that asked for conformal PEC.
 
@@ -2096,7 +2183,7 @@ def build_job_from_document(doc, steps=None, fmax=30.0e9, progress=None):
     from wavesim_gui import spice_port as spice_mod
 
     # The geometry is left to stop where the CAD stops -- nothing is extruded to
-    # meet a port. A **modal port** face carries no PML pad and no background gap
+    # meet a port. A **modal port** face carries no PML shell and no background gap
     # (below), so the domain face lands exactly on the material bound and the port
     # plane cuts the real cross-section, which is what the mode solve needs; the
     # port then terminates the line there, and a conductor carried *past* it would
@@ -2105,7 +2192,7 @@ def build_job_from_document(doc, steps=None, fmax=30.0e9, progress=None):
 
     # Faces launching a beam or a SPICE-TEM port are forced to PML (they drive an
     # interior plane and need the absorber behind it); faces carrying a modal port
-    # lose their PML pad, PEC wall and background gap entirely. Both go through
+    # lose their PML shell, PEC wall and background gap entirely. Both go through
     # the single source of truth, so the grid padding *and* the emitted boundary
     # (below) agree with the drawn box and node arrays, which are built from the
     # same two face lists.
@@ -2133,7 +2220,7 @@ def build_job_from_document(doc, steps=None, fmax=30.0e9, progress=None):
         FreeCAD.Console.PrintWarning("Wavesim: " + message + "\n")
     # Non-uniform grid: when the Domain's snapper is enabled, hand its explicit
     # node arrays to the voxeliser (which then ignores cell size / spacing / PML
-    # padding -- the snapper already baked them in). Off (the default) leaves
+    # depth -- the snapper already baked them in). Off (the default) leaves
     # nodes_m None so the voxeliser derives the usual uniform grid.
     nodes_m = None
     if getattr(dom, "UseNonuniformGrid", False):
@@ -2162,7 +2249,7 @@ def build_job_from_document(doc, steps=None, fmax=30.0e9, progress=None):
             for body, name, _volts in materials_mod.conductors(sim)
         }
     # Grow the grid to include every source position and snapshot slice, so an
-    # input outside the material bounds (or in the PML) still lands inside it.
+    # input outside the material bounds still lands inside it.
     vox = voxelize_materials(
         materials, cell_size_m,
         spacing_lo_m=spacing_lo, spacing_hi_m=spacing_hi,
@@ -2180,6 +2267,12 @@ def build_job_from_document(doc, steps=None, fmax=30.0e9, progress=None):
     # those cases the run is the ordinary staircase one. The runner echoes this
     # into summary.json and keys its backend choice off it, so it has to be the
     # truth rather than the request.
+    # Geometry carried into the absorber has to run *through* it unchanged;
+    # nothing enforces that but the user, so say so here rather than let the
+    # reflection be read as a weak PML.
+    for message in pml_shell_warnings(vox["arrays"], pad_lo, pad_hi,
+                                      grid_params["pml_faces"]):
+        FreeCAD.Console.PrintWarning("Wavesim: " + message + "\n")
     conformal = all(key in vox["arrays"] for key in CONFORMAL_KEYS)
     if want_conformal:
         _report_conformal(conformal, vox["counts"], area_threshold)
@@ -2519,10 +2612,11 @@ def _floating_face_shorts(dom, sim, boundary, floating):
 def _conductor_face_contacts(dom, sim):
     """``{name: {face key, ...}}`` for every conductor reaching a domain wall.
 
-    The check is against the **grid** bounds (the node arrays, which include the
-    PML pad) rather than the drawn domain box, because that is where a boundary
-    condition is actually applied. Shared by the two warnings below, which ask
-    the same geometric question of different boundary conditions.
+    The check is against the **grid** bounds (the node arrays), which is where a
+    boundary condition is actually applied. Those now coincide with the drawn
+    domain box -- the absorber lies inside it -- so the two readings agree.
+    Shared by the two warnings below, which ask the same geometric question of
+    different boundary conditions.
     """
     from wavesim_gui import materials as materials_mod
     from wavesim_gui import domain as domain_mod
@@ -2615,9 +2709,9 @@ def _grounded_face_shorts(dom, sim, boundary):
 
     Extraction drives every conductor to 1 V in turn, so a conductor touching a
     face held at 0 V has no solution then even though the potential solve before
-    it was fine. The check is against the **grid** bounds (the node arrays, which
-    include the PML pad) rather than the drawn domain box, because that is where
-    the boundary condition is actually applied.
+    it was fine. The check is against the **grid** bounds (the node arrays), which
+    is where the boundary condition is actually applied -- and which is the drawn
+    domain box, the absorber being inside it.
     """
     from wavesim_gui import materials as materials_mod
     from wavesim_gui import domain as domain_mod

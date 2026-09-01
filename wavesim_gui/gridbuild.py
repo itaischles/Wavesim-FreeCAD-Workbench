@@ -61,8 +61,18 @@ The mesh is built per axis, independently:
   low-index void stays coarse. Being axis-separable, the refinement fills the
   body's projected slab on each axis; the body itself (the slabs' intersection)
   is fine on all three.
-* **PML pads.** ``pad_lo``/``pad_hi`` uniform cells (coarse size) are appended
-  outside the inner region for the absorber, matching ``domain_grid_params``.
+* **PML shell.** ``pad_lo``/``pad_hi`` uniform cells (coarse size) are carved
+  out of the *inside* of each face for the absorber, matching
+  ``domain_grid_params``: the returned nodes span exactly the domain box the
+  user drew, and its outermost cells are the PML. The graded fill covers only
+  what is left, and a snap landing in the shell is dropped -- the solver's CPML
+  requires the outer ``d_pml`` cells of an absorbing face to be one constant
+  width (``wavesim.pml._pml_face_widths`` raises otherwise), so nothing may
+  refine there. Geometry may run out through the shell (set that face's
+  background spacing to 0), which is how a structure is carried to infinity
+  instead of ending at a wall; keeping it invariant along the absorbed axis is
+  the user's job, and :func:`wavesim_gui.voxelize.pml_shell_warnings` says so
+  when it is not.
 
 A global guard caps the grid at :data:`_MAX_TOTAL_CELLS`; if a build exceeds it
 the whole mesh is coarsened uniformly and rebuilt.
@@ -834,8 +844,10 @@ def _forced_lines(snaps, lo, hi, coarse, min_cell=0.0):
     A line merged under a large *min_cell* therefore moves by up to
     ``min_cell/2`` -- an interface deliberately traded away for the timestep,
     which is what asking for a minimum cell size means. *lo* and *hi* never move:
-    they are the domain bounds the PML pads are measured from, so a cluster
-    within *tol* of either is dropped rather than allowed to drag the edge.
+    they are the inner edge of the absorber shell (the domain wall on a face
+    that does not absorb), and the shell has to keep its constant width, so a
+    cluster within *tol* of either is dropped rather than allowed to drag the
+    edge.
     """
     tol = merge_tolerance(coarse, min_cell)
 
@@ -974,21 +986,27 @@ def _graded_widths(w, hL, hR, H, r):
 def build_axis_nodes(snaps, lo, hi, coarse, ratio, pad_lo, pad_hi, min_cell=0.0,
                      caps=(), line_sizes=(), centres=(), exact_caps=(),
                      forced_out=None):
-    """Graded node coordinates (mm) for one axis, PML pad cells included.
+    """Graded node coordinates (mm) for one axis, the PML shell included.
 
     Parameters
     ----------
     snaps : iterable of float
         Forced interior grid-line coordinates (world mm) for this axis.
     lo, hi : float
-        Bounds of the inner (air-padded) region on this axis, world mm.
+        Bounds of the whole domain box on this axis, world mm (the material
+        bounds grown by the per-face background spacing). The returned nodes
+        span exactly this -- the absorber is carved out of it, not added
+        outside.
     coarse : float
         Target interior (void) cell size (mm) -- the background-medium
         resolution.
     ratio : float
         Max size ratio between adjacent cells the graded fill may use.
     pad_lo, pad_hi : int
-        Uniform PML cells (width *coarse*) appended below *lo* / above *hi*.
+        Uniform PML cells (width *coarse*) taken off the inside of the *lo* /
+        *hi* face. The graded fill then covers ``[lo + pad_lo*coarse,
+        hi - pad_hi*coarse]`` only, and any snap in the shell is dropped: the
+        solver requires a constant-width absorber (see the module docstring).
     min_cell : float
         Smallest cell the fill may use (mm); 0 disables the limit. Nearby forced
         lines are merged and the fine feature cells are clamped to it, so
@@ -1028,8 +1046,17 @@ def build_axis_nodes(snaps, lo, hi, coarse, ratio, pad_lo, pad_hi, min_cell=0.0,
     """
     coarse = max(float(coarse), 1.0e-9)
     min_cell = min(max(float(min_cell), 0.0), coarse)
-    if hi - lo < coarse:
-        hi = lo + coarse  # degenerate/thin axis: at least one inner cell
+    pad_lo, pad_hi = int(pad_lo), int(pad_hi)
+    # The absorber lives *inside* the box: inset the fill's bounds by its shell
+    # and hand back the shell cells at the end. An axis with no room for both
+    # shells plus one interior cell grows outward rather than losing the
+    # absorber (the solver silently makes the PML inert below 2*d_pml+1 cells).
+    lo, hi = float(lo), float(hi)
+    inner_lo = lo + pad_lo * coarse
+    inner_hi = hi - pad_hi * coarse
+    if inner_hi - inner_lo < coarse:
+        inner_hi = inner_lo + coarse
+    lo, hi = inner_lo, inner_hi
 
     forced = _forced_lines(snaps, lo, hi, coarse, min_cell)
     if centres:
@@ -1090,9 +1117,10 @@ def build_axis_nodes(snaps, lo, hi, coarse, ratio, pad_lo, pad_hi, min_cell=0.0,
             nodes.append(pos)
         nodes[-1] = forced[k + 1]  # land exactly on the forced line
 
-    # PML pads: uniform coarse cells outside the inner region.
-    lo_pad = [nodes[0] - (pad_lo - i) * coarse for i in range(int(pad_lo))]
-    hi_pad = [nodes[-1] + (i + 1) * coarse for i in range(int(pad_hi))]
+    # PML shell: uniform coarse cells, one constant width per face, wrapping the
+    # graded fill back out to the domain box the caller asked for.
+    lo_pad = [nodes[0] - (pad_lo - i) * coarse for i in range(pad_lo)]
+    hi_pad = [nodes[-1] + (i + 1) * coarse for i in range(pad_hi)]
     return lo_pad + nodes + hi_pad
 
 
@@ -1107,11 +1135,13 @@ def build_domain_nodes(sim, domain, force_pml_faces=(), modal_faces=(),
     Uses the material geometry bounds (grown for sources/monitors, via
     ``combined_bbox_mm``) as the inner region, the Domain's ``Dx/Dy/Dz`` as the
     coarse (background) interior target, its ``MaxGradingRatio`` as the grading
-    bound and the per-face PML padding from ``domain_grid_params``.
+    bound and the per-face PML depth from ``domain_grid_params`` -- taken out of
+    the inside of each absorbing face, so the returned arrays span exactly the
+    domain box.
     *force_pml_faces* (beam / SPICE-TEM launch faces) and *modal_faces* (Modal
-    Port faces, which get no pad and no background gap) are forwarded so the node
-    arrays carry exactly the padding and spacing the run's boundary assumes, even
-    when the face's stored property says otherwise. Each material
+    Port faces, which get no shell and no background gap) are forwarded so the
+    node arrays carry exactly the absorber and spacing the run's boundary
+    assumes, even when the face's stored property says otherwise. Each material
     body additionally refines its own band down to its per-medium resolution (see
     :func:`collect_material_caps`), so higher-index regions are meshed finer than
     the void, and -- when the Domain's ``CurvatureRefinement`` factor is above 1 --

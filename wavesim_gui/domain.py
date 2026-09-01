@@ -13,18 +13,33 @@ The domain box auto-sizes to bound every material-assigned body plus the spacing
 it starts empty (no geometry) and grows/shrinks as bodies are assigned (the
 material commands notify it via :func:`notify_materials_changed`).
 
+**The PML sits inside the domain box**, not around it: the outermost
+``PMLThickness`` cells of each absorbing face *are* the absorber, and the grid
+spans exactly the box the user drew. Two consequences, both of them the point:
+the drawn box is the true extent of what is solved (nothing is hidden outside
+it), and **geometry can be carried into the absorber** -- set a face's
+``Spacing`` to 0 and a body runs out through the PML, which is how a waveguide,
+a substrate or a trace is taken to infinity instead of ending in a physical
+discontinuity at the wall. The cross-section must not *change* through the
+shell for that to be reflectionless; ``voxelize.pml_shell_warnings`` checks it
+and warns before the run.
+
 Rendering
 ---------
 The domain draws as two *wireframe* boxes (edges only, no fill, so neither
-obscures the other or the geometry): the inner domain box and the outer box the
-PML layers occupy, in two colours. Alongside them are three fully-transparent
-*cell grids* (thin lines spaced ``Dx``/``Dy``/``Dz``) on the domain's three min
-faces, so the meshing resolution is visible. All of these are drawn by one
-object, so the single "eye" visibility toggle next to Domain shows/hides them
-together.
+obscures the other or the geometry): the domain box and, within it, the box
+bounding the PML-free interior, in two colours -- so the frame between them is
+the absorber. Alongside them are three fully-transparent *cell grids* (thin
+lines spaced ``Dx``/``Dy``/``Dz``) on the domain's three min faces, so the
+meshing resolution is visible; the segments of those lines that lie in the
+absorber are drawn in the PML box's own colour, which is what makes the
+absorber read as a *region of the mesh* rather than an annotation. All of these
+are drawn by one object, so the single "eye" visibility toggle next to Domain
+shows/hides them together.
 
 :func:`domain_grid_params` is the single source of truth mapping the per-face
-settings to the per-side PML padding (cells), the PML ``faces`` tuple and the PEC
+settings to the per-side PML depth (cells, taken from inside the box), the
+PML ``faces`` tuple and the PEC
 ``faces`` tuple that the voxeliser and runner consume.
 
 Units: FreeCAD geometry/properties are in millimetres; the solver works in
@@ -155,6 +170,27 @@ _SNAP_COLOR = (0.95, 0.85, 0.35)
 _SNAP_LINE_WIDTH = 2
 _MAX_SNAP_LINES = 400
 
+# The grid lines that fall in the absorber, drawn in the PML box's own colour so
+# the user can see how much of the domain the absorber is eating and how far a
+# body carried out through it actually runs. Same width and cap as the thin
+# lines: it is the same mesh, only differently labelled.
+_PML_GRID_COLOR = (0.85, 0.45, 0.20)
+
+
+def _node_at(nodes, index, fallback):
+    """``nodes[index]`` (world mm) when the array reaches that far, else *fallback*.
+
+    The node arrays are the geometric source of truth for where a cell wall is,
+    so the PML box is read off them rather than recomputed from the cell size --
+    exact on a graded grid, where the shell's own width is the *coarse* target
+    and not the ``Dx`` the interior may have refined past. The fallback covers
+    the first recompute of a restored document, before the arrays are filled.
+    """
+    try:
+        return float(nodes[index])
+    except (IndexError, TypeError, ValueError):
+        return float(fallback)
+
 
 # --------------------------------------------------------------------------- #
 # Document-object model
@@ -173,7 +209,8 @@ class DomainObject:
         ``PMLThickness``         -- PML depth in cells, on every PML face.
         ``BoundaryX/Y/Z Min/Max`` -- per-face boundary condition (PML | PEC).
 
-    Hidden geometry properties (``DomainMin``/``Max``, ``PmlMin``/``Max``) carry
+    Hidden geometry properties (``DomainMin``/``Max`` -- the whole grid --  and
+    ``PmlMin``/``Max`` -- the interior the absorber leaves, *inside* it) carry
     the box corners for the view provider; ``execute`` keeps them in sync with the
     material bounds, cell sizes and boundary settings.
     """
@@ -244,10 +281,11 @@ class DomainObject:
         _ensure_grid_plane_props(obj)
         _ensure_snap_props(obj)
 
-        # Per-axis node-coordinate arrays (world mm, including the PML pad cells)
-        # spanning the padded grid -- the geometric source of truth every
-        # downstream consumer derives from. ``execute`` populates them: uniform
-        # ticks when UseNonuniformGrid is off, the snapper's lines when on.
+        # Per-axis node-coordinate arrays (world mm) spanning the grid -- the
+        # outermost of them are the absorber's own cells, the PML being inside
+        # the box. The geometric source of truth every consumer derives from;
+        # ``execute`` populates them: uniform ticks when UseNonuniformGrid is
+        # off, the snapper's lines when on.
         for name in ("NodesX", "NodesY", "NodesZ"):
             if not hasattr(obj, name):
                 obj.addProperty(
@@ -269,7 +307,8 @@ class DomainObject:
         if not hasattr(obj, "PMLThickness"):
             obj.addProperty(
                 "App::PropertyInteger", "PMLThickness", "Boundary",
-                "PML absorbing-layer depth, in grid cells, on each PML face",
+                "PML absorbing-layer depth, in grid cells, taken from *inside* "
+                "each PML face (the domain box is the whole grid)",
             )
             obj.PMLThickness = 8
 
@@ -364,17 +403,7 @@ class DomainObject:
                               bbox.ZMax + sp_hi[2])
         obj.DomainMin, obj.DomainMax = dmin, dmax
 
-        if params["pml_faces"]:
-            obj.PmlMin = FreeCAD.Vector(
-                dmin.x - pad_lo[0] * dx, dmin.y - pad_lo[1] * dy, dmin.z - pad_lo[2] * dz
-            )
-            obj.PmlMax = FreeCAD.Vector(
-                dmax.x + pad_hi[0] * dx, dmax.y + pad_hi[1] * dy, dmax.z + pad_hi[2] * dz
-            )
-        else:
-            obj.PmlMin = obj.PmlMax = zero  # no PML -> draw no outer box
-
-        # Per-axis node-coordinate arrays (world mm) spanning the padded grid.
+        # Per-axis node-coordinate arrays (world mm) spanning the grid.
         # With UseNonuniformGrid on, the snapper places lines on the geometry's
         # features and grades the spacing; otherwise these are uniform ticks
         # whose extent matches the voxeliser's own ``_grid_extent`` for the same
@@ -413,6 +442,33 @@ class DomainObject:
             obj.Nx, obj.Ny, obj.Nz = nx, ny, nz
             # A uniform grid snaps to nothing, so every line is drawn thin.
             _set_snaps(obj, None)
+
+        # Inner edge of the absorber. The PML sits *inside* the domain box -- the
+        # outermost ``pad_lo``/``pad_hi`` cells of the grid *are* the PML -- so
+        # this box is drawn within the domain box rather than around it, and it
+        # is read off the node arrays so it lands exactly on a cell wall on a
+        # graded grid as well as a uniform one.
+        if params["pml_faces"]:
+            nx_, ny_, nz_ = (list(obj.NodesX), list(obj.NodesY), list(obj.NodesZ))
+            pml_min = FreeCAD.Vector(
+                _node_at(nx_, pad_lo[0], dmin.x + pad_lo[0] * dx),
+                _node_at(ny_, pad_lo[1], dmin.y + pad_lo[1] * dy),
+                _node_at(nz_, pad_lo[2], dmin.z + pad_lo[2] * dz),
+            )
+            pml_max = FreeCAD.Vector(
+                _node_at(nx_, -1 - pad_hi[0], dmax.x - pad_hi[0] * dx),
+                _node_at(ny_, -1 - pad_hi[1], dmax.y - pad_hi[1] * dy),
+                _node_at(nz_, -1 - pad_hi[2], dmax.z - pad_hi[2] * dz),
+            )
+            # An axis with no room left between its two shells has no interior
+            # to bound: draw no inner box rather than an inside-out one.
+            if any(getattr(pml_max, a) <= getattr(pml_min, a)
+                   for a in ("x", "y", "z")):
+                obj.PmlMin = obj.PmlMax = zero
+            else:
+                obj.PmlMin, obj.PmlMax = pml_min, pml_max
+        else:
+            obj.PmlMin = obj.PmlMax = zero  # no PML -> draw no inner box
 
         # First recompute with real bounds parks the grid planes on the min
         # faces -- where they used to be nailed. Later recomputes leave them
@@ -463,7 +519,7 @@ def modal_port_faces(sim):
     A modal port is an impedance-sheet *boundary*: it writes the ghost tangential
     H on the face each step, launching the mode inward and absorbing whatever
     returns, with no reflection and -- unlike PML -- no DC error. So the face
-    needs **no PML pad and no PEC wall**; it also needs **no background spacing**,
+    needs **no PML shell and no PEC wall**; it also needs **no background spacing**,
     because the port plane has to cut the real cross-section and a gap of
     background medium would leave it nothing to solve. All three are applied by
     :func:`domain_grid_params`, everywhere the grid is built (the drawn box, the
@@ -489,7 +545,7 @@ def pml_port_faces(sim):
     A Gaussian beam and a SPICE-TEM port both drive an *interior* plane placed one
     PML-depth inside the face, so that face has to be an absorber -- otherwise it
     traps the backward/reflected wave and, on a non-uniform grid, desyncs the node
-    arrays (no PML pad) from the forced boundary (crash). Applied everywhere the
+    arrays (no absorber shell) from the forced boundary (crash). Applied everywhere the
     grid is built, regardless of the Domain's per-face setting.
 
     A **modal port** face is *not* in this list: it terminates itself, see
@@ -568,8 +624,9 @@ def curvature_refinement(obj):
 def node_coords_mm(obj):
     """Return the Domain's ``(NodesX, NodesY, NodesZ)`` arrays (world mm lists).
 
-    These are the per-axis grid node coordinates spanning the padded grid (PML
-    included), the geometric source of truth ``execute`` maintains. Empty lists
+    These are the per-axis grid node coordinates spanning the whole grid, which
+    is the domain box itself (the absorber's cells are its outermost ones) --
+    the geometric source of truth ``execute`` maintains. Empty lists
     when the domain has no sized geometry yet.
     """
     return (
@@ -894,6 +951,87 @@ def _ensure_snap_props(obj):
             obj.setEditorMode(name, 2)  # hidden
 
 
+def shell_geometry_warnings(sim, domain):
+    """Bodies that lie in an absorber shell without running through it.
+
+    The PML is carved out of the inside of the domain box, so a body reaches it
+    as soon as that face's background spacing is under ``PMLThickness`` cells --
+    and the per-face spacing defaults to zero, which is exactly the case that
+    hands a whole model to the absorber without being asked for. Carrying
+    geometry into the PML is a *feature* (that is how a trace or a substrate is
+    taken to infinity instead of ending at a wall), so this cannot be an error;
+    but a body that **stops, bends or changes section inside the shell** reflects
+    off its own discontinuity, and the reflection reads as a mediocre absorber
+    rather than as a modelling mistake. So it is said out loud, live, in the
+    Domain panel where the spacing that causes it is typed.
+
+    This is the cheap bounding-box reading -- a body whose bbox does not span the
+    whole shell along that face's own axis. It runs on every keystroke, so it
+    cannot voxelise; the exact one, over the material mask the run will use, is
+    :func:`wavesim_gui.voxelize.pml_shell_warnings` at job build. A body that
+    passes here and fails there is one whose *section* varies through the shell,
+    which no bounding box can see.
+
+    Returns a list of message strings, one per offending face.
+    """
+    from wavesim_gui import materials as materials_mod
+
+    if domain is None or sim is None:
+        return []
+    params = domain_grid_params(
+        domain, force_pml_faces=pml_port_faces(sim),
+        modal_faces=modal_port_faces(sim))
+    pml_faces = set(params["pml_faces"])
+    if not pml_faces:
+        return []
+    nodes = node_coords_mm(domain)
+    if not all(len(a) >= 2 for a in nodes):
+        return []
+    bodies = []
+    for mat in materials_mod.find_materials(sim):
+        for body in getattr(mat, "Bodies", []) or []:
+            shape = getattr(body, "Shape", None)
+            if shape is not None and not shape.isNull():
+                bodies.append((str(body.Label or body.Name), shape.BoundBox))
+    if not bodies:
+        return []
+
+    tol = 1.0e-6
+    out = []
+    for axis, name in enumerate(("x", "y", "z")):
+        lo_attr, hi_attr = (("XMin", "XMax"), ("YMin", "YMax"),
+                            ("ZMin", "ZMax"))[axis]
+        for high in (False, True):
+            face = name + ("1" if high else "0")
+            depth = (params["pad_hi"] if high else params["pad_lo"])[axis]
+            if face not in pml_faces or depth <= 0:
+                continue
+            coords = nodes[axis]
+            if high:
+                shell_lo, shell_hi = coords[-1 - depth], coords[-1]
+            else:
+                shell_lo, shell_hi = coords[0], coords[depth]
+            caught = []
+            for label, bb in bodies:
+                b_lo, b_hi = getattr(bb, lo_attr), getattr(bb, hi_attr)
+                if b_hi <= shell_lo + tol or b_lo >= shell_hi - tol:
+                    continue                      # clear of this shell
+                if b_lo <= shell_lo + tol and b_hi >= shell_hi - tol:
+                    continue                      # runs right through it
+                caught.append(label)
+            if caught:
+                out.append(
+                    "{} ends inside the {} absorber ({:.4g} to {:.4g} mm). A PML "
+                    "terminates what runs straight out through it; a body that "
+                    "stops or changes section in there reflects. Carry it out to "
+                    "the face, or raise that face's background spacing past "
+                    "{:g} mm.".format(
+                        ", ".join(sorted(set(caught))), face, shell_lo, shell_hi,
+                        abs(shell_hi - shell_lo))
+                )
+    return out
+
+
 def electrostatic_boundary(domain):
     """The solver's ``boundary`` dict for an electrostatic solve on *domain*.
 
@@ -922,6 +1060,13 @@ def domain_grid_params(domain, force_pml_faces=(), modal_faces=()):
     place the per-face properties are interpreted, so the drawn boxes, the
     voxelised grid and the runner all agree.
 
+    ``pad_lo``/``pad_hi`` count cells the absorber takes **out of the inside** of
+    each face -- they do not extend the grid. The domain box is the material
+    bounds plus the background spacing, full stop; how much of it the PML eats is
+    ``d_pml`` cells, and the background spacing is what buys clearance between
+    the geometry and the absorber (a face whose spacing is 0 hands its geometry
+    straight to the PML, deliberately).
+
     *force_pml_faces* names faces (``'x0'``..``'z1'``) that must be PML no matter
     what the per-face property says -- Gaussian beams and SPICE-TEM ports pass
     their launch faces (:func:`pml_port_faces`) so a face left (or set) to PEC
@@ -930,7 +1075,7 @@ def domain_grid_params(domain, force_pml_faces=(), modal_faces=()):
 
     *modal_faces* names faces terminated by a **Modal Port**
     (:func:`modal_port_faces`). The port *is* the boundary, so such a face gets
-    **no PML padding, no PEC wall and no background spacing**: it appears in
+    **no PML shell, no PEC wall and no background spacing**: it appears in
     neither ``pml_faces`` nor ``pec_faces``, contributes zero to ``pad_*``, and
     its gap is zeroed so the domain face lands exactly on the geometry the port
     plane must cut. *modal_faces* wins over *force_pml_faces* for a face named by
@@ -994,11 +1139,13 @@ def face_is_high(face):
 def face_world_coord_mm(domain, face):
     """World-mm coordinate of the *face* plane along its normal axis.
 
-    Uses the inner domain box corners (``DomainMin``/``DomainMax``), which exclude
-    the PML padding: a beam / SPICE-TEM port on a forced-PML face therefore sits at
-    the absorbing region's inner edge, and a modal port -- whose face carries no
-    padding and no background gap (:func:`domain_grid_params`) -- sits exactly on
-    the grid boundary, where the geometry it must cut ends.
+    The domain box corners (``DomainMin``/``DomainMax``) *are* the grid bounds --
+    the absorber is carved out of the inside -- so this is the wall itself. A
+    modal port sits exactly here, with no background gap
+    (:func:`domain_grid_params`), where the geometry it must cut ends. A beam /
+    SPICE-TEM port names this face too, but its sheet is placed a full PML depth
+    in by the runner (``_interior_position`` / ``sources.GaussianBeam``), which
+    puts it on the absorber's inner edge -- i.e. on ``PmlMin``/``PmlMax``.
     """
     v = domain.DomainMax if face_is_high(face) else domain.DomainMin
     return {"x": v.x, "y": v.y, "z": v.z}[face_axis(face)]
@@ -1154,6 +1301,23 @@ if _GUI_AVAILABLE:
             gsep.addChild(self._grid_lines)
             root.addChild(gsep)
 
+            # The absorber's own share of those same planes, in the PML box's
+            # colour. Its own node set for the same reason the snapped subset
+            # has one: Coin carries one colour per set, and ``_grid_segments``
+            # hands every segment to exactly one of the three.
+            self._pmlgrid_color = coin.SoBaseColor()
+            self._pmlgrid_color.rgb.setValue(*_PML_GRID_COLOR)
+            pgstyle = coin.SoDrawStyle()
+            pgstyle.lineWidth = 1
+            self._pmlgrid_coords = coin.SoCoordinate3()
+            self._pmlgrid_lines = coin.SoIndexedLineSet()
+            pgsep = coin.SoSeparator()
+            pgsep.addChild(self._pmlgrid_color)
+            pgsep.addChild(pgstyle)
+            pgsep.addChild(self._pmlgrid_coords)
+            pgsep.addChild(self._pmlgrid_lines)
+            root.addChild(pgsep)
+
             # The snapped subset, over the top of the thin grid: same planes,
             # own colour and width. A separate node set rather than a per-line
             # style because Coin has no per-segment line width, and drawing them
@@ -1203,11 +1367,11 @@ if _GUI_AVAILABLE:
                        obj.PmlMin, obj.PmlMax)
 
         def _grid_segments(self, mn, mx, nodes_x, nodes_y, nodes_z,
-                           snaps=None, plane=None):
+                           snaps=None, plane=None, interior=None):
             """Line segments for the three orthogonal cell grids.
 
-            Returns ``(thin, bold)``, each an ``(points, indices)`` pair for an
-            ``SoIndexedLineSet``: an XY grid at ``z = plane[2]``, a YZ grid at
+            Returns ``(thin, bold, pml)``, each an ``(points, indices)`` pair for
+            an ``SoIndexedLineSet``: an XY grid at ``z = plane[2]``, a YZ grid at
             ``x = plane[0]`` and an XZ grid at ``y = plane[1]`` -- the Domain's
             ``GridPlaneX/Y/Z``, already clamped into the box by
             :func:`grid_plane_positions_mm`, so a plane can be walked through the
@@ -1224,11 +1388,35 @@ if _GUI_AVAILABLE:
             cannot z-fight. Line counts per axis are clamped to
             :data:`_MAX_GRID_LINES` / :data:`_MAX_SNAP_LINES` by decimating --
             separately, so thinning a fine grid never drops a feature line.
+
+            *interior* is the ``(PmlMin, PmlMax)`` pair bounding the absorber-free
+            region (``None`` when the domain has no PML). The absorber lies
+            *inside* the box, so a thin line is cut where it crosses that
+            boundary and the parts outside go to the *pml* set in
+            :data:`_PML_GRID_COLOR`: the mesh reads as two regions rather than
+            one, which is the whole point of drawing it there. A cell is in the
+            absorber if **any** of its coordinates is past the interior on that
+            coordinate's own axis, so a line whose fixed coordinate is already in
+            a shell is absorber over its whole length -- that is what fills in
+            the corners where two PMLs overlap. Bold snapped lines are never
+            split: the snapper puts no forced line in the shell (the CPML needs a
+            constant width there), so a bold line only ever *crosses* one, and
+            cutting it would hide the feature it marks.
             """
             px, py, pz = plane if plane is not None else (mn.x, mn.y, mn.z)
             snaps = snaps if snaps is not None else ([], [], [])
             thin_pts, thin_idx = [], []
             bold_pts, bold_idx = [], []
+            pml_pts, pml_idx = [], []
+            # Per-axis interior interval; ``None`` on an axis (or altogether)
+            # where nothing is absorbed, which makes every test below a no-op.
+            if interior is None:
+                bounds = (None, None, None)
+            else:
+                ilo, ihi = interior
+                bounds = tuple(
+                    (getattr(ilo, a), getattr(ihi, a)) for a in ("x", "y", "z")
+                )
 
             def adder(pts, idx):
                 def add_line(p0, p1):
@@ -1240,6 +1428,42 @@ if _GUI_AVAILABLE:
 
             add_thin = adder(thin_pts, thin_idx)
             add_bold = adder(bold_pts, bold_idx)
+            add_pml = adder(pml_pts, pml_idx)
+
+            tol = 1e-9
+
+            def in_shell(axis, v):
+                """Is coordinate *v* inside the absorber on this *axis*?"""
+                b = bounds[axis]
+                return b is not None and (v < b[0] - tol or v > b[1] + tol)
+
+            def add_split(p0, p1, axis):
+                """Draw one grid line, cut at the absorber boundary it crosses.
+
+                *axis* is the index of the coordinate that varies along the line;
+                the other two are fixed, and either of them landing in its own
+                shell paints the whole line as absorber.
+                """
+                if any(in_shell(a, p0[a]) for a in range(3) if a != axis):
+                    add_pml(p0, p1)
+                    return
+                b = bounds[axis]
+                v0, v1 = p0[axis], p1[axis]
+                if b is None or (v0 >= b[0] - tol and v1 <= b[1] + tol):
+                    add_thin(p0, p1)
+                    return
+
+                def at(v):
+                    q = list(p0)
+                    q[axis] = v
+                    return tuple(q)
+
+                for lo_v, hi_v, add in ((v0, min(max(b[0], v0), v1), add_pml),
+                                        (min(max(b[0], v0), v1),
+                                         max(min(b[1], v1), v0), add_thin),
+                                        (max(min(b[1], v1), v0), v1, add_pml)):
+                    if hi_v - lo_v > tol:
+                        add(at(lo_v), at(hi_v))
 
             def decimate(vals, cap):
                 if len(vals) <= cap:
@@ -1278,24 +1502,27 @@ if _GUI_AVAILABLE:
             ys, bys = ticks(mn.y, mx.y, nodes_y, snaps[1])
             zs, bzs = ticks(mn.z, mx.z, nodes_z, snaps[2])
 
-            for add, (ax, ay, az) in ((add_thin, (xs, ys, zs)),
-                                      (add_bold, (bxs, bys, bzs))):
-                # XY grid at z = pz
-                for x in ax:
-                    add((x, mn.y, pz), (x, mx.y, pz))
+            # (varying axis, endpoint pair) for every line of the three planes.
+            def lines(ax, ay, az):
+                for x in ax:                       # XY grid at z = pz
+                    yield 1, (x, mn.y, pz), (x, mx.y, pz)
                 for y in ay:
-                    add((mn.x, y, pz), (mx.x, y, pz))
-                # YZ grid at x = px
-                for y in ay:
-                    add((px, y, mn.z), (px, y, mx.z))
+                    yield 0, (mn.x, y, pz), (mx.x, y, pz)
+                for y in ay:                       # YZ grid at x = px
+                    yield 2, (px, y, mn.z), (px, y, mx.z)
                 for z in az:
-                    add((px, mn.y, z), (px, mx.y, z))
-                # XZ grid at y = py
-                for x in ax:
-                    add((x, py, mn.z), (x, py, mx.z))
+                    yield 1, (px, mn.y, z), (px, mx.y, z)
+                for x in ax:                       # XZ grid at y = py
+                    yield 2, (x, py, mn.z), (x, py, mx.z)
                 for z in az:
-                    add((mn.x, py, z), (mx.x, py, z))
-            return (thin_pts, thin_idx), (bold_pts, bold_idx)
+                    yield 0, (mn.x, py, z), (mx.x, py, z)
+
+            for axis, p0, p1 in lines(xs, ys, zs):
+                add_split(p0, p1, axis)
+            for _axis, p0, p1 in lines(bxs, bys, bzs):
+                add_bold(p0, p1)
+            return ((thin_pts, thin_idx), (bold_pts, bold_idx),
+                    (pml_pts, pml_idx))
 
         def _rebuild_grid(self):
             obj = getattr(self, "Object", None)
@@ -1303,7 +1530,8 @@ if _GUI_AVAILABLE:
                 return          # not attached yet; attach() rebuilds at the end
             mn, mx = obj.DomainMin, obj.DomainMax
             pairs = ((self._grid_coords, self._grid_lines),
-                     (self._snap_coords, self._snap_lines))
+                     (self._snap_coords, self._snap_lines),
+                     (self._pmlgrid_coords, self._pmlgrid_lines))
             if (mn - mx).Length < 1.0e-9:
                 for coords, lines in pairs:
                     if lines.coordIndex.getNum():
@@ -1327,9 +1555,14 @@ if _GUI_AVAILABLE:
                            for i in range(int((mx.z - mn.z) / max(float(obj.Dz.Value), 1e-9)) + 1)]
             snaps = tuple(list(getattr(obj, name, []) or [])
                           for name in _SNAP_PROPS)
+            # The absorber-free interior, or None when nothing absorbs (the
+            # PML box collapses to a point when no face carries a PML).
+            pml_min, pml_max = obj.PmlMin, obj.PmlMax
+            interior = (None if (pml_max - pml_min).Length < 1.0e-9
+                        else (pml_min, pml_max))
             sets = self._grid_segments(
                 mn, mx, nodes_x, nodes_y, nodes_z, snaps=snaps,
-                plane=grid_plane_positions_mm(obj),
+                plane=grid_plane_positions_mm(obj), interior=interior,
             )
             for (coords, lines), (pts, idx) in zip(pairs, sets):
                 coords.point.setValues(0, len(pts), pts)
@@ -1342,7 +1575,8 @@ if _GUI_AVAILABLE:
         def updateData(self, obj, prop):
             if prop in ("DomainMin", "DomainMax", "PmlMin", "PmlMax"):
                 self._rebuild()
-            if prop in ("DomainMin", "DomainMax", "Dx", "Dy", "Dz",
+            if prop in ("DomainMin", "DomainMax", "PmlMin", "PmlMax",
+                        "Dx", "Dy", "Dz",
                         "NodesX", "NodesY", "NodesZ",
                         "SnapsX", "SnapsY", "SnapsZ",
                         "GridPlaneX", "GridPlaneY", "GridPlaneZ"):
@@ -1466,6 +1700,20 @@ if _GUI_AVAILABLE:
 
             self._counts = QtWidgets.QLabel(self._counts_text())
 
+            # Live "your geometry is in the absorber" notice. The per-face
+            # spacing defaults to zero and the PML is taken out of the inside of
+            # the box, so the default puts a model in the absorber -- which is a
+            # supported thing to want (a body carried out through a face runs to
+            # infinity instead of ending at a wall) and a silent disaster when it
+            # is not. It sits right under the spacing boxes that cause it,
+            # refreshed by every live-apply, and the 3D view says the same thing
+            # in the other language: the grid lines inside the shell are drawn in
+            # the PML box's colour, so which part of the model is buried is
+            # visible rather than inferred.
+            self._shell = QtWidgets.QLabel("")
+            self._shell.setWordWrap(True)
+            self._shell.setStyleSheet("color: #c0392b;")
+
             # Per-face background spacing, built like the per-face BCs below: a
             # "same on all faces" checkbox drives every face from the first
             # (X min) box and greys the rest out. The migration is re-run here so
@@ -1535,6 +1783,8 @@ if _GUI_AVAILABLE:
             layout.addRow("Min cell size:", self._min_cell)
             layout.addRow("Refine at curved surfaces:", self._curvature)
             layout.addRow("Cell counts:", self._counts)
+            layout.addRow(self._shell)
+            self._refresh_shell()
             # Per-face background spacing. Headed, because the six face rows here
             # and the six boundary-condition rows below carry the same labels.
             layout.addRow(QtWidgets.QLabel("<b>Background spacing</b>"))
@@ -1611,14 +1861,16 @@ if _GUI_AVAILABLE:
                 "material). A Ground face holds phi = 0, which makes the box the "
                 "reference conductor every capacitance to ground is measured "
                 "against; a Symmetry face lets no field cross it, which is what "
-                "halves a mirror-symmetric model. The PML thickness still pads "
-                "the grid, as plain background: an absorber corrects terms "
-                "inside a curl and a static field has none, so those cells only "
-                "give the field room."
+                "halves a mirror-symmetric model. The PML thickness costs an "
+                "electrostatic run nothing: it takes no cells of its own (the "
+                "absorber lies inside the box) and an absorber corrects terms "
+                "inside a curl, which a static field has none of."
                 if self._es else
                 "The domain box auto-sizes to the assigned geometry plus the "
                 "per-face background spacing (filled with the background "
-                "material). PML faces absorb outgoing waves and enlarge the grid; "
+                "material). PML faces absorb outgoing waves in the outermost "
+                "cells *of* the box, so the box is the whole grid and a body "
+                "run out to a face (spacing 0) is carried into the absorber; "
                 "PEC faces are perfectly-conducting walls. A face carrying a "
                 "Modal Port reads '{}': the port is the boundary — it launches "
                 "the mode and absorbs what comes back, exactly and at DC too, so "
@@ -1866,6 +2118,22 @@ if _GUI_AVAILABLE:
             self._write_to_obj()
             self.obj.Document.recompute()
             self._counts.setText(self._counts_text())
+            self._refresh_shell()
+
+        def _refresh_shell(self):
+            """Update the absorber notice from the geometry as it now stands."""
+            from wavesim_gui.commands import active_simulation
+
+            try:
+                sim = active_simulation(self.obj.Document)
+                messages = shell_geometry_warnings(sim, self.obj)
+            except Exception:
+                messages = []      # a notice must never break the panel
+            if messages:
+                self._shell.setText("In the PML: " + " ".join(messages))
+            else:
+                self._shell.setText("")
+            self._shell.setVisible(bool(messages))
 
         def _default_cell_size_mm(self):
             """Cubic cell size (mm) from the max frequency, or None if it's unset.

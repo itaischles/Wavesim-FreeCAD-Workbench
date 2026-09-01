@@ -30,7 +30,7 @@ Two consequences shape this module:
   three are applied by ``domain.domain_grid_params`` via
   ``domain.modal_port_faces``, and the Domain panel shows such a face as a locked
   "Modal port" entry. (This is what the older matched-Thevenin TEM port could not
-  do: it was a lumped drive on an *interior* plane and still needed a PML pad
+  do: it was a lumped drive on an *interior* plane and still needed a PML shell
   behind it.)
 * **No mode-mesh refinement.** The port's profile ``ê`` is built by the solver as
   a forward difference of φ landed on the Yee edges, which makes it an exact null
@@ -848,12 +848,15 @@ def _solve_region_rect_mm(dom, face, bounds_sel):
     """The in-plane rect the mode solve grounds the edge of (world mm), or None.
 
     ``mode_solver`` pins φ=0 on the edge of the region it solves, which is the
-    ``bounds`` sub-rect when one is given and otherwise **the whole grid plane --
-    PML padding included**, not the inner domain box. The distinction decides
-    whether an outer shield is the grounded reference or a signal conductor with
-    a mode of its own: with an absorber on the transverse faces the shield stops
-    short of the grid edge and the solver gives it a mode. Reading the Domain's
-    padded node arrays is what keeps this panel's answer the solver's answer.
+    ``bounds`` sub-rect when one is given and otherwise **the whole grid plane**,
+    absorber cells included -- read off the node arrays rather than assumed, which
+    is what keeps this panel's answer the solver's answer. Whether an outer shield
+    is the grounded reference or a signal conductor with a mode of its own is
+    decided by whether it actually reaches that edge: a shield stopping short of
+    the wall (a transverse background gap) gets a mode of its own, one running out
+    to it is the reference. Since the absorber now lies *inside* the box, a shield
+    carried out to the wall reaches the grid edge and grounds the solve -- where
+    before the transverse pads always held it short.
     """
     rect = _bounds_rect_mm(dom, face, bounds_sel)
     if rect is not None:
@@ -1108,7 +1111,7 @@ def modal_port_spec(obj, origin_m):
     The port plane sits on the chosen domain face; its position along the face
     normal is taken from the domain box and shifted into the solver frame (the
     domain origin is subtracted, mirroring :func:`source.source_spec`). Because a
-    modal-port face carries no PML pad and no background gap
+    modal-port face carries no PML shell and no background gap
     (``domain.domain_grid_params``), that plane lands on the grid boundary, where
     the geometry it must cut ends; the runner then nudges it the one cell inward
     the solver's ghost-H stencil needs (``runner._interior_position``).
@@ -2128,7 +2131,7 @@ if _GUI_AVAILABLE:
 
             Returns after committing + recomputing; the domain is re-synced so it
             re-sizes to the (possibly changed) port plane -- which for a modal port
-            also drops that face's PML pad and background gap. Shared by Accept and
+            also drops that face's PML shell and background gap. Shared by Accept and
             Compute Mode so both see exactly the same persisted state.
             """
             doc = self.obj.Document

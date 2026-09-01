@@ -74,6 +74,10 @@ from wavesim_gui import materials as mat_mod                   # noqa: E402
 FMAX_HZ = 5.0e9          # -> a 1 mm background cell, the grid these were sized on
 COARSE = 1.0
 
+# Background gap clearing the 8-cell absorber shell, so the snapper is free
+# over every body (it forces no line inside the PML).
+_CLEARANCE_MM = 12.0
+
 _report = []
 _failures = []
 
@@ -191,6 +195,13 @@ def meshes(build_bodies):
         _vacuum, pec = mat_mod.create_default_materials(doc, sim)
         pec.Bodies = build_bodies(doc)
         sim.MaxFrequency = FMAX_HZ
+        # Clear the absorber: it is taken out of the inside of the domain box
+        # and hosts no forced line (the CPML needs a constant-width shell), so
+        # a body inside it is not snapped at all. This gate is about which
+        # centre lines the *fill* takes, so every body has to sit in the
+        # interior -- a gap wider than PMLThickness cells is what puts it there.
+        for _face, prop, _pdoc in domain_mod._SPACING_PROPS:
+            setattr(dom, prop, "%g mm" % _CLEARANCE_MM)
         doc.recompute()
         original = gb._is_full_circle
         gb._is_full_circle = lambda face: False   # propose nothing

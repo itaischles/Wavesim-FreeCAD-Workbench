@@ -273,16 +273,22 @@ def find_gaussian_beams(sim):
 def face_half_widths_mm(obj):
     """Return the launch face's two interior transverse half-widths (mm).
 
-    Taken from the domain's *interior* box (``DomainMin``/``DomainMax``, which
-    excludes the PML padding), in the face's (â, b̂) axis order. ``(None, None)``
-    when there is no sized domain yet.
+    Taken from the domain's *interior* box -- ``PmlMin``/``PmlMax``, the region
+    the absorber leaves, since the PML lies inside the domain box and the solver
+    hard-zeroes the sheet over the transverse absorber slabs. In the face's
+    (â, b̂) axis order. Falls back to the full box on a domain with no PML at
+    all (nothing is zeroed there); ``(None, None)`` when there is no sized
+    domain yet.
     """
     doc = getattr(obj, "Document", None)
     sim = active_simulation(doc) if doc is not None else None
     dom = domain_mod.find_domain(sim) if sim else None
     if dom is None or (dom.DomainMax - dom.DomainMin).Length <= 1.0e-9:
         return None, None
-    extent = {ax: abs(getattr(dom.DomainMax, ax) - getattr(dom.DomainMin, ax))
+    lo, hi = dom.PmlMin, dom.PmlMax
+    if (hi - lo).Length <= 1.0e-9:
+        lo, hi = dom.DomainMin, dom.DomainMax
+    extent = {ax: abs(getattr(hi, ax) - getattr(lo, ax))
               for ax in ("x", "y", "z")}
     a_ax, b_ax = _FACE_AXES[str(getattr(obj, "Face", "z0"))]
     return 0.5 * extent[a_ax], 0.5 * extent[b_ax]

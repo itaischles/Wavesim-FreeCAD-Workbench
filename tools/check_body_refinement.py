@@ -52,6 +52,11 @@ from wavesim_gui import materials as mat_mod                   # noqa: E402
 from wavesim_gui import refine as refine_mod                   # noqa: E402
 
 FMAX_HZ = 5.0e9          # -> a 1 mm background cell, as in check_circle_centres
+
+# Background gap that clears the absorber shell (PMLThickness 8 cells of the
+# 1 mm background target): the snapper forces no line inside the PML, so a body
+# must sit clear of it for a refinement request to mean anything.
+_CLEARANCE_MM = 10.0
 COARSE = 1.0
 
 _report = []
@@ -103,6 +108,14 @@ class Model(object):
         self.slab.Bodies = [self.diel]
 
         sim.MaxFrequency = FMAX_HZ
+        # Clear the absorber. The PML is taken out of the *inside* of the
+        # domain box, and no grid line may be forced within it (the CPML needs
+        # a constant-width shell), so a body sitting in the shell cannot be
+        # refined at all -- correct, and not what this gate is measuring. A gap
+        # wider than PMLThickness cells puts every body in the interior, where
+        # the snapper is free.
+        for _face, prop, _doc in domain_mod._SPACING_PROPS:
+            setattr(self.dom, prop, "%g mm" % _CLEARANCE_MM)
         self.doc.recompute()
 
     def close(self):

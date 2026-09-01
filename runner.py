@@ -168,8 +168,10 @@ job.json schema (Session 2)
       "monitors": {
         "energy": {"full": false, "interior": true},
                       # one whole-domain energy monitor per true region:
-                      # "full" sums the entire grid, "interior" only the physical
-                      # domain (PML cells dropped). Both false records no energy;
+                      # "full" sums the entire grid, "interior" the grid less
+                      # its absorber cells (which lie inside the domain box, so
+                      # 'interior' can drop geometry the user meant to carry
+                      # into the PML). Both false records no energy;
                       # a legacy bool true == {"full": true}
         "dissipation": {"full": false, "interior": true},
                       # ohmic power P = sum(sigma*|E|^2*dV), same regions and the
@@ -232,9 +234,12 @@ than the grid per in-plane axis; the edge arrays stay node coordinates and so
 remain one entry longer than the frame (pcolormesh's convention). H frames are
 additionally averaged across the half timestep onto the E timebase, so an E and
 an H snapshot sharing a ``times`` entry are simultaneous -- what a Poynting
-vector needs. The saved frames and edges are **cropped to the domain
-interior** -- the PML padding cells on both in-plane axes are stripped so the
-animation/export shows only the physical region. Each TEM mode stores its two
+vector needs. The saved frames and edges are the **whole grid**: the PML lies
+inside the domain box, so cropping it would hide the part of a body that was
+deliberately carried out through the absorber. The summary instead carries
+``interior0``/``interior1`` per snapshot -- the absorber-free span of each
+in-plane axis in the edges' own frame, or null where that axis absorbs on
+neither face -- and the results plot shades the rest. Each TEM mode stores its two
 transverse sample-coordinate arrays (``mode_<si>_<mi>_ca`` / ``_cb``), so the
 workbench draws them on the real grid (uniform or non-uniform) instead of
 assuming a constant cell size. Those are **node** coordinates, one per saved
@@ -1261,14 +1266,6 @@ def _run_electrostatic(ws, np, grid, job, workdir, voxel_summary):
     # stack of exactly one frame: the results window already knows how to draw a
     # plane with a component selector and an in-plane quiver, and a static
     # solution is that with the time axis removed rather than a different thing.
-    boundary_cfg = job.get("boundary") or {}
-    d_pml = int(boundary_cfg.get("d_pml", 0))
-    pml_set = set(boundary_cfg.get("faces") or ())
-
-    def _pad(axis):
-        return (d_pml if (axis + "0") in pml_set else 0,
-                d_pml if (axis + "1") in pml_set else 0)
-
     snapshot_meta = []
     for idx, spec in enumerate(cfg.get("slices") or []):
         normal = str(spec.get("normal", "z"))
@@ -1286,24 +1283,16 @@ def _run_electrostatic(ws, np, grid, job, workdir, voxel_summary):
         edges1 = _node_dual_edges(np, _axis_nodes(grid, ax1),
                                   _axis_centers(grid, ax1),
                                   shape[_NORMAL_AXIS[ax1]])
-        # Strip the absorber padding, as the time-domain path does: those cells
-        # are plain background here, but they are still outside the box the user
-        # drew, and showing them would put the grounded wall in the wrong place.
-        (lo0, hi0), (lo1, hi1) = _pad(ax0), _pad(ax1)
-        n0, n1 = shape[_NORMAL_AXIS[ax0]], shape[_NORMAL_AXIS[ax1]]
-        stop0, stop1 = n0 - hi0, n1 - hi1
-        crop = stop0 > lo0 and stop1 > lo1
+        # Nothing is cropped: the absorber lies *inside* the box the user drew
+        # (and holds plain background in a static solve, since a PML corrects
+        # terms inside a curl and a static field has none of one), so every cell
+        # here is a cell of the domain and the grounded wall is where it draws.
         saved = []
         for comp, arr in zip(comps, fields):
             plane = np.take(np.asarray(arr, dtype=np.float64), k, axis=n_axis)
-            if crop:
-                plane = plane[lo0:stop0, lo1:stop1]
-            result_arrays["snapshot_{}_{}_data".format(idx, comp)] = \
-                plane[np.newaxis, ...]
+            result_arrays["snapshot_{}_{}_data".format(idx, comp)] = (
+                plane[np.newaxis, ...])
             saved.append(comp)
-        if crop:
-            edges0 = edges0[lo0:stop0 + 1]
-            edges1 = edges1[lo1:stop1 + 1]
         result_arrays["snapshot_{}_times".format(idx)] = np.zeros(1)
         result_arrays["snapshot_{}_edges0".format(idx)] = edges0
         result_arrays["snapshot_{}_edges1".format(idx)] = edges1
@@ -1835,7 +1824,7 @@ def run_job(workdir):
     mon_cfg = job.get("monitors", {})
 
     # Energy: one solver monitor per requested region -- 'full' sums the entire
-    # grid, 'interior' only the physical domain, with the PML cells dropped. The
+    # grid, 'interior' the grid less its absorber cells. The
     # solver takes the PML geometry off the CPML this run is built with, so the
     # interior monitor needs nothing from us but the region name.
     energy = [(region, ws.EnergyMonitor(region=region))
@@ -1992,15 +1981,32 @@ def run_job(workdir):
     pml_set = set(pml_faces)
 
     def _interior_pad(axis):
-        """PML cell counts (lo, hi) to strip off *axis* ('x'/'y'/'z')."""
+        """Absorber cell counts (lo, hi) at the two faces of *axis*."""
         return (
             d_pml if (axis + "0") in pml_set else 0,
             d_pml if (axis + "1") in pml_set else 0,
         )
 
+    def _interior_span(edges, axis):
+        """The absorber-free coordinate span of *axis*, in the *edges* frame.
+
+        The PML lies **inside** the domain box, so a snapshot is saved whole --
+        cropping it would hide exactly the geometry a body was carried out
+        through the absorber to model, which is what carrying it there was for.
+        Instead the interior's two coordinates ride along in the summary and the
+        results plot shades the rest, so the picture says where the absorber is
+        rather than pretending the domain stops at it. ``None`` on an axis that
+        absorbs on neither face.
+        """
+        lo, hi = _interior_pad(axis)
+        if not lo and not hi:
+            return None
+        return [float(edges[lo]), float(edges[len(edges) - 1 - hi])]
+
     snapshot_meta = []
     for idx, (name, field, mons) in enumerate(snapshots):
         saved = []
+        interior = (None, None)
         for comp, mon in mons:
             if not mon.snapshots:
                 continue
@@ -2008,27 +2014,12 @@ def run_job(workdir):
             ax0, ax1 = _INPLANE_AXES.get(getattr(mon, "normal", "z"), ("x", "y"))
             edges0 = np.asarray(_axis_nodes(grid, ax0), dtype=np.float64)
             edges1 = np.asarray(_axis_nodes(grid, ax1), dtype=np.float64)
-            # Crop the PML padding off both in-plane axes so the saved frames (and
-            # the animation/export built from them) show only the domain interior.
-            #
             # The frames are collocated to cell centres by the solver's
-            # SnapshotMonitor and are therefore already one cell short per
-            # in-plane axis (cells 0..N-2). So the window is expressed in *grid*
-            # cells -- keep cells [lo, N-hi) -- and clamped to what the frame
-            # actually carries. Deriving the high edge from ``data.shape``
-            # instead would silently eat one extra interior cell per PML face,
-            # since collocation has already consumed the last one.
-            (lo0, hi0), (lo1, hi1) = _interior_pad(ax0), _interior_pad(ax1)
-            n0, n1 = data.shape[1], data.shape[2]
-            stop0 = min(len(edges0) - 1 - hi0, n0)
-            stop1 = min(len(edges1) - 1 - hi1, n1)
-            if stop0 > lo0 and stop1 > lo1:
-                data = data[:, lo0:stop0, lo1:stop1]
-                # Cell-centred values still sit inside their original cells, so
-                # the node array remains the correct pcolormesh edge array --
-                # one entry longer than the frame.
-                edges0 = edges0[lo0:stop0 + 1]
-                edges1 = edges1[lo1:stop1 + 1]
+            # SnapshotMonitor and are therefore one cell short per in-plane axis
+            # (cells 0..N-2); the node array is the pcolormesh edge array for
+            # them, trimmed to match.
+            edges0 = edges0[:data.shape[1] + 1]
+            edges1 = edges1[:data.shape[2] + 1]
             result_arrays["snapshot_{}_{}_data".format(idx, comp)] = data
             if not saved:
                 # Same plane and cadence for every component: save once.
@@ -2036,6 +2027,8 @@ def run_job(workdir):
                     np.asarray(mon.snap_times)
                 result_arrays["snapshot_{}_edges0".format(idx)] = edges0
                 result_arrays["snapshot_{}_edges1".format(idx)] = edges1
+                interior = (_interior_span(edges0, ax0),
+                            _interior_span(edges1, ax1))
             saved.append(comp)
         # The two components lying *in* the slice plane, in array-index order —
         # the in-plane vector the results plot draws as a quiver overlay. Named
@@ -2046,6 +2039,9 @@ def run_job(workdir):
             "name": name, "field": field, "components": saved,
             "inplane": [field + pax0, field + pax1],
             "frames": len(mons[0][1].snapshots) if mons else 0,
+            # Absorber-free span per in-plane axis, in the saved edges' own
+            # frame (metres); null where that axis absorbs on neither face.
+            "interior0": interior[0], "interior1": interior[1],
         })
 
     # Voltage/current line integrals: one time series each, keyed by index.

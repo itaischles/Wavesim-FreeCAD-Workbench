@@ -393,6 +393,12 @@ def _snapshot_extent(sim, name):
     return None
 
 
+# The dashed line marking where the absorber starts on a snapshot map, and the
+# colour it is drawn in: a muted warm grey that reads on both the diverging and
+# the one-sided colour map without being mistaken for a material outline (those
+# are each drawn in their own material's colour).
+_PML_EDGE_COLOR = (0.55, 0.42, 0.32)
+
 # Sagitta tolerance for discretising a curved section edge, as a fraction of
 # the snapshot's drawn extent. See :func:`_geometry_outlines`.
 #
@@ -450,10 +456,10 @@ def _geometry_outlines(obj, deflection_mm):
     x0, y0 = getattr(obj, "XWorld", None), getattr(obj, "YWorld", None)
     if x0 is None or y0 is None:
         # A leaf built before the world frame was stored. The runner crops
-        # exactly the PML pad, so the drawn region is the domain interior and
-        # its low corner is the Domain's own DomainMin -- right unless the
-        # domain has been resized since the run, in which case a stored value
-        # would be stale too.
+        # nothing (the absorber lies inside the box), so the drawn region is
+        # the domain box and its low corner is the Domain's own DomainMin --
+        # right unless the domain has been resized since the run, in which case
+        # a stored value would be stale too.
         dom = domain_mod.find_domain(sim)
         dmin = getattr(dom, "DomainMin", None) if dom is not None else None
         if dmin is None:
@@ -513,6 +519,37 @@ def _pec_rings(groups):
             for _rgb, polys, is_pec in groups if is_pec
             for poly in polys
             if len(poly) >= 4 and np.allclose(poly[0], poly[-1])]
+
+
+def _pml_frame(box, xin, yin):
+    """The absorber frame of one snapshot plane: ``(outer, interior)`` rectangles.
+
+    *box* is the drawn field's ``(x0, x1, y0, y1)`` and *xin*/*yin* are the
+    leaf's ``XInterior``/``YInterior`` -- the absorber-free span of each in-plane
+    axis, empty where that axis absorbs on neither face. Returns ``None`` when
+    there is nothing to frame: no absorber on either axis, or an interior the
+    two shells have closed over (which is a domain too thin to host its own
+    absorber, not a picture worth drawing).
+
+    Split out of the plot so the geometry can be checked without a figure: the
+    clamping is where this goes wrong, and it goes wrong invisibly -- an
+    inside-out rectangle fills nothing at all and reads as "no PML" rather than
+    as a bug.
+    """
+    if box is None:
+        return None
+    xin = [float(v) for v in (xin or [])]
+    yin = [float(v) for v in (yin or [])]
+    if len(xin) != 2 and len(yin) != 2:
+        return None
+    x0, x1, y0, y1 = (float(v) for v in box)
+    ix0, ix1 = (xin if len(xin) == 2 else [x0, x1])
+    iy0, iy1 = (yin if len(yin) == 2 else [y0, y1])
+    ix0, ix1 = max(ix0, x0), min(ix1, x1)
+    iy0, iy1 = max(iy0, y0), min(iy1, y1)
+    if ix1 - ix0 <= 0.0 or iy1 - iy0 <= 0.0:
+        return None
+    return (x0, x1, y0, y1), (ix0, ix1, iy0, iy1)
 
 
 def _filled_path(rings):
@@ -912,6 +949,15 @@ def build_results(doc, sim, workdir, summary):
                     # the plot can draw the CAD cross-section over it.
                     _store_snapshot_world(leaf, sim, extent[2], extent[3],
                                           npz[e0k][0], npz[e1k][0])
+                # Where the absorber starts on each in-plane axis. The frames
+                # span the whole grid (the PML sits inside the domain box, so
+                # cropping it would hide a body carried out through it), and
+                # this is what lets the plot say which part of the picture is
+                # absorber rather than leaving it to be read as domain.
+                _store_interior(leaf, "XInterior", meta.get("interior0"),
+                                npz[e0k][0])
+                _store_interior(leaf, "YInterior", meta.get("interior1"),
+                                npz[e1k][0])
 
         # Electrostatics: one leaf for the scalar results. Created whenever the
         # run was electrostatic, even with no capacitance matrix -- the applied
@@ -1219,6 +1265,26 @@ def _store_edges(leaf, prop, coords_m, relative=True, group="Snapshot"):
                          "Axis coordinates (mm)")
         leaf.setEditorMode(prop, 1)
     setattr(leaf, prop, mm)
+
+
+def _store_interior(leaf, prop, span_m, origin_m):
+    """Stash one in-plane axis's absorber-free span on a snapshot leaf (mm).
+
+    *span_m* is the runner's ``interior0``/``interior1`` -- the two coordinates
+    bounding the region the PML leaves, in the saved edges' frame -- or ``None``
+    where that axis absorbs on neither face. Stored the way the edges are:
+    millimetres relative to the first drawn edge (*origin_m*), so the plot can
+    use it against ``XEdges``/``YEdges`` without knowing the solver frame. An
+    axis with no absorber stores an empty list, which is what the plot reads as
+    "nothing to shade here".
+    """
+    vals = ([] if not span_m else
+            [(float(v) - float(origin_m)) * _MM_PER_M for v in span_m])
+    if not hasattr(leaf, prop):
+        leaf.addProperty("App::PropertyFloatList", prop, "Snapshot",
+                         "Absorber-free span of this axis (mm)")
+        leaf.setEditorMode(prop, 1)
+    setattr(leaf, prop, vals)
 
 
 def _store_mode_meta(leaf, meta):
@@ -3330,6 +3396,61 @@ if _GUI_AVAILABLE:
 
         pec_mask = _build_mask()
 
+        # --- absorber overlay ---------------------------------------------- #
+        # The PML lives *inside* the domain box, so the frames now run all the
+        # way to the wall and part of what they show is absorber: a region whose
+        # field is being deliberately destroyed, and which is worth nothing as a
+        # result. Blanking it is the same argument as blanking a conductor -- the
+        # numbers are there but they do not mean what the colour map says -- and
+        # it doubles as the picture of where the domain really ends, which no
+        # other overlay carries. The boundary is drawn either way, so lifting the
+        # mask to watch a wave decay into the absorber does not lose it.
+        #
+        # A body carried out through the absorber (a face with zero background
+        # spacing) still shows: the geometry outlines sit above the mask, so the
+        # structure reads as continuing to infinity while the field in there
+        # reads as what it is.
+        def _plot_bounds():
+            """(x0, x1, y0, y1) of the drawn field, in the axes' own units."""
+            if use_mesh:
+                return (float(xedges[0]), float(xedges[-1]),
+                        float(yedges[0]), float(yedges[-1]))
+            if extent is not None:
+                return tuple(float(v) for v in extent)
+            return None
+
+        def _build_pml():
+            """(mask patch, boundary rectangle) for the absorber, or None."""
+            from matplotlib.patches import PathPatch, Rectangle
+            from matplotlib.path import Path
+
+            frame = _pml_frame(_plot_bounds(),
+                               getattr(obj, "XInterior", []),
+                               getattr(obj, "YInterior", []))
+            if frame is None:
+                return None
+            (x0, x1, y0, y1), (ix0, ix1, iy0, iy1) = frame
+
+            def _ring(a0, a1, b0, b1, ccw):
+                pts = [(a0, b0), (a1, b0), (a1, b1), (a0, b1), (a0, b0)]
+                return pts if ccw else pts[::-1]
+
+            # Outer ring counter-clockwise, interior clockwise: the same
+            # winding trick ``_filled_path`` uses to punch a hole, so what is
+            # painted is exactly the frame between the two.
+            verts = _ring(x0, x1, y0, y1, True) + _ring(ix0, ix1, iy0, iy1, False)
+            codes = ([Path.MOVETO] + [Path.LINETO] * 3 + [Path.CLOSEPOLY]) * 2
+            patch = PathPatch(Path(verts, codes), facecolor=ax.get_facecolor(),
+                              edgecolor="none", zorder=1.9)
+            ax.add_artist(patch)
+            edge = Rectangle((ix0, iy0), ix1 - ix0, iy1 - iy0, fill=False,
+                             edgecolor=_PML_EDGE_COLOR, linewidth=1.0,
+                             linestyle="--", zorder=2.2)
+            ax.add_artist(edge)
+            return patch, edge
+
+        pml_overlay = _build_pml()
+
         # --- in-plane vector overlay -------------------------------------- #
         # The two components lying in the slice plane form a vector the colour
         # map cannot show (it is one scalar at a time), so they are drawn as
@@ -3552,6 +3673,19 @@ if _GUI_AVAILABLE:
                 "Turn it off to see what the run actually holds in there."
             )
             controls.addWidget(mask_check)
+        pml_check = None
+        if pml_overlay is not None:
+            pml_check = QtWidgets.QCheckBox("Mask PML")
+            pml_check.setChecked(True)
+            pml_check.setToolTip(
+                "Blank the absorbing layer. The PML sits inside the domain\n"
+                "box -- its outermost cells -- and the field there is being\n"
+                "destroyed on purpose, so it is a picture of the boundary\n"
+                "doing its job rather than a result.\n"
+                "The dashed line marks where it starts either way; turn\n"
+                "the mask off to watch a wave decay into it."
+            )
+            controls.addWidget(pml_check)
         geom_check = None
         if outlines:
             geom_check = QtWidgets.QCheckBox("Geometry")
@@ -3652,6 +3786,15 @@ if _GUI_AVAILABLE:
 
         if mask_check is not None:
             mask_check.toggled.connect(on_mask)
+
+        def on_pml_mask(checked):
+            # Only the blanking patch: the dashed boundary stays, since where
+            # the absorber begins is worth knowing in either view.
+            pml_overlay[0].set_visible(bool(checked))
+            dialog._canvas.draw_idle()
+
+        if pml_check is not None:
+            pml_check.toggled.connect(on_pml_mask)
 
         def on_geometry(checked):
             for art in outlines:

@@ -32,6 +32,7 @@ metres. ``Dx``/``Dy``/``Dz`` and the ``Spacing*`` gaps are lengths (mm internall
 :func:`cell_sizes_m` / :func:`domain_grid_params` are the conversion points.
 """
 
+import bisect
 import math
 import os
 
@@ -144,6 +145,16 @@ _PML_COLOR = (1.00, 0.45, 0.10)
 _GRID_COLOR = (0.55, 0.55, 0.55)
 _MAX_GRID_LINES = 400
 
+# The snapped lines -- the ones the snapper forced onto a geometry feature (a
+# body's bounding box, a cylinder's silhouette, a bevel's outline circle) rather
+# than laid down to fill a gap. Drawn brighter and thicker so the mesh can be
+# read as what it is: which lines the geometry asked for, and which merely tile
+# the space between them. Capped separately from the thin lines so decimating a
+# fine grid can never drop a feature line -- they are the few that matter.
+_SNAP_COLOR = (0.95, 0.85, 0.35)
+_SNAP_LINE_WIDTH = 2
+_MAX_SNAP_LINES = 400
+
 
 # --------------------------------------------------------------------------- #
 # Document-object model
@@ -231,6 +242,7 @@ class DomainObject:
         _ensure_curvature_prop(obj)
 
         _ensure_grid_plane_props(obj)
+        _ensure_snap_props(obj)
 
         # Per-axis node-coordinate arrays (world mm, including the PML pad cells)
         # spanning the padded grid -- the geometric source of truth every
@@ -290,6 +302,7 @@ class DomainObject:
         _ensure_es_bc_props(obj)
         _ensure_grid_plane_props(obj)
         _ensure_curvature_prop(obj)
+        _ensure_snap_props(obj)
 
     @staticmethod
     def _migrate_spacing(obj):
@@ -328,6 +341,7 @@ class DomainObject:
             obj.PmlMin = obj.PmlMax = zero
             obj.Nx = obj.Ny = obj.Nz = 0
             obj.NodesX = obj.NodesY = obj.NodesZ = []
+            _set_snaps(obj, None)
             return
 
         # Face-launching sources override the per-face setting here too (not just
@@ -366,12 +380,13 @@ class DomainObject:
         # whose extent matches the voxeliser's own ``_grid_extent`` for the same
         # geometry, so the preview and the run agree.
         nodes = None
+        snaps = ([], [], [])
         if getattr(obj, "UseNonuniformGrid", False):
             from wavesim_gui import gridbuild
             try:
                 nodes = gridbuild.build_domain_nodes(
                     sim, obj, force_pml_faces=force_faces,
-                    modal_faces=modal_faces,
+                    modal_faces=modal_faces, snaps_out=snaps,
                 )
             except Exception as exc:  # never let meshing break the recompute
                 FreeCAD.Console.PrintWarning(
@@ -387,6 +402,7 @@ class DomainObject:
             obj.Nx = len(nodes[0]) - 1
             obj.Ny = len(nodes[1]) - 1
             obj.Nz = len(nodes[2]) - 1
+            _set_snaps(obj, snaps)
         else:
             (nx, ny, nz), (ox, oy, oz) = vox._grid_extent(
                 bbox, (dx, dy, dz), sp_lo, sp_hi, pad_lo, pad_hi
@@ -395,6 +411,8 @@ class DomainObject:
             obj.NodesY = [oy + i * dy for i in range(ny + 1)]
             obj.NodesZ = [oz + i * dz for i in range(nz + 1)]
             obj.Nx, obj.Ny, obj.Nz = nx, ny, nz
+            # A uniform grid snaps to nothing, so every line is drawn thin.
+            _set_snaps(obj, None)
 
         # First recompute with real bounds parks the grid planes on the min
         # faces -- where they used to be nailed. Later recomputes leave them
@@ -740,6 +758,10 @@ _GRID_PLANE_PROPS = (
 # Set once the planes have been parked on the min faces (see place_grid_planes).
 _GRID_PLANES_PLACED = "GridPlanesPlaced"
 
+# The per-axis arrays of snapped (geometry-forced) grid lines -- a subset of
+# ``NodesX/Y/Z``, kept only so the 3D preview can draw them bold.
+_SNAP_PROPS = ("SnapsX", "SnapsY", "SnapsZ")
+
 
 def _ensure_grid_plane_props(obj):
     """Add the three grid-plane positions, back-filling an older document.
@@ -838,6 +860,38 @@ def _ensure_curvature_prop(obj):
             "this bounds the cost (1 = off)",
         )
         obj.CurvatureRefinement = 1.0
+
+
+def _set_snaps(obj, snaps):
+    """Store the snapped grid lines (per-axis mm lists), or clear them.
+
+    Tolerant of a document whose ``SnapsX/Y/Z`` are missing, for the same reason
+    every other write here is: a Domain restored from an older file gains them on
+    the next ``onDocumentRestored``, and a recompute must not raise in between.
+    """
+    for a, name in enumerate(_SNAP_PROPS):
+        if hasattr(obj, name):
+            setattr(obj, name, list(snaps[a]) if snaps else [])
+
+
+def _ensure_snap_props(obj):
+    """Add the three snapped-line arrays if absent.
+
+    Idempotent; called from ``__init__`` **and** ``onDocumentRestored`` -- the
+    second call is the load-bearing one for every document saved before these
+    existed (see :func:`_ensure_curvature_prop`). They are pure view data: the
+    subset of ``NodesX/Y/Z`` the snapper forced onto the geometry, which the view
+    provider draws bold so the "must-have" lines are told apart from the graded
+    fill's. Nothing about the mesh or the job reads them.
+    """
+    for name in _SNAP_PROPS:
+        if not hasattr(obj, name):
+            obj.addProperty(
+                "App::PropertyFloatList", name, "Grid",
+                "Grid lines snapped onto a geometry feature along {} (world "
+                "mm; maintained internally, drawn bold)".format(name[-1].lower()),
+            )
+            obj.setEditorMode(name, 2)  # hidden
 
 
 def electrostatic_boundary(domain):
@@ -1100,6 +1154,24 @@ if _GUI_AVAILABLE:
             gsep.addChild(self._grid_lines)
             root.addChild(gsep)
 
+            # The snapped subset, over the top of the thin grid: same planes,
+            # own colour and width. A separate node set rather than a per-line
+            # style because Coin has no per-segment line width, and drawing them
+            # twice would z-fight -- so ``_grid_segments`` hands each line to
+            # exactly one of the two.
+            self._snap_color = coin.SoBaseColor()
+            self._snap_color.rgb.setValue(*_SNAP_COLOR)
+            sstyle = coin.SoDrawStyle()
+            sstyle.lineWidth = _SNAP_LINE_WIDTH
+            self._snap_coords = coin.SoCoordinate3()
+            self._snap_lines = coin.SoIndexedLineSet()
+            ssep = coin.SoSeparator()
+            ssep.addChild(self._snap_color)
+            ssep.addChild(sstyle)
+            ssep.addChild(self._snap_coords)
+            ssep.addChild(self._snap_lines)
+            root.addChild(ssep)
+
             self._root = root
             vobj.addDisplayMode(root, "Wireframe")
             self._rebuild()
@@ -1131,33 +1203,57 @@ if _GUI_AVAILABLE:
                        obj.PmlMin, obj.PmlMax)
 
         def _grid_segments(self, mn, mx, nodes_x, nodes_y, nodes_z,
-                           plane=None):
+                           snaps=None, plane=None):
             """Line segments for the three orthogonal cell grids.
 
-            Returns ``(points, indices)`` for an ``SoIndexedLineSet``: an XY grid
-            at ``z = plane[2]``, a YZ grid at ``x = plane[0]`` and an XZ grid at
-            ``y = plane[1]`` -- the Domain's ``GridPlaneX/Y/Z``, already clamped
-            into the box by :func:`grid_plane_positions_mm`, so a plane can be
-            walked through the model instead of sitting on the wall. *plane*
-            defaults to the min corner, which is where they used to be nailed.
-            Grid lines are placed at the explicit per-axis node coordinates
-            (``nodes_*``, world mm) clamped to the inner domain box, so a
-            non-uniform grid shows its real (graded) spacing. Line counts per
-            axis are clamped to :data:`_MAX_GRID_LINES` by decimating.
+            Returns ``(thin, bold)``, each an ``(points, indices)`` pair for an
+            ``SoIndexedLineSet``: an XY grid at ``z = plane[2]``, a YZ grid at
+            ``x = plane[0]`` and an XZ grid at ``y = plane[1]`` -- the Domain's
+            ``GridPlaneX/Y/Z``, already clamped into the box by
+            :func:`grid_plane_positions_mm`, so a plane can be walked through the
+            model instead of sitting on the wall. *plane* defaults to the min
+            corner, which is where they used to be nailed. Grid lines are placed
+            at the explicit per-axis node coordinates (``nodes_*``, world mm)
+            clamped to the inner domain box, so a non-uniform grid shows its real
+            (graded) spacing.
+
+            *snaps* is the matching triple of **snapped** coordinates (the
+            Domain's ``SnapsX/Y/Z`` -- the lines the snapper forced onto a
+            geometry feature). Those go in the *bold* set and the rest in the
+            thin one, so every line is drawn exactly once and the two styles
+            cannot z-fight. Line counts per axis are clamped to
+            :data:`_MAX_GRID_LINES` / :data:`_MAX_SNAP_LINES` by decimating --
+            separately, so thinning a fine grid never drops a feature line.
             """
             px, py, pz = plane if plane is not None else (mn.x, mn.y, mn.z)
-            pts = []
-            idx = []
+            snaps = snaps if snaps is not None else ([], [], [])
+            thin_pts, thin_idx = [], []
+            bold_pts, bold_idx = [], []
 
-            def add_line(p0, p1):
-                a = len(pts)
-                pts.append(p0)
-                pts.append(p1)
-                idx.extend([a, a + 1, -1])
+            def adder(pts, idx):
+                def add_line(p0, p1):
+                    a = len(pts)
+                    pts.append(p0)
+                    pts.append(p1)
+                    idx.extend([a, a + 1, -1])
+                return add_line
 
-            def ticks(lo, hi, nodes):
+            add_thin = adder(thin_pts, thin_idx)
+            add_bold = adder(bold_pts, bold_idx)
+
+            def decimate(vals, cap):
+                if len(vals) <= cap:
+                    return vals
+                step = int(math.ceil(len(vals) / float(cap)))
+                out = vals[::step]
+                if out and out[-1] != vals[-1]:
+                    out.append(vals[-1])
+                return out
+
+            def ticks(lo, hi, nodes, axis_snaps):
                 # Node coordinates inside [lo, hi] (the inner box), always closing
-                # on both faces, then decimated so no axis exceeds the line cap.
+                # on both faces, split into the snapped ones and the rest, then
+                # each decimated so no axis exceeds its line cap.
                 tol = 1e-9
                 vals = [v for v in nodes if lo - tol <= v <= hi + tol]
                 if not vals:
@@ -1166,46 +1262,54 @@ if _GUI_AVAILABLE:
                     vals.insert(0, lo)
                 if vals[-1] < hi - tol:
                     vals.append(hi)
-                if len(vals) > _MAX_GRID_LINES:
-                    step = int(math.ceil(len(vals) / float(_MAX_GRID_LINES)))
-                    decimated = vals[::step]
-                    if decimated[-1] != vals[-1]:
-                        decimated.append(vals[-1])
-                    vals = decimated
-                return vals
+                marks = sorted(v for v in axis_snaps if lo - tol <= v <= hi + tol)
+                bold, thin = [], []
+                for v in vals:
+                    # A snap coordinate *is* a node -- the fill lands exactly on
+                    # it -- so this only has to tolerate the float round trip
+                    # through the property, not search a neighbourhood.
+                    k = bisect.bisect_left(marks, v - tol)
+                    (bold if k < len(marks) and abs(marks[k] - v) <= tol
+                     else thin).append(v)
+                return (decimate(thin, _MAX_GRID_LINES),
+                        decimate(bold, _MAX_SNAP_LINES))
 
-            xs = ticks(mn.x, mx.x, nodes_x)
-            ys = ticks(mn.y, mx.y, nodes_y)
-            zs = ticks(mn.z, mx.z, nodes_z)
+            xs, bxs = ticks(mn.x, mx.x, nodes_x, snaps[0])
+            ys, bys = ticks(mn.y, mx.y, nodes_y, snaps[1])
+            zs, bzs = ticks(mn.z, mx.z, nodes_z, snaps[2])
 
-            # XY grid at z = pz
-            for x in xs:
-                add_line((x, mn.y, pz), (x, mx.y, pz))
-            for y in ys:
-                add_line((mn.x, y, pz), (mx.x, y, pz))
-            # YZ grid at x = px
-            for y in ys:
-                add_line((px, y, mn.z), (px, y, mx.z))
-            for z in zs:
-                add_line((px, mn.y, z), (px, mx.y, z))
-            # XZ grid at y = py
-            for x in xs:
-                add_line((x, py, mn.z), (x, py, mx.z))
-            for z in zs:
-                add_line((mn.x, py, z), (mx.x, py, z))
-            return pts, idx
+            for add, (ax, ay, az) in ((add_thin, (xs, ys, zs)),
+                                      (add_bold, (bxs, bys, bzs))):
+                # XY grid at z = pz
+                for x in ax:
+                    add((x, mn.y, pz), (x, mx.y, pz))
+                for y in ay:
+                    add((mn.x, y, pz), (mx.x, y, pz))
+                # YZ grid at x = px
+                for y in ay:
+                    add((px, y, mn.z), (px, y, mx.z))
+                for z in az:
+                    add((px, mn.y, z), (px, mx.y, z))
+                # XZ grid at y = py
+                for x in ax:
+                    add((x, py, mn.z), (x, py, mx.z))
+                for z in az:
+                    add((mn.x, py, z), (mx.x, py, z))
+            return (thin_pts, thin_idx), (bold_pts, bold_idx)
 
         def _rebuild_grid(self):
             obj = getattr(self, "Object", None)
-            if obj is None:
-                return
+            if obj is None or not hasattr(self, "_snap_coords"):
+                return          # not attached yet; attach() rebuilds at the end
             mn, mx = obj.DomainMin, obj.DomainMax
-            coords, lines = self._grid_coords, self._grid_lines
+            pairs = ((self._grid_coords, self._grid_lines),
+                     (self._snap_coords, self._snap_lines))
             if (mn - mx).Length < 1.0e-9:
-                if lines.coordIndex.getNum():
-                    lines.coordIndex.deleteValues(0)
-                if coords.point.getNum():
-                    coords.point.deleteValues(0)
+                for coords, lines in pairs:
+                    if lines.coordIndex.getNum():
+                        lines.coordIndex.deleteValues(0)
+                    if coords.point.getNum():
+                        coords.point.deleteValues(0)
                 return
             nodes_x = list(getattr(obj, "NodesX", []) or [])
             nodes_y = list(getattr(obj, "NodesY", []) or [])
@@ -1221,22 +1325,26 @@ if _GUI_AVAILABLE:
             if not nodes_z:
                 nodes_z = [mn.z + i * float(obj.Dz.Value)
                            for i in range(int((mx.z - mn.z) / max(float(obj.Dz.Value), 1e-9)) + 1)]
-            pts, idx = self._grid_segments(
-                mn, mx, nodes_x, nodes_y, nodes_z,
+            snaps = tuple(list(getattr(obj, name, []) or [])
+                          for name in _SNAP_PROPS)
+            sets = self._grid_segments(
+                mn, mx, nodes_x, nodes_y, nodes_z, snaps=snaps,
                 plane=grid_plane_positions_mm(obj),
             )
-            coords.point.setValues(0, len(pts), pts)
-            if coords.point.getNum() > len(pts):
-                coords.point.deleteValues(len(pts))
-            lines.coordIndex.setValues(0, len(idx), idx)
-            if lines.coordIndex.getNum() > len(idx):
-                lines.coordIndex.deleteValues(len(idx))
+            for (coords, lines), (pts, idx) in zip(pairs, sets):
+                coords.point.setValues(0, len(pts), pts)
+                if coords.point.getNum() > len(pts):
+                    coords.point.deleteValues(len(pts))
+                lines.coordIndex.setValues(0, len(idx), idx)
+                if lines.coordIndex.getNum() > len(idx):
+                    lines.coordIndex.deleteValues(len(idx))
 
         def updateData(self, obj, prop):
             if prop in ("DomainMin", "DomainMax", "PmlMin", "PmlMax"):
                 self._rebuild()
             if prop in ("DomainMin", "DomainMax", "Dx", "Dy", "Dz",
                         "NodesX", "NodesY", "NodesZ",
+                        "SnapsX", "SnapsY", "SnapsZ",
                         "GridPlaneX", "GridPlaneY", "GridPlaneZ"):
                 self._rebuild_grid()
 

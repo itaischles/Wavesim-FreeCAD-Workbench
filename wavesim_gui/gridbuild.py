@@ -18,6 +18,14 @@ The mesh is built per axis, independently:
   a bounding box only describes a body's outer extent, so a slot, pocket, step or
   aperture cut into it -- geometry that never touches the box -- is snapped by its
   own faces or not at all.
+* **Feature outlines.** The two rules above are surface-type rules, and a shape
+  whose surfaces are neither planes nor cylinders -- a cone, a torus, a revolve, a
+  swept spline -- passes them by entirely. Where two faces *meet* is a kink in
+  the surface whatever the faces are, so every edge that really is a face-face
+  boundary (:func:`_feature_edges`; a parametrisation seam is not) and lies flat
+  against an axis forces a line at its own plane, and a curved one forces its
+  silhouette on the other two axes as well (:func:`_add_edge_snaps`). This is
+  what puts grid lines on the two circles bounding a bevel.
 * **Circle centre lines.** A cylindrical face that closes a full turn -- a rod, a
   bore, anything whose cross-section really is a *circle*, as opposed to the arc
   of a fillet or blend -- also forces a line through its **centre**, so a node
@@ -96,6 +104,12 @@ _GRAZE_REFINE_ROUNDS = 16
 # because OCC reports the seam range as exactly 2*pi but a trimmed-then-healed
 # face can come back a rounding short.
 _FULL_TURN_MIN = 2.0 * math.pi - 1.0e-6
+
+# Extent (mm) below which an edge counts as lying flat against an axis -- see
+# :func:`_add_edge_snaps`. Well under :func:`merge_tolerance`'s floor, so a
+# coordinate that qualifies here is one the merge would treat as a single line
+# anyway; a genuinely shallow curve is not flat and contributes no plane.
+_FLAT_TOL = 1.0e-6
 
 
 # --------------------------------------------------------------------------- #
@@ -245,6 +259,145 @@ def _add_planar_snaps(shape, axes):
         axes[ai].append((pos.x, pos.y, pos.z)[ai])
 
 
+def _feature_edges(shape):
+    """*shape*'s edges that are a real boundary between two faces.
+
+    A **feature outline** is where two faces meet: the ring at the start and end
+    of a bevel, the rim of a cone's flat cut, the tangency circle where a fillet
+    leaves a shaft. That is a topological statement, not a surface-type one,
+    which is why this generalises to arbitrary geometry -- cones, tori, revolves
+    and swept splines all have such rings, and none of them is a plane or a
+    cylinder, so :func:`_add_planar_snaps` and :func:`_add_cylinder_snaps` see
+    nothing at all where the shape stops being what it was.
+
+    The filter is the whole trick. In a well-formed solid a genuine face-face
+    boundary has **exactly two** face ancestors; the two other kinds of edge OCC
+    hands back have one:
+
+    * a **seam** -- the artificial cut a closed surface needs to be
+      parametrisable (a cylinder's, a torus's, a revolve's generatrix). It is not
+      an interface, it lies wherever the parametrisation starts, and taking it
+      seriously is actively harmful: a z-cylinder's seam runs at ``(xc + r, yc)``,
+      so it would force an unconditional grid line through ``yc`` -- exactly the
+      circle-centre line :func:`_insert_centre_lines` exists to take only where
+      it is free.
+    * a **degenerate** edge -- a sphere's pole, which collapses to a point and
+      whose ``Curve`` raises "undefined curve type" if asked.
+
+    So an open shell contributes nothing here (its free boundary edges also have
+    one ancestor) and falls back to its bounding box, as it does everywhere else
+    in this module.
+    """
+    try:
+        import Part
+    except Exception:
+        return
+    for edge in getattr(shape, "Edges", []) or []:
+        try:
+            if edge.Degenerated:
+                continue
+            if len(shape.ancestorsOfType(edge, Part.Face)) != 2:
+                continue
+        except Exception:
+            continue
+        yield edge
+
+
+def _edge_circle(edge):
+    """``(axis_index, centre_xyz, radius)`` if *edge* is a whole axis-aligned circle.
+
+    ``None`` otherwise -- an arc, an ellipse, a tilted circle, anything else. The
+    full-turn test is :func:`_is_full_circle`'s, for the same reason: a trimmed
+    arc's centre is a construction point that need not lie on the body.
+    """
+    try:
+        import Part
+        curve = edge.Curve
+    except Exception:
+        return None
+    if not isinstance(curve, Part.Circle):
+        return None
+    if not edge.isClosed():
+        return None
+    u0, u1 = edge.ParameterRange
+    if (u1 - u0) < _FULL_TURN_MIN:
+        return None
+    ai = _axis_index(curve.Axis)
+    if ai is None:
+        return None
+    c = curve.Center
+    return ai, (c.x, c.y, c.z), float(curve.Radius)
+
+
+def _add_edge_snaps(shape, axes, centres=None):
+    """Append every axis-normal **feature outline**'s snap lines to *axes* (mm).
+
+    This is the general case of the two rules above, and the one that reaches a
+    shape whose surfaces have no axis of their own. Take the screenshot case: an
+    electrode is a cone whose flat end cut carries a bevel, so the solid is
+    ``plane | torus | cone | plane`` and the interesting geometry -- the two
+    circles bounding the bevel -- belongs to *no* plane and *no* cylinder. Before
+    this, the body forced lines only at its bounding box, and the bevel simply
+    was not in the mesh.
+
+    Each feature edge (:func:`_feature_edges`) contributes on two counts:
+
+    * **Its plane.** An axis along which the edge has no extent is an axis the
+      edge lies flat against, and that coordinate is where two faces meet -- a
+      kink in the surface, so the place a staircase most needs a cell boundary.
+      An edge may be flat against two axes at once (a straight edge parallel to
+      the third); it forces a line on both, which for a box's corner edge is two
+      lines its bounding box already placed.
+    * **Its extremes**, on the two remaining axes, but only for a *curved* edge
+      lying flat against exactly one -- a ring. Those are the silhouette of the
+      outline (a circle's ``centre +/- r``), which is the radius at which the
+      bevel starts. A straight edge is excluded because its extremes are just its
+      end vertices: shared with the neighbouring edges, describing no silhouette,
+      and multiplying lines across a faceted body for nothing.
+
+    A whole circle among them also **proposes its centre**, on the same
+    conditional channel as :func:`_add_cylinder_snaps`' -- so a cone or a revolve
+    gets the axis line a rod already got.
+
+    The circle case is computed from the analytic ``Curve`` (centre +/- radius)
+    rather than the edge's box, so it agrees bit-for-bit with the line a
+    cylinder of the same radius would have contributed and the two cannot
+    mean-merge each other off the geometry (see :func:`_exact_bbox`).
+    """
+    for edge in _feature_edges(shape):
+        circle = _edge_circle(edge)
+        if circle is not None:
+            ai, centre, r = circle
+            axes[ai].append(centre[ai])
+            for t in range(3):
+                if t == ai:
+                    continue
+                axes[t].extend((centre[t] - r, centre[t] + r))
+                if centres is not None:
+                    centres[t].append(centre[t])
+            continue
+        bb = _exact_bbox(edge)
+        ext = ((bb.XMin, bb.XMax), (bb.YMin, bb.YMax), (bb.ZMin, bb.ZMax))
+        flat = [a for a in range(3) if ext[a][1] - ext[a][0] <= _FLAT_TOL]
+        if not flat:
+            continue  # not axis-separable, like a tilted plane or cylinder
+        for a in flat:
+            axes[a].append(0.5 * (ext[a][0] + ext[a][1]))
+        if len(flat) == 1 and not _is_straight(edge):
+            for a in range(3):
+                if a not in flat:
+                    axes[a].extend(ext[a])
+
+
+def _is_straight(edge):
+    """True when *edge* is a straight line segment (so it has no silhouette)."""
+    try:
+        import Part
+        return isinstance(edge.Curve, Part.Line)
+    except Exception:
+        return True
+
+
 def collect_axis_snaps(materials, centres=None):
     """Per-axis forced grid-line coordinates (world mm) from material geometry.
 
@@ -275,6 +428,7 @@ def collect_axis_snaps(materials, centres=None):
         axes[2].extend((bb.ZMin, bb.ZMax))
         _add_cylinder_snaps(shape, axes, centres)
         _add_planar_snaps(shape, axes)
+        _add_edge_snaps(shape, axes, centres)
     return axes
 
 
@@ -818,7 +972,8 @@ def _graded_widths(w, hL, hR, H, r):
 
 
 def build_axis_nodes(snaps, lo, hi, coarse, ratio, pad_lo, pad_hi, min_cell=0.0,
-                     caps=(), line_sizes=(), centres=(), exact_caps=()):
+                     caps=(), line_sizes=(), centres=(), exact_caps=(),
+                     forced_out=None):
     """Graded node coordinates (mm) for one axis, PML pad cells included.
 
     Parameters
@@ -858,6 +1013,13 @@ def build_axis_nodes(snaps, lo, hi, coarse, ratio, pad_lo, pad_hi, min_cell=0.0,
         gap target is rounded so the fill lays a whole number of cells and its
         usual stretch cannot come out coarser than asked -- see
         :func:`_exact_target`. Empty ⇒ every gap tiles exactly as it always did.
+    forced_out : list or None
+        When given, the forced lines this axis was actually built on are
+        appended to it -- the merged snaps plus whatever centre lines were taken,
+        which is a subset of the returned nodes rather than of *snaps*. The
+        Domain stores them so the 3D preview can draw the lines the geometry
+        asked for in bold and the fill's lines thin; nothing about the mesh
+        depends on it.
 
     Returns a strictly-increasing list of node coordinates. The inner region is
     tiled so every gap between forced lines is resolved with cells no larger than
@@ -872,6 +1034,13 @@ def build_axis_nodes(snaps, lo, hi, coarse, ratio, pad_lo, pad_hi, min_cell=0.0,
     forced = _forced_lines(snaps, lo, hi, coarse, min_cell)
     if centres:
         forced = _insert_centre_lines(forced, centres, coarse, min_cell, caps)
+    if forced_out is not None:
+        # Endpoints excluded: :func:`_forced_lines` injects *lo* and *hi*
+        # whatever the geometry does, so reporting them would mark the domain
+        # wall as a snapped feature even when the nearest body is an air gap
+        # away. A body that really does touch the wall loses its mark there --
+        # accepted, since that line is drawn as the domain box anyway.
+        forced_out.extend(forced[1:-1])
     gaps = [b - a for a, b in zip(forced[:-1], forced[1:])]
 
     # Per-gap coarse target: the void size, tightened where a material body covers
@@ -931,7 +1100,8 @@ def build_axis_nodes(snaps, lo, hi, coarse, ratio, pad_lo, pad_hi, min_cell=0.0,
 # Domain-level entry point
 # --------------------------------------------------------------------------- #
 
-def build_domain_nodes(sim, domain, force_pml_faces=(), modal_faces=()):
+def build_domain_nodes(sim, domain, force_pml_faces=(), modal_faces=(),
+                       snaps_out=None):
     """Snapped, graded ``(NodesX, NodesY, NodesZ)`` (world mm) for *domain*.
 
     Uses the material geometry bounds (grown for sources/monitors, via
@@ -950,6 +1120,13 @@ def build_domain_nodes(sim, domain, force_pml_faces=(), modal_faces=()):
     centre, taken wherever the fill can absorb it for free
     (:func:`_insert_centre_lines`). Returns ``None`` when there is no geometry
     to bound (the caller falls back to a uniform grid).
+
+    *snaps_out*, when given, is a per-axis triple of lists filled with the forced
+    lines the returned mesh was built on -- the geometry-derived "must-have"
+    coordinates, as opposed to the graded fill's. Only the attempt that survives
+    the cell-count guard leaves its lines there, since a coarsened rebuild merges
+    and judges them afresh. It is diagnostic output only (the Domain draws them
+    bold); nothing downstream of the node arrays reads it.
 
     If the grid exceeds :data:`_MAX_TOTAL_CELLS`, the coarse target is scaled up
     and the whole mesh rebuilt until it fits (bounded number of attempts).
@@ -1014,11 +1191,12 @@ def build_domain_nodes(sim, domain, force_pml_faces=(), modal_faces=()):
         scaled_sizes = tuple(
             [(c, s * scale) for c, s in line_sizes[a]] for a in range(3)
         )
+        forced = ([], [], [])
         nodes = tuple(
             build_axis_nodes(
                 snaps[a], los[a], his[a], coarse_mm[a] * scale, ratio,
                 pad_lo[a], pad_hi[a], min_cell_mm, scaled_caps[a],
-                scaled_sizes[a], centres[a], scaled_manual[a],
+                scaled_sizes[a], centres[a], scaled_manual[a], forced[a],
             )
             for a in range(3)
         )
@@ -1026,4 +1204,7 @@ def build_domain_nodes(sim, domain, force_pml_faces=(), modal_faces=()):
         if total <= _MAX_TOTAL_CELLS:
             break
         scale *= 1.5
+    if snaps_out is not None:
+        for a in range(3):
+            snaps_out[a][:] = forced[a]
     return nodes

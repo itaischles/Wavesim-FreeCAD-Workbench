@@ -126,16 +126,16 @@ class SimulationContainer:
         # anti-staircases each dielectric body's boundary cells with an
         # anisotropic effective permittivity (Kottke/Meep averaging) instead of
         # snapping to whole cells -- ~2nd-order accuracy and smooth variation of
-        # results with geometry. On by default; edited via the Simulation panel.
+        # results with geometry. Off by default; edited via the Simulation panel.
         if not hasattr(obj, "SubpixelSmoothing"):
             obj.addProperty(
                 "App::PropertyBool", "SubpixelSmoothing", "Run",
                 "Anti-staircase dielectric interfaces with an anisotropic "
                 "effective permittivity (subpixel smoothing). PEC is unaffected.",
             )
-            obj.SubpixelSmoothing = True
+            obj.SubpixelSmoothing = False
 
-        _ensure_conformal_props(obj)
+        _ensure_conformal_props(obj, enabled=True)
         _ensure_solver_mode_props(obj)
 
     def onDocumentRestored(self, obj):
@@ -253,18 +253,18 @@ def _drop_mode_convergence_props(obj):
 CONFORMAL_AREA_THRESHOLD = 0.4
 
 
-def _ensure_conformal_props(obj):
+def _ensure_conformal_props(obj, enabled=False):
     """Add the conformal-PEC properties to *obj* if it does not carry them.
 
     Idempotent, and called from ``__init__``, ``onDocumentRestored`` and the task
     panel, so a document saved before the feature existed picks them up without
     the caller having to know which.
 
-    ``ConformalPEC`` is **off by default**, unlike ``SubpixelSmoothing``. The
-    small-cut instability that first justified that is closed -- the solver now
-    measures the assembled scheme and raises the clamp threshold itself (S7 in
-    CONFORMAL_PEC_PLAN.md) -- but flipping the default is its own decision, and
-    the plan still gates it on the rest of phase 6.
+    ``ConformalPEC`` is on for a new simulation and off for a document that
+    predates the property -- hence *enabled*, which only the ``__init__`` caller
+    passes. A run made before the feature existed was staircased, so restoring it
+    with conformal PEC silently on would change its numbers; a new simulation has
+    no such history and gets the accurate scheme.
 
     ``ConformalAreaThreshold`` deliberately gets **no panel row**. It is now only
     a *starting* value for the solver's own stability probe, so a spin box in the
@@ -281,7 +281,7 @@ def _ensure_conformal_props(obj):
             "error and the parasitic higher-order mode a staircased conductor "
             "launches at a modal port. Dielectrics are unaffected.",
         )
-        obj.ConformalPEC = False
+        obj.ConformalPEC = bool(enabled)
     if not hasattr(obj, "ConformalAreaThreshold"):
         obj.addProperty(
             "App::PropertyFloat", "ConformalAreaThreshold", "Run",
@@ -300,8 +300,8 @@ def _ensure_conformal_props(obj):
 def conformal_pec(sim):
     """``(enabled, area_threshold)`` for *sim* -- the conformal PEC settings.
 
-    Legacy documents that predate the properties read as off, which is also the
-    default, so nothing changes for them.
+    Legacy documents that predate the properties read as off -- the scheme they
+    were run with -- while a new simulation is created with it on.
     """
     if sim is None:
         return False, CONFORMAL_AREA_THRESHOLD
@@ -565,8 +565,9 @@ if _GUI_AVAILABLE:
                 "resulting charges. One extra solve per conductor."
             )
 
-            # Subpixel smoothing of dielectric interfaces (on by default). True
-            # for legacy documents that predate the property.
+            # Subpixel smoothing of dielectric interfaces (off for a new
+            # simulation). True for legacy documents that predate the property,
+            # which ran with it on.
             self._subpixel = QtWidgets.QCheckBox(
                 "Subpixel smoothing of dielectric interfaces"
             )
@@ -580,8 +581,9 @@ if _GUI_AVAILABLE:
                 "conductors are unaffected."
             )
 
-            # Conformal (cut-cell) PEC. Off by default -- see
-            # _ensure_conformal_props for why this one is opt-in.
+            # Conformal (cut-cell) PEC. On for a new simulation, off for a
+            # document that predates the property -- see
+            # _ensure_conformal_props for why the two differ.
             self._conformal = QtWidgets.QCheckBox(
                 "Conformal (cut-cell) PEC conductors"
             )

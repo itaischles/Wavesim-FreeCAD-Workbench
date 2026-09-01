@@ -393,7 +393,29 @@ def _snapshot_extent(sim, name):
     return None
 
 
-def _geometry_outlines(obj, chord_mm):
+# Sagitta tolerance for discretising a curved section edge, as a fraction of
+# the snapshot's drawn extent. See :func:`_geometry_outlines`.
+#
+# OCC's ``Deflection`` bounds the *sagitta* -- how far the curve bows away from
+# the straight segment replacing it -- not the segment's length, and on a curve
+# of radius R the segment that comes back is ``2*sqrt(2*R*d)``. That amplifies
+# the tolerance by ``sqrt(R/d)``, which is why a value that looks safely
+# sub-pixel is not: at the extent/400 this once used, an 81 mm slice gave
+# d = 0.2 mm and so 2.4 mm segments around a 3.5 mm nose -- roughly two and a
+# half cells each, drawing a visible polygon over a mesh fine enough to have
+# resolved the curve. Sized here so the *segment* is sub-pixel instead: on that
+# same slice d = 0.2 um, which is a 0.075 mm segment at R = 3.5 mm and 0.03 mm
+# at R = 0.5 mm.
+#
+# The cost of going finer is mild and lands nowhere hot. Vertex count grows
+# only as ``1/sqrt(d)``, straight edges still discretise to their two endpoints
+# whatever the tolerance, and the one consumer that scales with vertex count
+# (:func:`_dead_cells`, one ``searchsorted`` per edge per row) runs over the
+# coarse cell centres, not the fine smoothing lattice.
+_OUTLINE_DEFLECTION_FRACTION = 1.0 / 400000.0
+
+
+def _geometry_outlines(obj, deflection_mm):
     """Material cross-sections on a snapshot leaf's plane, in the plot's frame.
 
     Returns ``[(rgb, [polyline, ...], is_pec), ...]``: one entry per Material
@@ -455,7 +477,7 @@ def _geometry_outlines(obj, chord_mm):
                 continue          # a plane that misses the solid, or a bad shape
             for wire in wires or []:
                 try:
-                    verts = wire.discretize(Deflection=chord_mm)
+                    verts = wire.discretize(Deflection=deflection_mm)
                 except Exception:
                     continue
                 if len(verts) < 2:
@@ -3150,18 +3172,19 @@ if _GUI_AVAILABLE:
 
         def _section_groups():
             """Section the CAD on this leaf's plane -- once, for every overlay."""
-            # Chord tolerance for discretising curved edges: a fraction of the
-            # drawn extent, so a bore reads as a circle rather than a polygon
-            # and no CAD detail costs much more than a pixel.
+            # Sagitta tolerance for discretising curved edges: a fraction of
+            # the drawn extent (see _OUTLINE_DEFLECTION_FRACTION for why it is
+            # as small as it is), so a bore reads as a circle rather than a
+            # polygon and no CAD detail costs much more than a pixel.
             spanx = ((float(xedges[-1]) - float(xedges[0])) if use_mesh
                      else (float(size.x) if have_size else 0.0))
             spany = ((float(yedges[-1]) - float(yedges[0])) if use_mesh
                      else (float(size.y) if have_size else 0.0))
-            chord = max(spanx, spany) / 400.0
-            if chord <= 0.0:
+            deflection = max(spanx, spany) * _OUTLINE_DEFLECTION_FRACTION
+            if deflection <= 0.0:
                 return []
             try:
-                return _geometry_outlines(obj, chord)
+                return _geometry_outlines(obj, deflection)
             except Exception as exc:      # never let the CAD break the plot
                 FreeCAD.Console.PrintWarning(
                     "Wavesim: could not section the geometry for {} ({})\n"

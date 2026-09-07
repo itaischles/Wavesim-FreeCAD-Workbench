@@ -423,7 +423,16 @@ def hatch_edges(shapes, axis, coord, keep_low, pitch):
 # --------------------------------------------------------------------------- #
 
 def _mark_preview(obj):
-    """Tag *obj* as a cross-section preview and keep it out of the tree."""
+    """Tag *obj* as a cross-section preview and keep it out of the tree.
+
+    ``ShowInTree = False`` alone does not hold: FreeCAD's tree re-inserts a
+    hidden item as soon as it is *selected*, so one click on a cut face in the
+    3D view put the whole section into the tree, where it can be renamed,
+    hidden, or deleted out from under the panel. ``Selectable = False`` closes
+    that door -- there is nothing to click, so nothing to sync into the tree,
+    and picking still falls through to whatever the user actually meant to hit.
+    A preview is a picture of the model, never a handle on it.
+    """
     try:
         obj.addProperty("App::PropertyBool", _PREVIEW_PROP, "Wavesim",
                         "Transient cross-section preview; not part of the model")
@@ -433,10 +442,11 @@ def _mark_preview(obj):
         pass
     vobj = getattr(obj, "ViewObject", None)
     if vobj is not None:
-        try:
-            vobj.ShowInTree = False
-        except Exception:
-            pass
+        for prop, value in (("ShowInTree", False), ("Selectable", False)):
+            try:
+                setattr(vobj, prop, value)
+            except Exception:
+                pass
     return obj
 
 
@@ -712,8 +722,7 @@ class CrossSectionPreview(object):
         if vobj is not None:
             for prop, value in (
                     ("LineColor", _shade(base, _HATCH_SHADE, _HATCH_FLOOR)),
-                    ("LineWidth", _HATCH_WIDTH),
-                    ("Selectable", False)):
+                    ("LineWidth", _HATCH_WIDTH)):
                 try:
                     setattr(vobj, prop, value)
                 except Exception:

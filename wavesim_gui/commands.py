@@ -544,6 +544,11 @@ if _GUI_AVAILABLE:
             self._mode.setCurrentText(
                 str(getattr(obj, "SolverMode", MODE_LABELS[0]))
             )
+            # Tracked because switching mode switches which driver the Domain
+            # sizes its cell from -- a wavelength or the geometry -- so the cell
+            # has to be re-derived on the way out, exactly as a frequency edit
+            # does. See accept().
+            self._orig_mode = self._mode.currentText()
             self._mode.setToolTip(
                 "Full wave: time-step Maxwell's equations (sources, ports, "
                 "monitors).\n"
@@ -641,12 +646,17 @@ if _GUI_AVAILABLE:
         def _on_mode_changed(self, label):
             """Show only the rows the chosen solver actually uses.
 
-            Max frequency stays visible in both modes: it is what the Domain
-            derives its default cell size from, so it is a meshing control here
-            even where there is no time axis to bound.
+            Max frequency goes with the time rows. It used to stay on as the
+            Domain's meshing knob, but a static solve has no wavelength to count
+            cells against, so asking for a frequency was asking the user to
+            invent one; the Domain now sizes an electrostatic mesh from the
+            geometry instead (``domain.feature_cell_size_m``). The frequency
+            unit follows it -- nothing else in an electrostatic run displays a
+            frequency.
             """
             electrostatic = _MODE_TOKENS.get(str(label)) == MODE_ELECTROSTATIC
-            for widget in (self._time, self._max_time, self._steps):
+            for widget in (self._time, self._max_time, self._steps,
+                           self._freq, self._max_freq):
                 self._set_row_visible(widget, not electrostatic)
             self._set_row_visible(self._capacitance, electrostatic)
             if electrostatic:
@@ -655,8 +665,9 @@ if _GUI_AVAILABLE:
                     "same grid, holding every PEC body at the potential set on "
                     "it (open a PEC material to set them). Sources, ports and "
                     "time-series monitors are ignored; a snapshot monitor draws "
-                    "phi, E or D on its plane. Max frequency is kept because "
-                    "the Domain sizes its default cell from it. Boundary "
+                    "phi, E or D on its plane. There is no max frequency: the "
+                    "Domain sizes its cell from the geometry here, counting "
+                    "cells across the model's thinnest feature. Boundary "
                     "conditions are per-face on the Domain: Ground (phi = 0) or "
                     "Symmetry (no normal field)."
                 )
@@ -731,18 +742,30 @@ if _GUI_AVAILABLE:
                     self._max_freq.value(), self._freq_unit
                 )
                 self.obj.MaxFrequency = new_max_freq
-            # The max frequency drives the default cell size, so when it changes
-            # re-derive the Domain's cell sizes from it and recompute -- the mesh
-            # display and derived counts update immediately without opening the
-            # Domain panel. Left alone when the frequency is unchanged, so custom
-            # cell sizes survive an unrelated edit (e.g. changing a display unit).
+            # The default cell size is derived, so when its driver changes
+            # re-derive the Domain's cell sizes and recompute -- the mesh display
+            # and derived counts update immediately without opening the Domain
+            # panel. Two things can change it: the max frequency (full wave) and
+            # the solver mode itself, which swaps the driver from the wavelength
+            # to the geometry. ``SolverMode`` is already written above, so the
+            # lookup below reads the new mode. Left alone otherwise, so custom
+            # cell sizes survive an unrelated edit (e.g. a display unit).
             domain = self._domain
             freq_changed = abs(new_max_freq - self._orig_max_freq) > 1.0e-6
-            if domain is not None and freq_changed:
+            mode_changed = self._mode.currentText() != self._orig_mode
+            if domain is not None and (freq_changed or mode_changed):
                 size_m = domain_mod.suggested_cell_size_m(self.obj, domain=domain)
                 if size_m is not None:
                     size_mm = "{} mm".format(size_m * 1000.0)
                     domain.Dx = domain.Dy = domain.Dz = size_mm
+            # The mode is a property of the *Simulation*, so writing it leaves
+            # the Domain untouched and the recompute below would skip it -- and
+            # the Domain is what reads the mode to decide its absorber shell and
+            # its wavelength caps. Without this the mesh, the cell counts and the
+            # drawn PML box all keep the previous mode's answer until something
+            # else happens to touch the Domain.
+            if domain is not None and mode_changed:
+                domain.touch()
             doc.commitTransaction()
             doc.recompute()
             Gui.Control.closeDialog()

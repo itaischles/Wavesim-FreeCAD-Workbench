@@ -1170,8 +1170,12 @@ def build_domain_nodes(sim, domain, force_pml_faces=(), modal_faces=(),
     if bbox is None:
         return None
 
+    from wavesim_gui.commands import is_electrostatic
+
+    electrostatic = is_electrostatic(sim)
     params = domain_mod.domain_grid_params(
-        domain, force_pml_faces=force_pml_faces, modal_faces=modal_faces)
+        domain, force_pml_faces=force_pml_faces, modal_faces=modal_faces,
+        electrostatic=electrostatic)
     sp_lo_mm = tuple(s * _MM_PER_M for s in params["spacing_lo"])
     sp_hi_mm = tuple(s * _MM_PER_M for s in params["spacing_hi"])
     pad_lo, pad_hi = params["pad_lo"], params["pad_hi"]
@@ -1193,7 +1197,14 @@ def build_domain_nodes(sim, domain, force_pml_faces=(), modal_faces=(),
     # request is the same kind of cap and simply joins the list -- the smallest
     # one covering a gap wins, so a manual request can refine a dielectric band
     # further but never coarsen it (nor be coarsened by it).
-    material_caps = collect_material_caps(sim, domain, materials)
+    # ...but only in full wave. A material cap is a *wavelength* statement, and
+    # an electrostatic solve has none: permittivity does not change what
+    # ``div(eps grad phi) = 0`` needs from its mesh, only the geometry does, so
+    # refining a high-index body there is refinement bought for nothing. What
+    # electrostatics wants from the snapper it already gets, and mode-neutrally:
+    # gap snapping, feature outlines, curvature, and the manual caps below.
+    material_caps = (([], [], []) if electrostatic
+                     else collect_material_caps(sim, domain, materials))
     manual_caps = collect_refinement_caps(materials)
     caps = tuple(list(material_caps[a]) + manual_caps[a] for a in range(3))
     # Grazing-surface refinement. Collected after the snaps it attaches to, and

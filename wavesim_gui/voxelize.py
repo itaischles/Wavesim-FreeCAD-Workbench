@@ -266,6 +266,7 @@ def _sizing_for(sim, default_padding):
     (so a document without a domain runs as before).
     """
     from wavesim_gui import domain as domain_mod
+    from wavesim_gui.commands import is_electrostatic
 
     dom = domain_mod.find_domain(sim) if sim else None
     if dom is not None:
@@ -273,6 +274,7 @@ def _sizing_for(sim, default_padding):
             dom,
             force_pml_faces=domain_mod.pml_port_faces(sim),
             modal_faces=domain_mod.modal_port_faces(sim),
+            electrostatic=is_electrostatic(sim),
         )
         return p["spacing_lo"], p["spacing_hi"], p["pad_lo"], p["pad_hi"], dom
     pad = (default_padding, default_padding, default_padding)
@@ -2196,10 +2198,17 @@ def build_job_from_document(doc, steps=None, fmax=30.0e9, progress=None):
     # the single source of truth, so the grid padding *and* the emitted boundary
     # (below) agree with the drawn box and node arrays, which are built from the
     # same two face lists.
+    # Needed here, before the grid params: an electrostatic run has no absorber,
+    # and the shell of uniform coarse cells a PML thickness reserves at each face
+    # would otherwise discard the feature snaps there (see domain_grid_params).
+    from wavesim_gui.commands import is_electrostatic
+
+    electrostatic = is_electrostatic(sim)
     grid_params = domain_mod.domain_grid_params(
         dom,
         force_pml_faces=domain_mod.pml_port_faces(sim),
         modal_faces=domain_mod.modal_port_faces(sim),
+        electrostatic=electrostatic,
     )
     spacing_lo = grid_params["spacing_lo"]
     spacing_hi = grid_params["spacing_hi"]
@@ -2239,9 +2248,6 @@ def build_job_from_document(doc, steps=None, fmax=30.0e9, progress=None):
     # Electrostatics: the solve addresses conductors by name, so every PEC body
     # is labelled. Only in that mode -- a full-wave materials.npz gains nothing
     # from an identity the FDTD update cannot read.
-    from wavesim_gui.commands import is_electrostatic
-
-    electrostatic = is_electrostatic(sim)
     conductor_names = None
     if electrostatic:
         conductor_names = {

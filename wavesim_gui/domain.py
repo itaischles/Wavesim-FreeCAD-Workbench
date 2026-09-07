@@ -254,6 +254,7 @@ class DomainObject:
                 "frequency; used by the 'Default from max frequency' cell size",
             )
             obj.CellsPerWavelength = 20
+        _ensure_feature_prop(obj)
         if not hasattr(obj, "UseNonuniformGrid"):
             obj.addProperty(
                 "App::PropertyBool", "UseNonuniformGrid", "Grid",
@@ -343,6 +344,7 @@ class DomainObject:
         _ensure_es_bc_props(obj)
         _ensure_grid_plane_props(obj)
         _ensure_curvature_prop(obj)
+        _ensure_feature_prop(obj)
         _ensure_snap_props(obj)
 
     @staticmethod
@@ -392,8 +394,15 @@ class DomainObject:
         # absorber and the background gap on their face entirely.
         force_faces = pml_port_faces(sim)
         modal_faces = modal_port_faces(sim)
+        # An electrostatic run has no absorber at all: no drawn PML box, and --
+        # the part that moves numbers -- no reserved shell of uniform coarse
+        # cells eating the feature snaps at each face.
+        from wavesim_gui.commands import is_electrostatic
+
+        es = is_electrostatic(sim)
         params = domain_grid_params(
-            obj, force_pml_faces=force_faces, modal_faces=modal_faces)
+            obj, force_pml_faces=force_faces, modal_faces=modal_faces,
+            electrostatic=es)
         sp_lo = tuple(s * _MM_PER_M for s in params["spacing_lo"])
         sp_hi = tuple(s * _MM_PER_M for s in params["spacing_hi"])
         pad_lo, pad_hi = params["pad_lo"], params["pad_hi"]
@@ -696,6 +705,54 @@ def wavelength_cell_size_m(sim, eps_r=1.0, mu_r=1.0, domain=None,
     return _C0 / (fmax * n_lambda * n)
 
 
+def feature_cell_size_m(sim, domain=None, cells_per_feature=None):
+    """Cell size (metres) resolving the model's thinnest feature *N* times.
+
+    The electrostatic counterpart of :func:`wavelength_cell_size_m`, and the
+    reason the two exist separately: ``div(eps grad phi) = 0`` has no wavelength
+    and no frequency, so nothing about a medium sets the mesh. What does is the
+    geometry -- phi varies fastest across the narrowest thing in the model -- so
+    the size is ``min(feature span) / N``, where the span is each assigned
+    body's thinnest bounding-box dimension.
+
+    **PEC bodies count here**, unlike in the wavelength form that skips them: in
+    an electrostatic run the conductors are the whole problem, and a thin trace
+    is exactly the feature the mesh has to resolve.
+
+    Returns ``None`` when no material-assigned body has a solid shape, so the
+    caller leaves the cell size alone rather than guessing one.
+    """
+    from wavesim_gui import gridbuild
+    from wavesim_gui import materials as materials_mod
+    from wavesim_gui import voxelize as vox
+
+    if cells_per_feature is None:
+        if domain is None:
+            domain = find_domain(sim)
+        n = int(getattr(domain, "CellsPerFeature", 10) or 10) if domain else 10
+    else:
+        n = int(cells_per_feature)
+    if n <= 0:
+        n = 10
+
+    smallest_mm = None
+    for shape, _eps, _mu, _pec, _sigma, _body in vox._gather(
+            materials_mod.find_materials(sim) if sim else []):
+        bb = gridbuild._exact_bbox(shape)
+        # A body flat on an axis (a shell, a zero-thickness pad) has no
+        # thickness to resolve there, so that axis is skipped rather than
+        # driving the size to zero; its in-plane extent is what it offers.
+        spans = [s for s in (bb.XLength, bb.YLength, bb.ZLength) if s > 1.0e-9]
+        if not spans:
+            continue
+        span = min(spans)
+        smallest_mm = span if smallest_mm is None else min(smallest_mm, span)
+
+    if smallest_mm is None:
+        return None
+    return (smallest_mm / _MM_PER_M) / n
+
+
 def background_eps_mu(domain):
     """Return the Domain background medium's ``(eps_r, mu_r)`` (vacuum default)."""
     bg = background_material(domain)
@@ -729,8 +786,18 @@ def default_cell_size_m(sim, domain=None, cells_per_wavelength=None):
     return wavelength_cell_size_m(sim, eps_max, mu_max, domain, cells_per_wavelength)
 
 
-def suggested_cell_size_m(sim, domain=None, cells_per_wavelength=None):
-    """Cell size (metres) to fill the Domain's ``Dx/Dy/Dz`` from the max frequency.
+def suggested_cell_size_m(sim, domain=None, cells_per_wavelength=None,
+                          cells_per_feature=None):
+    """Cell size (metres) to fill the Domain's ``Dx/Dy/Dz`` automatically.
+
+    **Electrostatic mode** takes a different driver entirely:
+    :func:`feature_cell_size_m`, cells across the model's thinnest feature.
+    There is no wavelength to count against, and a permittivity does not change
+    what a Laplace solve needs from its mesh -- only the geometry does. The same
+    size is used with the snapper on or off; with it on it is the coarse target
+    the gap, feature-outline and curvature snapping then refine below.
+
+    In **full-wave** mode:
 
     * **Uniform grid** -- the global-finest :func:`default_cell_size_m`: one
       constant size must resolve the highest-index medium in the model.
@@ -741,10 +808,15 @@ def suggested_cell_size_m(sim, domain=None, cells_per_wavelength=None):
       :mod:`wavesim_gui.gridbuild`), so higher-index regions get finer cells
       without meshing the whole domain that fine.
 
-    Returns ``None`` when the max frequency is not positive.
+    Returns ``None`` when the driver has nothing to work from -- an unset max
+    frequency in full wave, no assigned geometry in electrostatics.
     """
+    from wavesim_gui.commands import is_electrostatic
+
     if domain is None:
         domain = find_domain(sim)
+    if is_electrostatic(sim):
+        return feature_cell_size_m(sim, domain, cells_per_feature)
     if domain is not None and getattr(domain, "UseNonuniformGrid", False):
         eps_bg, mu_bg = background_eps_mu(domain)
         return wavelength_cell_size_m(sim, eps_bg, mu_bg, domain,
@@ -950,6 +1022,31 @@ def _ensure_curvature_prop(obj):
         obj.CurvatureRefinement = 1.0
 
 
+def _ensure_feature_prop(obj):
+    """Add the electrostatic resolution knob if absent.
+
+    Idempotent, and called from ``__init__`` **and** ``onDocumentRestored`` for
+    the same reason as :func:`_ensure_curvature_prop`: a document saved before
+    electrostatics grew its own resolution driver would otherwise never gain the
+    property, and the panel's spin box would write nothing.
+
+    A static field has no wavelength, so ``CellsPerWavelength`` cannot size an
+    electrostatic mesh: the frequency it needs is one the user has to invent.
+    What sets the resolution instead is the geometry -- the field's gradient is
+    sharpest across the model's thinnest feature -- so this counts cells across
+    exactly that. See :func:`feature_cell_size_m`.
+    """
+    if not hasattr(obj, "CellsPerFeature"):
+        obj.addProperty(
+            "App::PropertyInteger", "CellsPerFeature", "Grid",
+            "Electrostatic mode only: cells resolving the smallest assigned "
+            "body's thinnest dimension, which is what sizes the cell in a mode "
+            "with no wavelength to count against (the full-wave equivalent is "
+            "CellsPerWavelength)",
+        )
+        obj.CellsPerFeature = 10
+
+
 def _set_snaps(obj, snaps):
     """Store the snapped grid lines (per-axis mm lists), or clear them.
 
@@ -1009,9 +1106,14 @@ def shell_geometry_warnings(sim, domain):
 
     if domain is None or sim is None:
         return []
+    from wavesim_gui.commands import is_electrostatic
+
     params = domain_grid_params(
         domain, force_pml_faces=pml_port_faces(sim),
-        modal_faces=modal_port_faces(sim))
+        modal_faces=modal_port_faces(sim),
+        electrostatic=is_electrostatic(sim))
+    # In electrostatic mode ``pml_faces`` is empty by construction, so this
+    # falls out here: there is no absorber for a body to be buried in.
     pml_faces = set(params["pml_faces"])
     if not pml_faces:
         return []
@@ -1082,7 +1184,8 @@ def electrostatic_boundary(domain):
     return out
 
 
-def domain_grid_params(domain, force_pml_faces=(), modal_faces=()):
+def domain_grid_params(domain, force_pml_faces=(), modal_faces=(),
+                       electrostatic=False):
     """Map a domain's per-face boundary settings to grid/solver parameters.
 
     Returns a dict with ``spacing_lo``/``spacing_hi`` (per-axis background gaps in
@@ -1111,8 +1214,18 @@ def domain_grid_params(domain, force_pml_faces=(), modal_faces=()):
     its gap is zeroed so the domain face lands exactly on the geometry the port
     plane must cut. *modal_faces* wins over *force_pml_faces* for a face named by
     both (a port cannot both terminate a face and hide behind an absorber).
+
+    *electrostatic* strips the absorber out entirely: no ``pml_faces``, zero
+    ``pad_*``, ``d_pml`` 0. Not merely cosmetic. The absorber costs a static
+    solve no *extent* -- it lies inside the box -- but ``pad_lo``/``pad_hi``
+    reserve those cells as **uniform coarse** ones and
+    :func:`wavesim_gui.gridbuild.build_axis_nodes` discards every feature snap
+    that falls in the shell. So a leftover PML thickness would unsnap the
+    outermost cells of each face: exactly where the Ground boundary sits, and
+    where a conductor run out to a face lands. A static field has no curl for an
+    absorber to correct, so there is nothing to keep.
     """
-    d_pml = int(getattr(domain, "PMLThickness", 8))
+    d_pml = 0 if electrostatic else int(getattr(domain, "PMLThickness", 8))
     bc = {face: getattr(domain, prop) for face, prop, _doc in _FACE_PROPS}
     for face in force_pml_faces or ():
         if face in bc:
@@ -1121,7 +1234,12 @@ def domain_grid_params(domain, force_pml_faces=(), modal_faces=()):
         if face in bc:
             bc[face] = _BC_MODAL
 
-    pml_faces = [f for f in _FACES if bc.get(f) == "PML"]
+    # With no absorber there is nothing for the drawn PML box or the shell-
+    # coloured grid lines to mark, so the list is empty rather than a set of
+    # faces whose shell happens to be zero cells deep -- ``execute`` reads it to
+    # decide whether to draw an inner box at all.
+    pml_faces = [] if electrostatic else [f for f in _FACES
+                                          if bc.get(f) == "PML"]
     pec_faces = [f for f in _FACES if bc.get(f) == "PEC"]
     modal = [f for f in _FACES if bc.get(f) == _BC_MODAL]
 
@@ -1717,9 +1835,20 @@ if _GUI_AVAILABLE:
 
             self.obj = obj
 
+            # The solver mode is settled first: it decides which resolution
+            # driver this panel offers (a wavelength has no meaning in a static
+            # solve), whether the absorber rows exist at all, and which of the
+            # two per-face boundary property sets the combos below edit.
+            from wavesim_gui.commands import active_simulation, is_electrostatic
+
+            self._es = is_electrostatic(active_simulation(obj.Document))
+
             form = QtWidgets.QWidget()
             form.setWindowTitle("Wavesim Domain")
             layout = QtWidgets.QFormLayout(form)
+            # Kept so _set_row_visible can reach a field's label: the rows that
+            # only mean something in one solver mode are hidden, not disabled.
+            self._layout = layout
 
             def cell_spin(value_mm):
                 spin = QtWidgets.QDoubleSpinBox()
@@ -1741,15 +1870,38 @@ if _GUI_AVAILABLE:
             self._dy = cell_spin(float(obj.Dy.Value))
             self._dz = cell_spin(float(obj.Dz.Value))
 
-            # Cells-per-wavelength + a one-click button that fills the cell sizes
-            # from the simulation's max frequency (c / (fmax * N_lambda * n)).
+            # The resolution knob, and the one-click button that fills the cell
+            # sizes from it. Which of the two is on show depends on the solver
+            # mode, because the driver does:
+            #
+            # * full wave -- cells per wavelength, c / (fmax * N_lambda * n);
+            # * electrostatic -- cells across the model's thinnest feature.
+            #
+            # Both are built and both are stored, exactly as the two per-face
+            # boundary sets below are, so switching modes back and forth never
+            # discards either answer.
             self._cpw = QtWidgets.QSpinBox()
             self._cpw.setRange(1, 1000)
             self._cpw.setSuffix(" cells/wavelength")
             self._cpw.setValue(int(getattr(obj, "CellsPerWavelength", 20)))
 
+            _ensure_feature_prop(obj)
+            self._cpf = QtWidgets.QSpinBox()
+            self._cpf.setRange(1, 1000)
+            self._cpf.setSuffix(" cells/smallest feature")
+            self._cpf.setValue(int(getattr(obj, "CellsPerFeature", 10)))
+            self._cpf.setToolTip(
+                "A static solve has no wavelength, so nothing about a medium "
+                "sizes its mesh -- only the geometry does. This counts cells "
+                "across the thinnest dimension of the smallest body assigned "
+                "to a material (conductors included: in an electrostatic run "
+                "they are the problem). The gap, feature-outline and curvature "
+                "snapping then refine below it where the grid is non-uniform."
+            )
+
             self._default_btn = QtWidgets.QPushButton(
-                "Default from max frequency"
+                "Default from geometry" if self._es
+                else "Default from max frequency"
             )
             self._default_btn.clicked.connect(self._apply_default_cell_size)
 
@@ -1872,6 +2024,9 @@ if _GUI_AVAILABLE:
             layout.addRow("Cell size dy:", self._dy)
             layout.addRow("Cell size dz:", self._dz)
             layout.addRow("Resolution:", self._cpw)
+            layout.addRow("Resolution:", self._cpf)
+            self._set_row_visible(self._cpw, not self._es)
+            self._set_row_visible(self._cpf, self._es)
             layout.addRow("", self._default_btn)
             layout.addRow(self._nonuniform)
             layout.addRow("Max grading ratio:", self._ratio)
@@ -1888,6 +2043,11 @@ if _GUI_AVAILABLE:
                 layout.addRow(_FACE_LABELS[face], self._spacings[prop])
             layout.addRow("Background material:", self._background)
             layout.addRow("PML thickness:", self._dpml)
+            # No absorber in a static solve, so no depth to set. Hidden rather
+            # than left inert: a leftover thickness used to reserve a shell of
+            # uniform coarse cells at each face and throw away the feature snaps
+            # inside it, so the row read as free and was not.
+            self._set_row_visible(self._dpml, not self._es)
 
             # Per-face boundary conditions. A "same on all faces" checkbox drives
             # every face from the first (X min) combo and greys the rest out.
@@ -1896,9 +2056,7 @@ if _GUI_AVAILABLE:
             # PML/PEC for a full-wave run, Ground/Symmetry for an electrostatic
             # one. Both are stored, so switching modes back and forth never
             # discards either answer.
-            from wavesim_gui.commands import active_simulation, is_electrostatic
             _sim = active_simulation(obj.Document)
-            self._es = is_electrostatic(_sim)
             if self._es:
                 _ensure_es_bc_props(obj)
             self._bc_props = _ES_FACE_PROPS if self._es else _FACE_PROPS
@@ -1956,10 +2114,10 @@ if _GUI_AVAILABLE:
                 "material). A Ground face holds phi = 0, which makes the box the "
                 "reference conductor every capacitance to ground is measured "
                 "against; a Symmetry face lets no field cross it, which is what "
-                "halves a mirror-symmetric model. The PML thickness costs an "
-                "electrostatic run nothing: it takes no cells of its own (the "
-                "absorber lies inside the box) and an absorber corrects terms "
-                "inside a curl, which a static field has none of."
+                "halves a mirror-symmetric model. There is no absorber here at "
+                "all -- one corrects terms inside a curl, which a static field "
+                "has none of -- so no PML is drawn, no depth is set, and the "
+                "cells at each face are meshed on the geometry like any other."
                 if self._es else
                 "The domain box auto-sizes to the assigned geometry plus the "
                 "per-face background spacing (filled with the background "
@@ -2013,6 +2171,7 @@ if _GUI_AVAILABLE:
             # "Default from max frequency" button after each. The enable/disable
             # handlers are connected first so they run before the re-derive.
             self._cpw.valueChanged.connect(self._auto_fill_cell_size)
+            self._cpf.valueChanged.connect(self._auto_fill_cell_size)
             self._nonuniform.toggled.connect(self._on_nonuniform)
             self._nonuniform.toggled.connect(self._auto_fill_cell_size)
             self._cubic.toggled.connect(self._live_apply)
@@ -2033,6 +2192,13 @@ if _GUI_AVAILABLE:
             self._initializing = False
 
             self.form = form
+
+        def _set_row_visible(self, widget, visible):
+            """Show/hide a form row (its field widget and its label)."""
+            widget.setVisible(visible)
+            label = self._layout.labelForField(widget)
+            if label is not None:
+                label.setVisible(visible)
 
         def _counts_text(self):
             """The Domain's cell counts as recomputed by ``execute``.
@@ -2147,6 +2313,7 @@ if _GUI_AVAILABLE:
                 "MinCellSize": (float(obj.MinCellSize.Value)
                                 if hasattr(obj, "MinCellSize") else 0.0),
                 "CurvatureRefinement": curvature_refinement(obj),
+                "CellsPerFeature": int(getattr(obj, "CellsPerFeature", 10)),
                 "spacing": {p: getattr(obj, p).Value
                             for p in self._spacing_order},
                 "PMLThickness": int(getattr(obj, "PMLThickness", 8)),
@@ -2161,6 +2328,8 @@ if _GUI_AVAILABLE:
             obj.Dy = "{} mm".format(self._dy.value())
             obj.Dz = "{} mm".format(self._dz.value())
             obj.CellsPerWavelength = int(self._cpw.value())
+            if hasattr(obj, "CellsPerFeature"):
+                obj.CellsPerFeature = int(self._cpf.value())
             obj.UseNonuniformGrid = bool(self._nonuniform.isChecked())
             obj.MaxGradingRatio = float(self._ratio.value())
             if hasattr(obj, "MinCellSize"):
@@ -2193,6 +2362,8 @@ if _GUI_AVAILABLE:
             obj.Dy = "{} mm".format(o["Dy"])
             obj.Dz = "{} mm".format(o["Dz"])
             obj.CellsPerWavelength = o["CellsPerWavelength"]
+            if hasattr(obj, "CellsPerFeature"):
+                obj.CellsPerFeature = o["CellsPerFeature"]
             obj.UseNonuniformGrid = o["UseNonuniformGrid"]
             obj.MaxGradingRatio = o["MaxGradingRatio"]
             if hasattr(obj, "MinCellSize"):
@@ -2231,17 +2402,28 @@ if _GUI_AVAILABLE:
             self._shell.setVisible(bool(messages))
 
         def _default_cell_size_mm(self):
-            """Cubic cell size (mm) from the max frequency, or None if it's unset.
+            """Cubic cell size (mm) from the live resolution row, or None.
 
-            Uses the live (uncommitted) cells-per-wavelength and background
-            selections. In non-uniform mode the size is the coarse *background*
-            resolution (the snapper refines each material below it by its index);
-            in uniform mode it is the global-finest size a single spacing needs.
+            Uses the live (uncommitted) resolution and background selections.
+
+            In **electrostatic** mode the driver is the geometry: cells across
+            the model's thinnest feature, the same number with the snapper on or
+            off, since a permittivity says nothing about what a Laplace solve
+            needs from its mesh. None when no body is assigned to a material.
+
+            In **full wave** it is the max frequency: in non-uniform mode the
+            coarse *background* resolution (the snapper refines each material
+            below it by its index), in uniform mode the global-finest size a
+            single spacing needs. None when the max frequency is unset.
             """
             from wavesim_gui.commands import active_simulation
 
             sim = active_simulation(self.obj.Document)
-            if self._nonuniform.isChecked():
+            if self._es:
+                size_m = feature_cell_size_m(
+                    sim, self.obj, cells_per_feature=self._cpf.value()
+                )
+            elif self._nonuniform.isChecked():
                 bg = self._selected_background()
                 eps_bg = float(getattr(bg, "Eps", 1.0)) if bg is not None else 1.0
                 mu_bg = float(getattr(bg, "Mu", 1.0)) if bg is not None else 1.0
@@ -2261,15 +2443,16 @@ if _GUI_AVAILABLE:
             self._mirror_cubic()
 
         def _auto_fill_cell_size(self, *_):
-            """Re-derive the cell size from the max frequency and apply at once.
+            """Re-derive the cell size from the live resolution and apply at once.
 
-            Wired to every input that changes the frequency-driven default (the
-            resolution, the background medium, the uniform/non-uniform toggle) so
-            the mesh tracks them immediately -- pressing "Default from max
-            frequency" is never required. Silent when the max frequency is unset
-            (it just applies the other edits). Manual dx/dy/dz edits are left
-            alone, so a hand-picked cell size survives until one of these inputs
-            changes.
+            Wired to every input that changes the derived default (either
+            resolution box, the background medium, the uniform/non-uniform
+            toggle) so the mesh tracks them immediately -- pressing the default
+            button is never required. Silent when the driver has nothing to work
+            from -- an unset max frequency in full wave, no assigned geometry in
+            electrostatics -- and it just applies the other edits. Manual
+            dx/dy/dz edits are left alone, so a hand-picked cell size survives
+            until one of these inputs changes.
             """
             if self._initializing:
                 return
@@ -2279,7 +2462,11 @@ if _GUI_AVAILABLE:
             self._live_apply()
 
         def _apply_default_cell_size(self):
-            """Button handler: fill dx/dy/dz from the max frequency (warn if unset)."""
+            """Button handler: fill dx/dy/dz from the resolution row.
+
+            Says which driver came up empty, since the two modes fail for
+            different reasons and the fix is in a different place.
+            """
             try:
                 from PySide import QtWidgets
             except ImportError:
@@ -2289,6 +2476,10 @@ if _GUI_AVAILABLE:
             if size_mm is None:
                 QtWidgets.QMessageBox.warning(
                     Gui.getMainWindow(), "Wavesim Domain",
+                    "Assign at least one body to a material first: an "
+                    "electrostatic mesh is sized from the geometry, so with "
+                    "nothing assigned there is no feature to resolve."
+                    if self._es else
                     "Set a positive max frequency on the Simulation first "
                     "(double-click the Simulation object).",
                 )

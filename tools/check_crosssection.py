@@ -19,6 +19,13 @@ What it checks, per test document and per axis:
   ``capacitor`` documents are two plates with a gap, and their mid-plane divides
   neither), so "no cap" is only a failure where there was something to cap.
 * **a plane clear of the body leaves it alone** -- same volume, same face count.
+* **a body wholly on the cut-away side comes back as nothing** -- the cut is a
+  half-space, not a knife, so a body the plane never reaches is still on the
+  wrong side of it. The regression: such a body used to survive whole and float,
+  uncut, in front of a sectioned model.
+* **the three buttons are one state** -- the grid implies a cut (it is drawn on
+  the cut plane and means nothing without one) and taking the cut down takes the
+  grid with it, over a stand-in Domain.
 * **the hatch lies on the cap** -- every segment sits at the cut plane (to
   within the lift that keeps it off the surface), inside the cap's own bounding
   box, and an annular cap gets segments over the metal rather than over its hole.
@@ -302,6 +309,161 @@ def check_teardown():
         "teardown (stand-in objects)"))
 
 
+def check_discarded_side():
+    """A body wholly on the cut-away side must come back as nothing.
+
+    The cut is a half-space, not a knife: what the tool shows is everything on
+    the kept side. A body the plane never reaches is still on the wrong side of
+    it, and the regression this guards is exactly that -- such a body used to
+    come back whole and float, uncut, in front of a sectioned model.
+    """
+    import Part
+
+    box = Part.makeBox(4.0, 4.0, 4.0, FreeCAD.Vector(0.0, 0.0, 10.0))
+    for axis, keep_low, coord, expect in (
+            (2, True, 5.0, None),       # box is above the plane, low kept
+            (2, False, 20.0, None),     # box is below the plane, high kept
+            (2, False, 5.0, "whole"),   # box is above the plane, high kept
+            (2, True, 20.0, "whole"),   # box is below the plane, low kept
+    ):
+        cut = xs.cut_shape(box, axis, coord, keep_low)
+        if expect is None:
+            check(cut is None,
+                  "discard: a body wholly beyond the plane survived "
+                  "(axis {}, coord {}, keep_low {})".format(
+                      xs.AXES[axis], coord, keep_low))
+        else:
+            check(cut is not None
+                  and abs(cut.Volume - box.Volume) <= _REL_TOL * box.Volume,
+                  "discard: a body wholly on the kept side was changed "
+                  "(axis {}, coord {}, keep_low {})".format(
+                      xs.AXES[axis], coord, keep_low))
+    print("  {:46s} beyond -> None, before -> whole".format(
+        "discarded side (offset box)"))
+
+
+class _FakeQuantity(object):
+    def __init__(self, value):
+        self.Value = value
+
+
+class _FakeDomain(_FakeObject):
+    """Enough of a Domain for the state properties and the grid planes."""
+
+    def __init__(self):
+        _FakeObject.__init__(self, "Domain")
+        for prop in xs._POSITION_PROPS:
+            setattr(self, prop, _FakeQuantity(0.0))
+        for prop in xs._SHOW_PROPS:
+            setattr(self, prop, True)
+
+    def __setattr__(self, name, value):
+        # The real Domain's App::PropertyDistance takes "3 mm" and reads back a
+        # quantity; keep that shape so read_plane_state sees what it expects.
+        if name in xs._POSITION_PROPS and not isinstance(value, _FakeQuantity):
+            value = _FakeQuantity(float(str(value).split()[0]))
+        object.__setattr__(self, name, value)
+
+    def addProperty(self, _type, name, _group=None, _doc=None):
+        object.__setattr__(self, name, False)
+        return self
+
+
+def check_extent_with_a_cut_up():
+    """The position range must survive its own cut.
+
+    A cut hides the bodies it stands in for, so a range taken from the *visible*
+    geometry collapses to nothing the moment one goes up -- and the position
+    control, ranged on it, traps the cut where it stands. Only bites where the
+    Domain has no bounds of its own, which is every document before the first
+    material is assigned.
+    """
+    import Part
+
+    body = _FakeObject("Body")
+    body.Shape = Part.makeBox(10.0, 10.0, 10.0)
+    doc = _FakeDocument([body])
+
+    lo, hi = xs.axis_extent_mm(None, doc, 2)
+    check((lo, hi) == (0.0, 10.0),
+          "extent: a visible body gives {}..{}, expected 0..10".format(lo, hi))
+
+    # ...now cut: hidden, and marked as hidden by us
+    xs._hide_source(body)
+    lo, hi = xs.axis_extent_mm(None, doc, 2)
+    check((lo, hi) == (0.0, 10.0),
+          "extent: with the cut up the range collapsed to {}..{} -- the cut "
+          "can no longer be moved".format(lo, hi))
+
+    # a body the *user* hid carries no marker and stays out of the range
+    other = _FakeObject("Other", visible=False)
+    other.Shape = Part.makeBox(5.0, 5.0, 5.0, FreeCAD.Vector(0.0, 0.0, 50.0))
+    doc.Objects.append(other)
+    lo, hi = xs.axis_extent_mm(None, doc, 2)
+    check((lo, hi) == (0.0, 10.0),
+          "extent: a body the user hid was counted, giving {}..{}".format(
+              lo, hi))
+    print("  {:46s} 0..10 visible, cut, and beside a hidden body".format(
+        "extent under a cut (stand-in objects)"))
+
+
+def check_toggle_state():
+    """The three buttons are one state, and the grid is the stronger switch.
+
+    Grid on implies a cut (a mesh plane through a solid model is the thing the
+    cut exists to make readable); cut off implies grid off. Runs over a
+    stand-in Domain -- a console document has no view provider to draw either.
+    """
+    domain = _FakeDomain()
+    doc = _FakeDocument([domain])
+    real_find = xs.find_domain
+    xs.find_domain = lambda _doc: domain
+    try:
+        check(xs.ensure_state_props(domain), "toggle: state props refused")
+        check(not xs.is_active(doc) and not xs.is_grid_on(doc),
+              "toggle: a fresh domain claims a cut is up")
+
+        # An unconfigured document still has a cut to raise: the default axis,
+        # centred -- otherwise the button would appear to do nothing.
+        xs.set_active(doc, True)
+        check(xs.is_active(doc), "toggle: the cut did not come up")
+        state = xs.read_state(domain, doc)
+        check(state["configured"] and state["axis"] == xs._DEFAULT_AXIS,
+              "toggle: switching on left the cut unconfigured")
+        check(not xs.is_grid_on(doc),
+              "toggle: the cut brought the grid up with it")
+
+        # The grid is the stronger switch: it implies the cut.
+        xs.set_active(doc, False)
+        xs.set_grid(doc, True)
+        check(xs.is_grid_on(doc) and xs.is_active(doc),
+              "toggle: the grid came up without a cut under it")
+        check(xs.read_plane_state(domain)[1] == (False, False, True),
+              "toggle: the grid is drawn on {} planes, expected only the cut's"
+              .format(xs.read_plane_state(domain)[1]))
+
+        # ...and taking the cut down takes the grid with it.
+        xs.set_active(doc, False)
+        check(not xs.is_active(doc) and not xs.is_grid_on(doc),
+              "toggle: the grid outlived the cut it was drawn on")
+        check(xs.read_plane_state(domain)[1] == (False, False, False),
+              "toggle: a grid plane is still drawn with no cut up")
+
+        # A configured cut is remembered, not re-centred, across a toggle.
+        xs.write_state(domain, axis=0, flip=True, style=xs.CAP_HATCHED)
+        xs.write_plane_state(domain, position_mm=3.25, axis=0)
+        xs.set_active(doc, True)
+        state = xs.read_state(domain, doc)
+        check((state["axis"], state["flip"], state["style"]) ==
+              (0, True, xs.CAP_HATCHED)
+              and abs(state["position"] - 3.25) < 1.0e-9,
+              "toggle: the stored configuration was lost: {}".format(state))
+    finally:
+        xs.find_domain = real_find
+    print("  {:46s} grid implies cut, cut off implies grid off".format(
+        "toggle state (stand-in domain)"))
+
+
 def check_cap_shading():
     """The cap tint must be darker than the body, and the list the right length."""
     import Part
@@ -338,6 +500,9 @@ def main():
     print("Cross-section gate\n")
     print("synthetic:")
     check_teardown()
+    check_discarded_side()
+    check_extent_with_a_cut_up()
+    check_toggle_state()
     check_cap_shading()
     check_annulus()
     print("\ndocuments in {}:".format(DOCS))

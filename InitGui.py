@@ -34,6 +34,9 @@ class WavesimWorkbench(Gui.Workbench):
     MenuText = "Wavesim"
     ToolTip = "FDTD electromagnetic simulation powered by the Wavesim solver"
 
+    # Filled in by Initialize; the cross-section toolbar's commands (see there).
+    view_command_list = []
+
     def Initialize(self):
         """Set up commands, toolbars and menus.
 
@@ -112,10 +115,15 @@ class WavesimWorkbench(Gui.Workbench):
             from wavesim_gui import portmatrix  # noqa: F401
 
             add_group("Wavesim_Run", "Wavesim_PortMatrix")
-            # Viewing: cuts the model open on a grid plane. Its own group
-            # because it changes nothing in the model and runs nothing --
-            # it is how you look at what the other buttons built.
-            add_group("Wavesim_CrossSection")
+            # Viewing: cutting the model open on a grid plane. NOT part of
+            # command_list -- it gets a toolbar of its own, below (see
+            # view_command_list). It changes nothing in the model and runs
+            # nothing; it is how you look at what the other buttons built, and
+            # it is used far more often than any of them.
+            self.view_command_list = [
+                "Wavesim_CrossSectionToggle",
+                "Wavesim_CrossSectionGrid",
+            ]
         except Exception as exc:
             FreeCAD.Console.PrintError(
                 "Wavesim: failed to load commands module ({}: {})\n".format(
@@ -142,10 +150,32 @@ class WavesimWorkbench(Gui.Workbench):
         if self.command_list:
             self.appendToolbar("Wavesim", self.command_list)
             self.appendMenu("Wavesim", self.command_list)
+        # The cross-section controls get a **second toolbar**, which Qt puts on
+        # a row of its own (crosssection._force_new_row asks for the break).
+        # Two buttons plus three raw widgets -- an axis box, a position spinner
+        # and a flip switch -- that are not commands at all and so cannot go in
+        # command_list; crosssection.install_toolbar_controls() adds them to
+        # this toolbar on every activation. The menu keeps the two commands
+        # beside the rest, since a menu has no room for the widgets.
+        if self.view_command_list:
+            self.appendToolbar("Wavesim Cross Section", self.view_command_list)
+            self.appendMenu("Wavesim", self.view_command_list)
 
     def Activated(self):
-        """Called when the user switches to this workbench."""
-        pass
+        """Called when the user switches to this workbench.
+
+        FreeCAD destroys a workbench's toolbars when the user switches away, so
+        the cross-section widgets have to be rebuilt every time rather than
+        installed once at startup.
+        """
+        try:
+            from wavesim_gui import crosssection
+
+            crosssection.install_toolbar_controls()
+        except Exception as exc:
+            FreeCAD.Console.PrintError(
+                "Wavesim: could not build the cross-section toolbar "
+                "controls ({}: {})\n".format(type(exc).__name__, exc))
 
     def Deactivated(self):
         """Called when the user switches away from this workbench."""

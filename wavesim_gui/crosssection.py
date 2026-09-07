@@ -14,15 +14,53 @@ the test suite the whole per-move cost (cut + FreeCAD's own tessellation) runs
 from 40 ms on ``coaxial_line`` to 630 ms on ``bent_coax``, which is why the panel
 debounces (see :data:`_DEBOUNCE_MS`) rather than recutting on every keystroke.
 
+A cut is a half-space, not a knife
+---------------------------------
+What the tool shows is **everything on the kept side of the plane**, which is
+not the same thing as everything the plane cut. A body lying wholly beyond the
+plane is cut by nothing and still has to go -- otherwise it floats, whole and
+uncut, in front of a sectioned model and the picture is a lie about where the
+plane is. So :func:`cut_shape` returns ``None`` for such a body and
+:meth:`CrossSectionPreview.apply` hides it with the rest, preview or no preview.
+
 The cut plane **is a grid plane**
 --------------------------------
 There is no second position property. The cut sits at the Domain's own
 ``GridPlaneX/Y/Z`` (:func:`domain.grid_plane_positions_mm`), so moving the cut
 moves the voxel grid drawn on it, by construction rather than by syncing -- which
 is the point of the tool: to read the mesh against the geometry it will
-discretise. The panel also switches the other two grid planes off through the
-Domain's ``ShowGridPlaneX/Y/Z``, because three grids at once over a sectioned
-model is unreadable.
+discretise. The other two grid planes are switched off through the Domain's
+``ShowGridPlaneX/Y/Z``, because three grids at once over a sectioned model is
+unreadable.
+
+A toolbar, not a dialog
+-----------------------
+Looking inside a model is something you do repeatedly *while* building it, so
+none of this is behind a task panel (there used to be one; it is gone). The
+whole tool is one toolbar of its own: two checkable buttons -- the cut
+(``Wavesim_CrossSectionToggle``) and the mesh grid on it
+(``Wavesim_CrossSectionGrid``) -- and three raw widgets for the axis, the
+position and which half is kept. Pick the axis, drag the position, press the
+button; nothing to open, nothing to confirm, and nothing exclusive locking the
+rest of the GUI while a cut is up.
+
+The two switches are not independent. **The grid is the stronger one**: it
+implies the cut, because a mesh plane through an unsectioned solid model is
+exactly the picture the cut exists to replace. So switching the grid on raises a
+cut under it, and switching the cut off takes the grid down with it.
+
+All of it is one state, and that state is **on the Domain**
+(:data:`_STATE_PROPS`), hidden, beside the plane positions that already hold the
+cut's *position*. It has to be: the widgets set up a cut before it is switched
+on, so their edits have to land somewhere a live cut is not. Everything on
+screen comes back out of there through the one function :func:`apply_state`,
+so the widgets and the buttons cannot drift apart -- and the buttons' checkmarks
+are pushed back *from* the state (``_sync_toggle_actions``) rather than tracking
+their own clicks, which is what makes the grid-implies-cut rule visible on the
+other button.
+
+The one setting with no control is the cap style, which is a taste you set once:
+it stays as an ordinary Domain property, and the property editor is its UI.
 
 Denoting the cut face
 ---------------------
@@ -33,7 +71,8 @@ the hierarchy matters: the grid is the thing being read, the section marking is
 context. A fixed black hatch inverts that and becomes the loudest thing on
 screen.
 
-* ``CAP_SHADED`` (the default) -- no extra geometry at all. The cap faces are
+* ``CAP_SHADED`` (the default, and what a document gets unless somebody edits
+  the Domain's ``WavesimXSecStyle``) -- no extra geometry at all. The cap faces are
   found by :func:`is_cap_face` and tinted through a per-face ``DiffuseColor``
   built to the cut's own face count. Nothing to z-fight with, nothing to hatch.
 * ``CAP_HATCHED`` -- cross-hatch lines at +/-45 degrees over the cap, one line
@@ -66,12 +105,17 @@ always does both halves. Any entry point can then undo a cut it did not make --
 which is exactly what a second panel, and a reload, need to do.
 
 **It does not survive a reload.** :class:`_RestoreSweeper` runs that same sweep
-as a document finishes loading, so a cut saved by accident comes back whole,
-bodies and all. It is also not live: edit the geometry or the mesh while a cut is
-up and the preview is stale until the panel is re-opened.
+as a document finishes loading -- and clears the state that says a cut is up, so
+the toggle button agrees with the model -- so a cut saved by accident comes back
+whole, bodies and all. It is also not live: edit the geometry or the mesh while
+a cut is up and the preview is stale until it is re-applied.
 
-Importing this module registers ``Wavesim_CrossSection`` with ``Gui.addCommand``
-when a GUI is available.
+Importing this module registers ``Wavesim_CrossSectionToggle`` and
+``Wavesim_CrossSectionGrid`` with ``Gui.addCommand`` when a GUI is available.
+The three widgets are not commands and cannot be registered: the workbench's
+``Activated`` hook calls :func:`install_toolbar_controls` to push them into the
+toolbar, every time, because FreeCAD tears that toolbar down on a workbench
+switch.
 """
 
 import math
@@ -86,7 +130,10 @@ import FreeCAD
 
 _WB_DIR = os.path.join(FreeCAD.getUserAppDataDir(), "Mod", "wavesim-workbench")
 _ICONS_DIR = os.path.join(_WB_DIR, "Resources", "icons")
+# The cut's own icon is the on/off button: with the task panel gone there is
+# nothing else for it to be.
 _XSEC_ICON = os.path.join(_ICONS_DIR, "cross_section.svg")
+_XSEC_GRID_ICON = os.path.join(_ICONS_DIR, "cross_section_grid.svg")
 
 # Axis names in the x/y/z order every index in this module uses.
 AXES = ("x", "y", "z")
@@ -211,8 +258,9 @@ def cut_shape(shape, axis, coord, keep_low):
 
     The result is a closed solid carrying a real face in the cut plane -- that
     face is what makes the section read as material instead of as the hollow an
-    OpenGL clip plane leaves. A shape the plane misses entirely comes back
-    unchanged.
+    OpenGL clip plane leaves. A shape wholly on the kept side comes back
+    unchanged; one wholly on the discarded side comes back as ``None``, and the
+    caller has to hide it -- see :meth:`CrossSectionPreview.apply`.
     """
     box = _cut_box(shape.BoundBox, axis, coord, keep_low)
     if box is None:
@@ -495,7 +543,7 @@ class CrossSectionPreview(object):
 
     def _alive(self):
         return (self.doc is not None
-                and self.doc.Name in FreeCAD.listDocuments())
+                and getattr(self.doc, "Name", None) in FreeCAD.listDocuments())
 
     # -- teardown ------------------------------------------------------- #
 
@@ -517,33 +565,45 @@ class CrossSectionPreview(object):
     # -- build ---------------------------------------------------------- #
 
     def apply(self, axis, coord, keep_low, style=CAP_SHADED):
-        """Cut every visible solid at ``axis == coord``; returns the body count.
+        """Cut every visible solid at ``axis == coord``.
+
+        Returns ``(sectioned, removed)`` -- how many bodies came back with
+        something left to draw, and how many lay wholly on the discarded side.
 
         Rebuilds from scratch each time -- the sources are read *before* anything
         is hidden, so re-applying cuts the real bodies rather than the last cut.
+
+        **A body the plane does not reach is still on the wrong side of it.**
+        The cut is a half-space, not a knife: what the tool shows is everything
+        on the kept side, so a body lying entirely beyond the plane has to go
+        even though there was nothing to cut. It gets no preview and is hidden
+        like any other source -- which is the one thing that used to be missed,
+        leaving un-cut bodies floating in front of a sectioned model.
         """
         from wavesim_gui import visibility
 
         if not self._alive():
-            return 0
+            return (0, 0)
         self.clear()
         sources = visible_solids(self.doc)
         if not sources:
-            return 0
+            return (0, 0)
 
-        cuts = []
+        cuts, removed = [], []
         for obj in sources:
             shape = cut_shape(obj.Shape, axis, coord, keep_low)
-            if shape is not None:
+            if shape is None:
+                removed.append(obj)     # wholly beyond the plane
+            else:
                 cuts.append((obj, shape))
-        if not cuts:
-            # The plane took every body. Leave the model alone rather than show
-            # an empty scene the user cannot tell from a broken one.
-            return 0
 
         with visibility.suppressed():
             for obj, _shape in cuts:
                 _hide_source(obj)
+            for obj in removed:
+                _hide_source(obj)
+        if not cuts:
+            return (0, len(removed))
 
         pitch = _hatch_pitch([shape for _obj, shape in cuts], axis)
         for obj, shape in cuts:
@@ -551,7 +611,7 @@ class CrossSectionPreview(object):
             if style == CAP_HATCHED:
                 self._add_hatch(obj, shape, axis, coord, keep_low, pitch)
         self._show()
-        return len(cuts)
+        return (len(cuts), len(removed))
 
     def _show(self):
         """Bring the previews we just added onto the screen.
@@ -695,16 +755,29 @@ def axis_extent_mm(domain, doc, axis):
     """``(lo, hi)`` the cut may travel between on *axis*, in world mm.
 
     The domain box, which is what the grid plane is clamped to anyway
-    (:func:`domain.grid_plane_positions_mm`). Falls back to the visible geometry
-    for a document whose domain has not been sized yet, so the tool still works
-    before any material is assigned.
+    (:func:`domain.grid_plane_positions_mm`). Falls back to the geometry itself
+    for a document whose domain has not been sized yet -- a domain is sized from
+    the bodies that have a *material*, so this is the whole range before the
+    first material is assigned.
+
+    That fallback counts the bodies **the cut has hidden** as well as the
+    visible ones. It has to: hiding them is what a cut does, so a fallback that
+    looked only at what is on screen would collapse to nothing the moment a cut
+    went up -- and the position control, ranged on it, would trap the cut where
+    it stood.
     """
     mn = getattr(domain, "DomainMin", None) if domain is not None else None
     mx = getattr(domain, "DomainMax", None) if domain is not None else None
     if mn is not None and mx is not None and (mn - mx).Length > 1.0e-9:
         return (getattr(mn, AXES[axis]), getattr(mx, AXES[axis]))
     bbox = FreeCAD.BoundBox()
-    for obj in visible_solids(doc):
+    sources = list(visible_solids(doc))
+    for obj in (getattr(doc, "Objects", []) or []):
+        shape = getattr(obj, "Shape", None)
+        if (getattr(obj, _HIDDEN_PROP, False) and shape is not None
+                and not shape.isNull() and shape.Solids):
+            sources.append(obj)
+    for obj in sources:
         bbox.add(obj.Shape.BoundBox)
     if not bbox.isValid():
         return (0.0, 0.0)
@@ -748,7 +821,230 @@ def write_plane_state(domain, position_mm=None, axis=None, show=None):
 
 
 # --------------------------------------------------------------------------- #
-# GUI: task panel + command
+# The cut as state: what the toggles switch
+# --------------------------------------------------------------------------- #
+#
+# The cut has three buttons, not one: *configure* opens the panel, *toggle* puts
+# the last configuration up and takes it down, and *grid* does the same for the
+# mesh drawn on the cut plane. Two of those have to raise a cut nobody is
+# looking at a panel for, so the configuration cannot live in the panel -- it
+# lives on the Domain, hidden, beside the plane positions it already owns.
+#
+# The position is **not** duplicated here. It is ``GridPlaneX/Y/Z``, which is
+# the whole premise of the tool (see the module docstring); only which axis,
+# which side, how the cap is marked, and whether each switch is on are stored.
+#
+# The grid is the stronger switch: it implies the cut. Grid on with no cut would
+# be a mesh plane floating through a solid model -- the thing the cut exists to
+# make readable -- so :func:`set_grid` turns the cut on with it, and turning the
+# cut off takes the grid down too.
+
+_STATE_AXIS = "WavesimXSecAxis"      # 0/1/2, or -1 for "never configured"
+_STATE_FLIP = "WavesimXSecFlip"      # keep the far side instead
+_STATE_STYLE = "WavesimXSecStyle"    # one of CAP_STYLES
+_STATE_GRID = "WavesimXSecGrid"      # draw the voxel grid on the cut plane
+_STATE_ON = "WavesimXSecOn"          # is a cut up right now
+
+# What the property editor says about them. Only the cap style is shown there
+# (see ensure_state_props), so it is the only one that needs to read well.
+_STATE_DOC = {
+    _STATE_STYLE: ("How the exposed section face is marked: Shaded tints it a "
+                   "darker shade of the body's own colour, Hatched draws "
+                   "cross-hatch lines over it, Plain leaves it in the body "
+                   "colour. Both markings derive from the body colour, so "
+                   "they stay quieter than the voxel grid drawn on the cut."),
+}
+
+_STATE_PROPS = (
+    (_STATE_AXIS, "App::PropertyInteger", -1),
+    (_STATE_FLIP, "App::PropertyBool", False),
+    (_STATE_STYLE, "App::PropertyEnumeration", CAP_SHADED),
+    (_STATE_GRID, "App::PropertyBool", False),
+    (_STATE_ON, "App::PropertyBool", False),
+)
+
+# The axis a cut opens on when the tool has never been configured in this
+# document: z, the usual one to look down on a layered model.
+_DEFAULT_AXIS = 2
+
+
+def ensure_state_props(domain):
+    """Add the cross-section state properties to *domain* if it lacks them.
+
+    Hidden from the property editor: they are the tool's own bookkeeping, and
+    the two that mean anything on their own (position, grid visibility) are
+    already editable as ``GridPlane*``/``ShowGridPlane*``.
+    """
+    if domain is None:
+        return False
+    for prop, kind, default in _STATE_PROPS:
+        if hasattr(domain, prop):
+            continue
+        try:
+            domain.addProperty(kind, prop, "Grid", _STATE_DOC.get(prop, ""))
+            if kind == "App::PropertyEnumeration":
+                setattr(domain, prop, list(CAP_STYLES))
+            setattr(domain, prop, default)
+            # All but the cap style: those four are switch positions the two
+            # buttons own, and a second way to set them from the property
+            # editor could only ever disagree with the buttons.
+            if prop != _STATE_STYLE:
+                domain.setEditorMode(prop, 2)
+        except Exception:
+            return False
+    return True
+
+
+def find_domain(doc):
+    """The Domain of *doc*'s simulation, or ``None``."""
+    from wavesim_gui import commands, domain as domain_mod
+
+    sim = commands.active_simulation(doc)
+    return None if sim is None else domain_mod.find_domain(sim)
+
+
+def read_state(domain, doc=None):
+    """The cut's stored configuration as a dict, defaults filled in.
+
+    ``axis`` is never ``None`` here -- an unconfigured document reads back as
+    the default axis centred in the domain, which is what a toggle needs to be
+    able to raise a cut with nothing configured yet.
+    """
+    axis = int(getattr(domain, _STATE_AXIS, -1)) if domain is not None else -1
+    configured = 0 <= axis <= 2
+    if not configured:
+        axis = _DEFAULT_AXIS
+    positions, _show = (read_plane_state(domain) if domain is not None
+                        else ((0.0, 0.0, 0.0), (True, True, True)))
+    position = positions[axis]
+    if not configured:
+        lo, hi = axis_extent_mm(domain, doc, axis)
+        position = 0.5 * (lo + hi)
+    style = str(getattr(domain, _STATE_STYLE, CAP_SHADED) or CAP_SHADED)
+    return {
+        "axis": axis,
+        "configured": configured,
+        "position": position,
+        "flip": bool(getattr(domain, _STATE_FLIP, False)),
+        "style": style if style in CAP_STYLES else CAP_SHADED,
+        "grid": bool(getattr(domain, _STATE_GRID, False)),
+        "on": bool(getattr(domain, _STATE_ON, False)),
+    }
+
+
+def write_state(domain, **values):
+    """Store any of ``axis``/``flip``/``style``/``grid``/``on`` on *domain*."""
+    if domain is None:
+        return
+    ensure_state_props(domain)
+    for key, prop in (("axis", _STATE_AXIS), ("flip", _STATE_FLIP),
+                      ("style", _STATE_STYLE), ("grid", _STATE_GRID),
+                      ("on", _STATE_ON)):
+        if key not in values:
+            continue
+        try:
+            setattr(domain, prop, values[key])
+        except Exception:
+            pass
+
+
+def apply_state(doc, domain=None):
+    """Put *doc* into the state its Domain describes; returns ``(kept, removed)``.
+
+    The single path from stored state to what is on screen, so the toggles, the
+    panel and a re-apply after an edit all raise exactly the same picture.
+    ``(0, 0)`` when the cut is off -- which also takes the grid planes down,
+    because the grid is only ever drawn on a cut.
+    """
+    if domain is None:
+        domain = find_domain(doc)
+    if domain is None:
+        sweep(doc)
+        return (0, 0)
+    state = read_state(domain, doc)
+    if not state["on"]:
+        sweep(doc)
+        write_plane_state(domain, show=(False, False, False))
+        return (0, 0)
+
+    axis = state["axis"]
+    show = [False, False, False]
+    show[axis] = state["grid"]
+    write_plane_state(domain, position_mm=state["position"], axis=axis,
+                      show=show)
+    try:
+        return CrossSectionPreview(doc).apply(
+            axis, state["position"], keep_low=not state["flip"],
+            style=state["style"])
+    except Exception as exc:
+        sweep(doc)
+        FreeCAD.Console.PrintError(
+            "Wavesim: could not build the cross-section ({}: {})\n"
+            .format(type(exc).__name__, exc))
+        return (0, 0)
+
+
+def _adopt_defaults(domain, doc):
+    """Write the opening configuration for a document that has never had one."""
+    state = read_state(domain, doc)
+    if state["configured"]:
+        return state
+    write_state(domain, axis=state["axis"])
+    write_plane_state(domain, position_mm=state["position"], axis=state["axis"])
+    return read_state(domain, doc)
+
+
+def is_active(doc):
+    """Whether a cut is up in *doc*."""
+    domain = find_domain(doc)
+    return domain is not None and bool(getattr(domain, _STATE_ON, False))
+
+
+def is_grid_on(doc):
+    """Whether the voxel grid is drawn on the cut in *doc*."""
+    domain = find_domain(doc)
+    return (domain is not None and bool(getattr(domain, _STATE_ON, False))
+            and bool(getattr(domain, _STATE_GRID, False)))
+
+
+def set_active(doc, on):
+    """Raise or take down the cut, keeping the grid switch consistent.
+
+    Turning the cut off turns the grid off with it: the grid is drawn on the
+    cut plane and means nothing without one. Returns what :func:`apply_state`
+    did, as ``(sectioned, removed)``.
+    """
+    domain = find_domain(doc)
+    if domain is None:
+        return False
+    ensure_state_props(domain)
+    if on:
+        _adopt_defaults(domain, doc)
+        write_state(domain, on=True)
+    else:
+        write_state(domain, on=False, grid=False)
+    return apply_state(doc, domain)
+
+
+def set_grid(doc, on):
+    """Switch the mesh grid on the cut plane -- turning the cut on if needed.
+
+    Returns what :func:`apply_state` did, as ``(sectioned, removed)``.
+    """
+    domain = find_domain(doc)
+    if domain is None:
+        return False
+    ensure_state_props(domain)
+    if on:
+        _adopt_defaults(domain, doc)
+        write_state(domain, grid=True, on=True)
+    else:
+        write_state(domain, grid=False)
+    return apply_state(doc, domain)
+
+
+# --------------------------------------------------------------------------- #
+# GUI: task panel + commands
 # --------------------------------------------------------------------------- #
 
 try:
@@ -769,9 +1065,35 @@ class _RestoreSweeper(object):
     stored with their own visibility, which the sweep does not touch.
     """
 
+    def slotCreatedObject(self, obj):
+        """A Domain appearing gives the toolbar controls a range to read.
+
+        Creating the Simulation does not change which document is active, so
+        the active-document watcher never hears about it -- and the controls
+        would go on showing the 0..0 range of a document that had no Domain
+        when they were built.
+        """
+        if not (hasattr(obj, _POSITION_PROPS[0])
+                or getattr(obj, "WavesimType", None) == "Simulation"):
+            return
+        try:
+            refresh_toolbar_controls()
+        except Exception:      # console mode: no controls to refresh
+            pass
+
     def slotFinishRestoreDocument(self, doc):
         try:
             removed = sweep(doc)
+            # ...and the state that says a cut is up, so the toggle button
+            # agrees with the model the user is looking at. The grid planes go
+            # down with it: a grid is drawn on a cut, so a document saved with
+            # one showing must not come back with a mesh plane hanging in an
+            # uncut model. This is also the migration for a document written
+            # before the grid had its own button, when all three defaulted on.
+            domain = find_domain(doc)
+            if domain is not None:
+                write_state(domain, on=False, grid=False)
+                write_plane_state(domain, show=(False, False, False))
         except Exception:
             return
         if removed:
@@ -796,267 +1118,547 @@ if _GUI_AVAILABLE:
 
     from wavesim_gui.commands import active_simulation
 
-    class TaskCrossSectionPanel:
-        """Task-tab panel: which axis to cut on, and where.
+    # The two checkable commands, so any path that changes the state can put
+    # their buttons back in step -- the panel, and each other (switching the
+    # grid on switches the cut on under it).
+    _TOGGLE_COMMAND = "Wavesim_CrossSectionToggle"
+    _GRID_COMMAND = "Wavesim_CrossSectionGrid"
 
-        Live, like the Domain panel, but **debounced**: the axis, the position,
-        the side and the grid checkbox all schedule a recut rather than doing
-        one, so holding an arrow key on the position spinner cannot queue a
-        boolean per keystroke (the cut costs 40-630 ms depending on the model).
+    def _qaction_class():
+        """``QAction``, which moved from QtWidgets to QtGui in Qt 6."""
+        try:
+            from PySide import QtGui
 
-        OK leaves the cut standing -- the panel is exclusive, so a tool that
-        restored the model on close could only ever be looked at through itself.
-        Cancel puts back the bodies, the plane positions and the grid flags
-        exactly as they were on open.
+            if hasattr(QtGui, "QAction"):
+                return QtGui.QAction
+        except ImportError:
+            pass
+        from PySide import QtWidgets
+
+        return QtWidgets.QAction
+
+    def _sync_toggle_actions(doc):
+        """Put the two toolbar buttons' checkmarks back in step with the state.
+
+        FreeCAD names a command's ``QAction`` after the command, so the buttons
+        can be found and set without holding a reference to them -- which the
+        commands cannot do anyway, since FreeCAD builds one action per toolbar
+        and per menu from the same command. Signals are blocked around the set:
+        this is a readout of the state, not a click.
+        """
+        try:
+            window = Gui.getMainWindow()
+            if window is None:
+                return
+            wanted = {_TOGGLE_COMMAND: is_active(doc),
+                      _GRID_COMMAND: is_grid_on(doc)}
+            for action in window.findChildren(_qaction_class()):
+                state = wanted.get(action.objectName())
+                if state is None or not action.isCheckable():
+                    continue
+                blocked = action.blockSignals(True)
+                action.setChecked(bool(state))
+                action.blockSignals(blocked)
+        except Exception:
+            pass
+        try:
+            refresh_toolbar_controls()
+        except Exception:
+            pass
+
+    # ----------------------------------------------------------------- #
+    # The settings, on the toolbar
+    # ----------------------------------------------------------------- #
+    #
+    # There is no task panel. Which axis, where, and which half is a setting
+    # you change *while looking at the model* -- often several times a minute
+    # -- and a modal task panel is the wrong shape for that: it has to be
+    # opened, it is exclusive (nothing else can be edited while it is up), and
+    # it puts an OK button between the user and a cut they can already see.
+    # So the three settings are toolbar widgets sitting next to the two buttons
+    # they feed, and the sequence the tool is used in -- pick the axis, drag the
+    # position, press the toggle -- is one row of controls with no dialog in it.
+    #
+    # The price is that a toolbar widget is not a FreeCAD command: it is a raw
+    # ``QWidget`` pushed into the ``QToolBar`` behind FreeCAD's back, so it has
+    # no menu entry, no shortcut, and FreeCAD's Customize dialog cannot see it.
+    # It also has to be rebuilt on every workbench activation, because FreeCAD
+    # tears the toolbar down when the user switches away and back.
+
+    _TOOLBAR = "Wavesim Cross Section"
+
+    # Object names for the widgets we push into that toolbar. They are how a
+    # re-activation finds the ones it left behind, so it can take them out
+    # instead of adding a second set beside them.
+    _AXIS_WIDGET = "WavesimXSecAxisBox"
+    _POSITION_WIDGET = "WavesimXSecPositionBox"
+    _FLIP_WIDGET = "WavesimXSecFlipBox"
+    _OUR_WIDGETS = (_AXIS_WIDGET, _POSITION_WIDGET, _FLIP_WIDGET)
+
+    # A cut sitting on the domain wall shows nothing at all, so a plane that has
+    # never been moved off it is centred when its axis is picked instead. This
+    # is how far off the wall (as a fraction of the axis span) still counts as
+    # "on it".
+    _WALL_FRAC = 1.0e-6
+
+
+    class _CrossSectionControls(object):
+        """Axis, position and flip, as widgets on the cross-section toolbar.
+
+        Edits go **into the stored state** whether or not a cut is up: setting
+        the controls with the cut off and then pressing the toggle is the way
+        the tool is meant to be used, so the settings cannot be something only
+        a live cut remembers. When a cut *is* up the edit also recuts, on the
+        same debounce the panel used (:data:`_DEBOUNCE_MS`) -- holding an arrow
+        key on the position spinner must not queue one boolean per keystroke.
         """
 
-        def __init__(self, sim, doc):
+        def __init__(self):
+            self._axis = None
+            self._position = None
+            self._flip = None
+            self._timer = None
+            self._filter = None
+            self._loading = False
+
+        # -- installation ---------------------------------------------- #
+
+        @staticmethod
+        def _toolbar():
+            try:
+                from PySide import QtWidgets
+            except ImportError:
+                from PySide import QtGui as QtWidgets
+            window = Gui.getMainWindow()
+            if window is None:
+                return None
+            return window.findChild(QtWidgets.QToolBar, _TOOLBAR)
+
+        def install(self):
+            """Build the widgets into the toolbar, replacing any we left there.
+
+            Idempotent by demolition rather than by detection: FreeCAD may have
+            destroyed the widgets with the toolbar, in which case the Python
+            references we hold point at deleted C++ objects and cannot be told
+            apart from live ones without touching them. Taking out anything
+            carrying our names and building fresh is the version with no
+            question in it.
+            """
+            toolbar = self._toolbar()
+            if toolbar is None:
+                return False
+            self._remove_ours(toolbar)
+            self._build(toolbar)
+            _force_new_row(toolbar)
+            self.refresh()
+            # FreeCAD builds a checkable command's action **checked**, so
+            # without this both buttons come up pressed over a model with no
+            # cut in it. The state is the truth; the actions are a readout.
+            _sync_toggle_actions(FreeCAD.ActiveDocument)
+            return True
+
+        @staticmethod
+        def _remove_ours(toolbar):
+            for action in list(toolbar.actions()):
+                try:
+                    widget = action.defaultWidget()
+                except Exception:
+                    continue
+                if widget is not None and widget.objectName() in _OUR_WIDGETS:
+                    toolbar.removeAction(action)
+
+        def _build(self, toolbar):
             try:
                 from PySide import QtWidgets, QtCore
             except ImportError:
                 from PySide import QtGui as QtWidgets
                 from PySide import QtCore
 
-            from wavesim_gui import domain as domain_mod
+            self._axis = QtWidgets.QComboBox()
+            self._axis.setObjectName(_AXIS_WIDGET)
+            self._axis.addItems([name.upper() for name in AXES])
+            self._axis.setToolTip("Which axis the cut plane is normal to")
+            self._axis.currentIndexChanged.connect(self._on_axis_changed)
 
-            self.sim = sim
-            self.doc = doc
-            self.domain = domain_mod.find_domain(sim)
-            self.preview = CrossSectionPreview(doc)
-            self._initializing = True
-            # Pre-edit plane state, for Cancel.
-            self._orig_positions, self._orig_show = (
-                read_plane_state(self.domain) if self.domain is not None
-                else ((0.0, 0.0, 0.0), (True, True, True)))
-
-            form = QtWidgets.QWidget()
-            form.setWindowTitle("Wavesim Cross Section")
-            layout = QtWidgets.QFormLayout(form)
-
-            # -- axis, one at a time (None is also the off switch) --------- #
-            self._axis_group = QtWidgets.QButtonGroup(form)
-            axis_row = QtWidgets.QWidget()
-            axis_layout = QtWidgets.QHBoxLayout(axis_row)
-            axis_layout.setContentsMargins(0, 0, 0, 0)
-            self._axis_buttons = []
-            for index, label in enumerate(("X", "Y", "Z", "None")):
-                button = QtWidgets.QRadioButton(label)
-                self._axis_group.addButton(button, index)
-                axis_layout.addWidget(button)
-                self._axis_buttons.append(button)
-            self._axis_buttons[3].setToolTip(
-                "Remove the cross-section and show the whole model again")
-            self._axis_buttons[2].setChecked(True)      # z: the usual cut
-            self._axis_group.buttonClicked.connect(self._on_axis_changed)
-            layout.addRow("Cut normal to:", axis_row)
-
-            # -- position -------------------------------------------------- #
             self._position = QtWidgets.QDoubleSpinBox()
+            self._position.setObjectName(_POSITION_WIDGET)
             self._position.setDecimals(4)
             self._position.setSuffix(" mm")
+            self._position.setKeyboardTracking(False)
+            self._position.setToolTip(
+                "Where the cut plane sits on that axis. This is the Domain's "
+                "own grid plane, so the drawn mesh moves with it")
             self._position.valueChanged.connect(self._schedule)
-            layout.addRow("Position:", self._position)
 
-            self._flip = QtWidgets.QCheckBox("Keep the far side instead")
+            self._flip = QtWidgets.QCheckBox("Flip")
+            self._flip.setObjectName(_FLIP_WIDGET)
             self._flip.setToolTip(
-                "Which half of the model is kept; the cut plane does not move")
+                "Which half of the model is kept; the cut plane does not move. "
+                "A body lying entirely on the discarded side is hidden, cut "
+                "or not")
             self._flip.toggled.connect(self._schedule)
-            layout.addRow("", self._flip)
 
-            self._show_grid = QtWidgets.QCheckBox("Show the voxel grid on the cut")
-            self._show_grid.setChecked(True)
-            self._show_grid.setToolTip(
-                "Draws the Domain's cell grid on the cut plane, and switches "
-                "the other two grid planes off")
-            self._show_grid.toggled.connect(self._schedule)
-            layout.addRow("", self._show_grid)
+            self._filter = _reach_filter()(self)
+            for widget in (self._axis, self._position, self._flip):
+                widget.installEventFilter(self._filter)
+                toolbar.addWidget(widget)
 
-            self._style = QtWidgets.QComboBox()
-            self._style.addItems(list(CAP_STYLES))
-            self._style.setToolTip(
-                "How the exposed section face is marked. Shaded tints the cut "
-                "face a darker shade of the body's own colour; Hatched draws "
-                "cross-hatch lines over it; Plain leaves it in the body colour. "
-                "Both markings are derived from the body colour so they stay "
-                "quieter than the voxel grid.")
-            self._style.currentIndexChanged.connect(self._schedule)
-            layout.addRow("Section face:", self._style)
-
-            self._info = QtWidgets.QLabel()
-            self._info.setWordWrap(True)
-            layout.addRow("", self._info)
-
-            self._warning = QtWidgets.QLabel()
-            self._warning.setWordWrap(True)
-            self._warning.setStyleSheet("color: #b06000;")
-            layout.addRow("", self._warning)
-
-            # One shot, restarted on every edit: the last edit in a burst is the
-            # only one that costs a cut.
             self._timer = QtCore.QTimer()
             self._timer.setSingleShot(True)
             self._timer.setInterval(_DEBOUNCE_MS)
             self._timer.timeout.connect(self._apply)
 
-            self.form = form
-            self._initializing = False
-            self._reset_position()          # centres on the default axis...
-            self._apply()                   # ...and cuts there straight away
+        def _alive(self):
+            """Whether our widgets still exist on the C++ side."""
+            try:
+                return (self._axis is not None
+                        and self._axis.objectName() == _AXIS_WIDGET)
+            except Exception:
+                return False
 
-        # -- reads --------------------------------------------------------- #
+        # -- state in, state out --------------------------------------- #
 
-        def _axis(self):
-            """0/1/2 for x/y/z, or ``None`` when the cross-section is off."""
-            index = self._axis_group.checkedId()
-            return None if index == 3 else index
+        def refresh(self):
+            """Show what the Domain says, without setting anything off.
 
-        def _extent(self, axis):
-            return axis_extent_mm(self.domain, self.doc, axis)
-
-        # -- writes -------------------------------------------------------- #
-
-        def _reset_position(self):
-            """Centre the position on the current axis and re-range the spinner.
-
-            Half way along the axis is the default the tool opens on, and the
-            default it returns to whenever the axis changes -- the centre of a
-            new axis is a useful place to be, and the old axis's number never is.
+            The one direction the controls are ever written from. Called after
+            every toggle too, because the first switch-on adopts a default axis
+            -- and a control that did not follow that would be lying about the
+            cut on screen.
             """
-            axis = self._axis()
-            enabled = axis is not None
-            for widget in (self._position, self._flip, self._show_grid,
-                           self._style):
-                widget.setEnabled(enabled)
-            if not enabled:
+            if not self._alive():
                 return
-            lo, hi = self._extent(axis)
-            self._position.blockSignals(True)
-            self._position.setRange(min(lo, hi), max(lo, hi))
-            self._position.setSingleStep(max((hi - lo) / 100.0, 1.0e-4))
-            self._position.setValue(0.5 * (lo + hi))
-            self._position.blockSignals(False)
+            doc = FreeCAD.ActiveDocument
+            domain = find_domain(doc)
+            for widget in (self._axis, self._position, self._flip):
+                widget.setEnabled(domain is not None)
+            if domain is None:
+                return
+            state = read_state(domain, doc)
+            self._loading = True
+            try:
+                self._axis.setCurrentIndex(state["axis"])
+                self._range(state["axis"])
+                self._position.setValue(state["position"])
+                self._flip.setChecked(state["flip"])
+            finally:
+                self._loading = False
 
-        def _on_axis_changed(self, *_):
-            if self._initializing:
+        def refresh_if_idle(self):
+            """:meth:`refresh`, unless the position box is being typed into.
+
+            Re-reading the state writes the spinner, so doing it under a
+            half-typed number would eat the number.
+            """
+            try:
+                if self._position is not None and self._position.hasFocus():
+                    return
+            except Exception:
                 return
-            self._reset_position()
+            self.refresh()
+
+        def _range(self, axis):
+            """Re-range the spinner over the domain's extent on *axis*."""
+            lo, hi = axis_extent_mm(find_domain(FreeCAD.ActiveDocument),
+                                    FreeCAD.ActiveDocument, axis)
+            self._position.setRange(min(lo, hi), max(lo, hi))
+            self._position.setSingleStep(max(abs(hi - lo) / 100.0, 1.0e-4))
+
+        def _on_axis_changed(self, index):
+            """Move to the new axis's own plane -- or to its middle.
+
+            The position of each axis's cut is that axis's grid plane, so
+            switching axis is a jump to wherever that plane was left. The
+            exception is a plane that has never been moved: it sits on the
+            domain wall, where a cut shows either everything or nothing, so it
+            is centred instead. That is the one case where remembering is
+            worse than defaulting.
+            """
+            if self._loading or not 0 <= index <= 2:
+                return
+            doc = FreeCAD.ActiveDocument
+            domain = find_domain(doc)
+            if domain is None:
+                return
+            lo, hi = axis_extent_mm(domain, doc, index)
+            span = abs(hi - lo)
+            position = read_plane_state(domain)[0][index]
+            position = min(max(position, min(lo, hi)), max(lo, hi))
+            if span > 0.0 and min(abs(position - lo),
+                                  abs(position - hi)) <= span * _WALL_FRAC:
+                position = 0.5 * (lo + hi)
+            self._loading = True
+            try:
+                self._range(index)
+                self._position.setValue(position)
+            finally:
+                self._loading = False
             self._schedule()
 
         def _schedule(self, *_):
-            if self._initializing:
-                return
-            self._timer.start()
+            if not self._loading:
+                self._timer.start()
 
         def _apply(self):
-            """Recut the model and move the grid plane under it."""
+            """Store the settings, and recut if a cut is up.
+
+            Storing happens either way. The controls are how a cut is set up
+            *before* it is switched on, so an edit with the cut down has to
+            land somewhere -- and the only somewhere is the Domain.
+            """
             self._timer.stop()
-            axis = self._axis()
-            if axis is None:
-                self.preview.clear()
-                write_plane_state(self.domain, show=self._orig_show)
-                self._refresh_labels(0)
+            if not self._alive():
                 return
-
-            position = float(self._position.value())
-            show = [False, False, False]
-            if self._show_grid.isChecked():
-                show[axis] = True
-            write_plane_state(self.domain, position_mm=position, axis=axis,
-                              show=show)
-            try:
-                count = self.preview.apply(
-                    axis, position, keep_low=not self._flip.isChecked(),
-                    style=self._style.currentText())
-            except Exception as exc:
-                self.preview.clear()
-                FreeCAD.Console.PrintError(
-                    "Wavesim: could not build the cross-section ({}: {})\n"
-                    .format(type(exc).__name__, exc))
-                count = 0
-            self._refresh_labels(count)
-
-        # -- readout ------------------------------------------------------- #
-
-        def _refresh_labels(self, count):
-            axis = self._axis()
-            if axis is None:
-                self._info.setText("No cross-section; the whole model is shown.")
-                self._warning.setText("")
+            doc = FreeCAD.ActiveDocument
+            domain = find_domain(doc)
+            if domain is None:
                 return
-            lo, hi = self._extent(axis)
-            span = hi - lo
-            fraction = (self._position.value() - lo) / span * 100.0 if span else 0.0
-            self._info.setText(
-                "{} at {:.4g} mm ({:.0f}% of {:.4g}..{:.4g} mm), "
-                "{} bod{} sectioned.".format(
-                    AXES[axis].upper(), self._position.value(), fraction, lo, hi,
-                    count, "y" if count == 1 else "ies"))
-            notes = []
-            if count == 0:
-                notes.append(
-                    "Nothing to cut here -- either no solid body is visible, or "
-                    "the plane is past all of them.")
-            if self.domain is None:
-                notes.append(
-                    "No Domain in this document, so there is no voxel grid to "
-                    "draw and the range is the geometry's own.")
-            self._warning.setText("\n".join(notes))
+            axis = self._axis.currentIndex()
+            write_plane_state(domain, position_mm=float(self._position.value()),
+                              axis=axis)
+            write_state(domain, axis=axis, flip=self._flip.isChecked())
+            if bool(getattr(domain, _STATE_ON, False)):
+                _report(apply_state(doc, domain))
 
-        # -- task panel protocol ------------------------------------------- #
 
-        def accept(self):
-            self._timer.stop()
-            self._apply()
-            Gui.Control.closeDialog()
-            return True
+    _controls = None
+    _reach_filter_class = None
 
-        def reject(self):
-            self._timer.stop()
-            self.preview.clear()
-            if self.domain is not None:
-                for prop, value in zip(_POSITION_PROPS, self._orig_positions):
+    # How long to wait before asking for the toolbar break (see _force_new_row).
+    _BREAK_DELAY_MS = 500
+
+
+    def _reach_filter():
+        """The event filter that refreshes a control as it is reached for.
+
+        The observers cover the events that *change* which state the controls
+        should show (a document activated, a Domain created). This covers the
+        rest: everything else that can stale them -- a body added, a domain
+        resized, an undo -- happens without a signal we watch, and the cheapest
+        honest answer is to re-read the state when the pointer arrives on the
+        control, just before it is used.
+
+        Built on first use, never at import: this module is imported by
+        headless checks under ``freecadcmd``, where there is no PySide to
+        subclass ``QObject`` from.
+        """
+        global _reach_filter_class
+        if _reach_filter_class is None:
+            from PySide import QtCore
+
+            class _RefreshOnReach(QtCore.QObject):
+
+                def __init__(self, controls):
+                    QtCore.QObject.__init__(self)
+                    self._controls = controls
+
+                def eventFilter(self, _obj, event):
                     try:
-                        setattr(self.domain, prop, "{} mm".format(value))
+                        if event.type() in (QtCore.QEvent.Enter,
+                                            QtCore.QEvent.FocusIn):
+                            self._controls.refresh_if_idle()
                     except Exception:
                         pass
-                write_plane_state(self.domain, show=self._orig_show)
-            Gui.Control.closeDialog()
-            return True
+                    return False
 
-        def getStandardButtons(self):
+            _reach_filter_class = _RefreshOnReach
+        return _reach_filter_class
+
+
+    def _force_new_row(toolbar):
+        """Put the cross-section toolbar on a line of its own, once.
+
+        Qt packs toolbars onto the same row while there is space, and the point
+        of this one is that it is a second row of controls under the workbench's
+        buttons.
+
+        **Deferred through the event loop**, because FreeCAD restores its saved
+        window layout *after* it activates a workbench: a break inserted inline
+        here is registered and then overwritten, which is exactly what the
+        first version did -- ``toolBarBreak()`` answered True while the two
+        toolbars sat on one row. Once per session either way: the break becomes
+        part of the layout, which the user is free to rearrange and FreeCAD
+        saves.
+        """
+        global _row_forced
+        if _row_forced:
+            return
+        _row_forced = True
+        try:
+            from PySide import QtCore
+
+            QtCore.QTimer.singleShot(_BREAK_DELAY_MS, lambda: _insert_break(toolbar))
+        except Exception:
+            pass
+
+
+    def _insert_break(toolbar):
+        try:
+            window = Gui.getMainWindow()
+            if window is not None and not window.toolBarBreak(toolbar):
+                window.insertToolBarBreak(toolbar)
+        except Exception:
+            pass
+
+
+    _row_forced = False
+
+
+    def _report(counts):
+        """Say what the cut did, in the status bar rather than in a panel.
+
+        The count used to be a label in the task panel; with no panel it goes
+        where a transient readout belongs. The one case worth more than that --
+        a plane past every body, which empties the screen and looks like a
+        broken tool -- also goes to the report view.
+        """
+        count, removed = counts
+        message = "Wavesim: {} bod{} sectioned{}.".format(
+            count, "y" if count == 1 else "ies",
+            "" if not removed else
+            ", {} hidden past the plane".format(removed))
+        try:
+            window = Gui.getMainWindow()
+            if window is not None:
+                window.statusBar().showMessage(message, 4000)
+        except Exception:
+            pass
+        if count == 0 and removed:
+            FreeCAD.Console.PrintWarning(
+                "Wavesim: the cut plane is past every body -- the whole model "
+                "is on the discarded side, so nothing is drawn.\n")
+
+
+    class _ActiveDocumentWatcher(object):
+        """Refreshes the toolbar controls when the active document changes.
+
+        Without it the controls keep showing the document they were built over
+        -- and, since they are built when the workbench is activated, that is
+        usually *no* document at all: an axis of X and a 0..0 position over a
+        model that has a Domain and a cut. They are a readout of one document's
+        state, so they have to be told when that document is no longer the one
+        being looked at.
+        """
+
+        def slotActivateDocument(self, _doc):
             try:
-                from PySide import QtWidgets as _w
-            except ImportError:
-                from PySide import QtGui as _w
-            buttons = _w.QDialogButtonBox.Ok | _w.QDialogButtonBox.Cancel
-            return int(getattr(buttons, "value", buttons))
+                refresh_toolbar_controls()
+                _sync_toggle_actions(FreeCAD.ActiveDocument)
+            except Exception:
+                pass
 
-    class CommandCrossSection:
-        """Cut the model open on a grid plane, capped and hatched."""
+    _doc_watcher = None
 
-        def GetResources(self):
-            return {
-                "Pixmap": _XSEC_ICON,
-                "MenuText": "Cross Section",
-                "ToolTip": "Cut the model open on a grid plane -- capped and "
-                           "hatched, not hollow -- and draw the voxel grid on "
-                           "the cut",
-            }
 
-        def Activated(self):
+    def _install_document_watcher():
+        """Register the active-document refresh; idempotent."""
+        global _doc_watcher
+        if _doc_watcher is None:
+            _doc_watcher = _ActiveDocumentWatcher()
+            try:
+                Gui.addDocumentObserver(_doc_watcher)
+            except Exception:
+                _doc_watcher = None
+        return _doc_watcher
+
+
+    def install_toolbar_controls(retry=True):
+        """Build (or rebuild) the toolbar widgets. Called on workbench activation.
+
+        FreeCAD builds the toolbars around the activation hook rather than
+        strictly before it, so a first activation can arrive before the
+        toolbar exists. One deferred retry through the event loop covers that
+        without a poll.
+        """
+        global _controls
+        if _controls is None:
+            _controls = _CrossSectionControls()
+        _install_document_watcher()
+        if _controls.install():
+            return True
+        if retry:
+            try:
+                from PySide import QtCore
+
+                QtCore.QTimer.singleShot(
+                    0, lambda: install_toolbar_controls(retry=False))
+            except Exception:
+                pass
+        return False
+
+
+    def refresh_toolbar_controls():
+        """Make the widgets show what the state says."""
+        if _controls is not None:
+            _controls.refresh()
+
+
+    class _CommandToggle(object):
+        """Shared behaviour for the two checkable buttons.
+
+        Both do the same three things: read what the user asked for off the
+        action, ask the module to make it so, and then set every copy of both
+        buttons to what the state actually *is*. That last step is not a
+        formality -- switching the grid on switches the cut on under it, and the
+        cut's own button has to show that.
+        """
+
+        _setter = None          # set_active / set_grid
+
+        def _toggle(self, index):
             doc = FreeCAD.ActiveDocument
-            sim = active_simulation(doc)
-            if sim is None:
-                FreeCAD.Console.PrintWarning(
-                    "Wavesim: create a Simulation before cross-sectioning.\n")
-                return
-            sweep(doc)          # anything an earlier panel or a crash left
-            Gui.Control.closeDialog()
-            Gui.Control.showDialog(TaskCrossSectionPanel(sim, doc))
+            if index is None:
+                index = not self._current(doc)
+            counts = type(self)._setter(doc, bool(index))
+            _sync_toggle_actions(doc)
+            if index:
+                _report(counts)
+
+        def Activated(self, index=None):
+            self._toggle(index)
 
         def IsActive(self):
             return active_simulation(FreeCAD.ActiveDocument) is not None
 
-    Gui.addCommand("Wavesim_CrossSection", CommandCrossSection())
+    class CommandCrossSectionToggle(_CommandToggle):
+        """Put the configured cut up, or take it down."""
+
+        _setter = staticmethod(set_active)
+
+        @staticmethod
+        def _current(doc):
+            return is_active(doc)
+
+        def GetResources(self):
+            return {
+                "Pixmap": _XSEC_ICON,
+                "MenuText": "Cross Section On/Off",
+                "Checkable": True,
+                "ToolTip": "Show or hide the cross-section, using the settings "
+                           "the Cross Section panel last configured. Anything "
+                           "on the cut-away side goes with it, cut or not",
+            }
+
+    class CommandCrossSectionGrid(_CommandToggle):
+        """Draw the voxel grid on the cut plane, or stop drawing it."""
+
+        _setter = staticmethod(set_grid)
+
+        @staticmethod
+        def _current(doc):
+            return is_grid_on(doc)
+
+        def GetResources(self):
+            return {
+                "Pixmap": _XSEC_GRID_ICON,
+                "MenuText": "Mesh Grid On/Off",
+                "Checkable": True,
+                "ToolTip": "Draw the Domain's cell grid on the cut plane. The "
+                           "grid is only ever drawn on a cut, so switching it "
+                           "on cuts the model as well",
+            }
+
+    Gui.addCommand(_TOGGLE_COMMAND, CommandCrossSectionToggle())
+    Gui.addCommand(_GRID_COMMAND, CommandCrossSectionGrid())
 
 install_sweeper()

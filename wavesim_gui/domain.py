@@ -155,19 +155,21 @@ _FACE_LABELS = {
 _DOMAIN_COLOR = (0.30, 0.55, 1.00)
 _PML_COLOR = (1.00, 0.45, 0.10)
 
-# Faint grey for the cell-grid planes; cap on lines per axis so a fine grid on a
-# large domain can't lock up the viewport.
+# Color of grid lines
 _GRID_COLOR = (0.55, 0.55, 0.55)
 _MAX_GRID_LINES = 400
 
 # The snapped lines -- the ones the snapper forced onto a geometry feature (a
 # body's bounding box, a cylinder's silhouette, a bevel's outline circle) rather
-# than laid down to fill a gap. Drawn brighter and thicker so the mesh can be
-# read as what it is: which lines the geometry asked for, and which merely tile
-# the space between them. Capped separately from the thin lines so decimating a
-# fine grid can never drop a feature line -- they are the few that matter.
-_SNAP_COLOR = (0.95, 0.85, 0.35)
-_SNAP_LINE_WIDTH = 2
+# than laid down to fill a gap. Drawn **dark** against the grey of the rest, so
+# the mesh can be read as what it is: which lines the geometry asked for, and
+# which merely tile the space between them. The
+# separation is by value, not by hue -- the two absorber colours (_PML_COLOR,
+# _PML_GRID_COLOR) are the only warm things in the mesh, and a coloured snap
+# line competed with them. Capped separately from the thin lines so decimating
+# a fine grid can never drop a feature line -- they are the few that matter.
+_SNAP_COLOR = (0.25, 0.25, 0.25)
+_SNAP_LINE_WIDTH = 1
 _MAX_SNAP_LINES = 400
 
 # The grid lines that fall in the absorber, drawn in the PML box's own colour so
@@ -816,10 +818,13 @@ _GRID_PLANE_PROPS = (
 _GRID_PLANES_PLACED = "GridPlanesPlaced"
 
 # Whether each of those three planes is drawn at all, in the same x/y/z order.
-# Default **on**, so a document that predates them looks exactly as it did. What
-# they are for is the cross-section tool (``crosssection.py``), which shows the
-# mesh on the plane it is cutting and switches the other two off -- three grids
-# at once is unreadable next to a sectioned model.
+# Default **off**. They belong to the cross-section tool (``crosssection.py``):
+# its grid button is the only thing that turns one on, and it leaves up only the
+# plane it is cutting on, because three grids at once over a sectioned model is
+# unreadable. A mesh plane drawn through an unsectioned solid model is worse
+# still -- it is the picture the cut exists to replace -- so with no cut up
+# there is no grid, and a document restored with one saved has it cleared
+# (``crosssection._RestoreSweeper``).
 _GRID_SHOW_PROPS = ("ShowGridPlaneX", "ShowGridPlaneY", "ShowGridPlaneZ")
 
 # The per-axis arrays of snapped (geometry-forced) grid lines -- a subset of
@@ -855,11 +860,11 @@ def _ensure_grid_plane_props(obj):
         if not hasattr(obj, prop):
             obj.addProperty(
                 "App::PropertyBool", prop, "Grid",
-                "Whether the {} cell-grid plane is drawn. On by default, so a "
-                "domain shows the mesh on all three; the cross-section tool "
-                "leaves only the plane it cuts on.".format(plane),
+                "Whether the {} cell-grid plane is drawn. Off by default: the "
+                "grid is drawn on a cross-section, and the cross-section "
+                "toolbar's grid button is what turns it on.".format(plane),
             )
-            setattr(obj, prop, True)
+            setattr(obj, prop, False)
 
 
 def place_grid_planes(obj):
@@ -903,11 +908,10 @@ def grid_plane_positions_mm(domain):
 def grid_plane_visibility(domain):
     """Which of the three cell-grid planes are drawn, as ``(x, y, z)`` bools.
 
-    Defaults to all three for a domain saved before the properties existed --
-    the behaviour every document had -- so this can only ever *hide* a plane
-    somebody asked to hide.
+    Defaults to none for a domain that somehow has no such property: a grid is
+    drawn because the grid button asked for it, so silence means no.
     """
-    return tuple(bool(getattr(domain, prop, True)) for prop in _GRID_SHOW_PROPS)
+    return tuple(bool(getattr(domain, prop, False)) for prop in _GRID_SHOW_PROPS)
 
 
 def _ensure_es_bc_props(obj):
@@ -1273,8 +1277,53 @@ if _GUI_AVAILABLE:
             (mx.x, mx.y, mx.z), (mn.x, mx.y, mx.z),
         ]
 
+    # Name carried by the separator holding the three cell grids, so a
+    # re-attach can find the one it left behind instead of hanging a second
+    # grid off the same view provider.
+    _GRID_ROOT_NAME = "WavesimDomainGrid"
+
+
+    def _attach_grid_root(vobj, grid_root):
+        """Hang *grid_root* off the view provider **above** its mode switch.
+
+        A view provider's display-mode node sits under a switch that
+        ``Visibility`` flips, which is what an eye in the tree does. The grid is
+        deliberately not under it: hiding the Domain is how you get the box and
+        the PML shell out of the way, and it used to take the mesh with them --
+        so reading the mesh against the geometry meant looking through the two
+        boxes drawn around it. The grid answers to its own button instead (see
+        ``crosssection.set_grid``), through ``ShowGridPlaneX/Y/Z``.
+
+        ``RootNode`` is the node above that switch. If a FreeCAD build does not
+        expose it, the grid goes back under the display mode -- the old
+        behaviour, which is worse but not broken.
+        """
+        try:
+            root_node = vobj.RootNode
+        except Exception:
+            root_node = None
+        if root_node is None:
+            return False
+        try:
+            for index in reversed(range(root_node.getNumChildren())):
+                child = root_node.getChild(index)
+                if child is not None and child.getName() == _GRID_ROOT_NAME:
+                    root_node.removeChild(index)
+            root_node.addChild(grid_root)
+        except Exception:
+            return False
+        return True
+
+
     class DomainViewProvider:
-        """Custom coin view provider drawing the domain + PML as wireframes."""
+        """Custom coin view provider drawing the domain + PML as wireframes.
+
+        The boxes are a display mode, so the tree's eye hides them. **The cell
+        grids are not** -- they hang off ``RootNode``, above the visibility
+        switch (:func:`_attach_grid_root`), and are switched by the Domain's own
+        ``ShowGridPlane*`` flags, which the cross-section toolbar's grid button
+        drives.
+        """
 
         def __init__(self, vobj):
             vobj.Proxy = self
@@ -1311,10 +1360,15 @@ if _GUI_AVAILABLE:
             psep.addChild(self._pml_lines)
             root.addChild(psep)
 
-            # Three fully-transparent cell grids (thin lines spaced dx/dy/dz) on
-            # the domain's min faces, so the meshing is visible. They live under
-            # this same display-mode root, so the Domain "eye" toggle hides them
-            # together with the boxes.
+            # The cell grids live on a root of their own (see _GRID_ROOT_NAME
+            # and the end of this method): **outside** the display-mode switch,
+            # so the Domain's eye does not reach them. The eye is for the boxes;
+            # the grid has its own button on the cross-section toolbar.
+            grid_root = coin.SoSeparator()
+            grid_root.setName(_GRID_ROOT_NAME)
+
+            # Three cell grids (thin lines at the node coordinates) on the
+            # Domain's grid planes, so the meshing is visible.
             self._grid_color = coin.SoBaseColor()
             self._grid_color.rgb.setValue(*_GRID_COLOR)
             gstyle = coin.SoDrawStyle()
@@ -1326,7 +1380,7 @@ if _GUI_AVAILABLE:
             gsep.addChild(gstyle)
             gsep.addChild(self._grid_coords)
             gsep.addChild(self._grid_lines)
-            root.addChild(gsep)
+            grid_root.addChild(gsep)
 
             # The absorber's own share of those same planes, in the PML box's
             # colour. Its own node set for the same reason the snapped subset
@@ -1343,7 +1397,7 @@ if _GUI_AVAILABLE:
             pgsep.addChild(pgstyle)
             pgsep.addChild(self._pmlgrid_coords)
             pgsep.addChild(self._pmlgrid_lines)
-            root.addChild(pgsep)
+            grid_root.addChild(pgsep)
 
             # The snapped subset, over the top of the thin grid: same planes,
             # own colour and width. A separate node set rather than a per-line
@@ -1361,10 +1415,13 @@ if _GUI_AVAILABLE:
             ssep.addChild(sstyle)
             ssep.addChild(self._snap_coords)
             ssep.addChild(self._snap_lines)
-            root.addChild(ssep)
+            grid_root.addChild(ssep)
 
             self._root = root
+            self._grid_root = grid_root
             vobj.addDisplayMode(root, "Wireframe")
+            if not _attach_grid_root(vobj, grid_root):
+                root.addChild(grid_root)      # no RootNode: the old behaviour
             self._rebuild()
             self._rebuild_grid()
 

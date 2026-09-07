@@ -1,0 +1,10 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24">
+  <!-- A cross grid and nothing else, bleeding off all four edges. No frame:
+       a boxed lattice is the *domain* icon (domain.svg), and these two sit two
+       buttons apart. Mid blue rather than the family navy, so the lines hold
+       up on a dark toolbar as well as a light one. -->
+  <g stroke="#3f86c8" stroke-width="1.7" stroke-linecap="butt">
+    <path d="M4 0.5 v23 M11 0.5 v23 M18 0.5 v23"/>
+    <path d="M0.5 4 h23 M0.5 11 h23 M0.5 18 h23"/>
+  </g>
+</svg>

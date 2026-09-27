@@ -39,5 +39,10 @@ tools/feature_edges.txt
 # Report written by tools/check_pml_inside.py
 tools/pml_inside.txt
 
-# User manual sources, figures and build output — local working docs
-manual/
+# User manual: sources, figures and notes stay local. Only the built PDF and the
+# two example documents are tracked.
+manual/*
+!manual/wavesim-manual-v0.1.pdf
+!manual/examples/
+manual/examples/*
+!manual/examples/*.FCStd

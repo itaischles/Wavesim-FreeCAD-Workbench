@@ -90,7 +90,7 @@ What this is not
 **View only, and it cannot reach a run.** The preview objects are ordinary
 ``Part::Feature`` objects that belong to no Material, and both the voxeliser
 (``voxelize`` walks ``mat.Bodies``) and the Domain's auto-sizing
-(``domain._material_bounds``) enumerate material bodies only -- so a cut model
+(``voxelize.materials_bbox_mm``) enumerate material bodies only -- so a cut model
 voxelises exactly like an uncut one, and the preview cannot grow the domain box.
 Keep it that way: anything here that starts being read by the mesher is a bug.
 

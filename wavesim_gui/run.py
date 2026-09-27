@@ -129,7 +129,7 @@ def voxelization_progress(parent=None, title="Wavesim",
                           message="Voxelizing geometry..."):
     """Return ``(dialog, callback)`` for showing voxelisation progress.
 
-    The voxeliser's ``isInside`` sweep runs on the GUI thread, so without
+    The voxeliser's section-and-sample sweep runs on the GUI thread, so without
     pumping events the window looks frozen. Pass *callback* as
     :func:`voxelize.build_job_from_document`'s ``progress``: it sizes the bar on
     the first call, advances it, processes events so the dialog paints and the

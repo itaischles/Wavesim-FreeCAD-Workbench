@@ -5,8 +5,8 @@ One panel listing **every** PEC body in the document -- across every PEC
 material -- with a checkbox saying whether it is held at a potential and the
 volts it is held at. It is the one place the whole set is visible, which is what
 makes a missing or a contradictory potential obvious; the property editor shows
-them one body at a time (``materials.POTENTIAL_PROP`` /
-``materials.POTENTIAL_SET_PROP``, which live on the body).
+them one body at a time (``materials.MODE_PROP`` / ``materials.POTENTIAL_PROP``
+/ ``materials.CHARGE_PROP``, which live on the body).
 
 Two conditions, three ways of getting one
 -----------------------------------------

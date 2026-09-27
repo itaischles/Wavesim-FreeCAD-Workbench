@@ -67,7 +67,9 @@ _RESOURCES_DIR = os.path.join(_WB_DIR, "Resources")
 # The 24x24 SVG icon set (grouped by colour: blue setup, amber sources,
 # teal monitors). The retired PNGs are still in Resources/ alongside it.
 _ICONS_DIR = os.path.join(_RESOURCES_DIR, "icons")
-# Generic monitor icon (placeholder; specific monitors set their own below).
+# Generic monitor icon. Every monitor kind below names its own; this one is the
+# fallback a path monitor's view provider returns when the object is neither a
+# voltage nor a current monitor (see ``PathMonitorViewProvider.getIcon``).
 _MONITOR_ICON = os.path.join(_ICONS_DIR, "monitor.svg")
 _SNAPSHOT_MONITOR_ICON = os.path.join(_ICONS_DIR, "snapshot.svg")
 _VOLTAGE_MONITOR_ICON = os.path.join(_ICONS_DIR, "voltage.svg")

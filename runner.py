@@ -218,7 +218,7 @@ the materials actually were rather than what the job asked for — and, for
 a conformal run, ``cut_cells``, ``clamped_faces`` and the
 ``conformal_area_threshold`` in force. That last one is likewise what *ran*:
 building the Simulation measures this grid's small-cut stability and raises the
-threshold when it has to (solver S7), since 0.4 is not safe on real geometry and
+threshold when it has to, since 0.4 is not safe on real geometry and
 the failure is not monotone in resolution. When it was raised, the job's own
 value is kept alongside as ``conformal_area_threshold_requested`` and
 ``clamped_faces`` counts the faces clamped at the threshold actually used. A snapshot stores one frame stack per recorded component (``snapshot_<idx>_<comp>_data``, e.g. ``snapshot_0_Ex_data``)
@@ -397,12 +397,10 @@ like one and honours ``mode_only``). It is a *lumped* drive on an interior plane
 so — unlike a modal port — its face is forced to PML and the plane is clamped one
 PML depth in. The ngspice shared library is taken from
 ``ngspice_dll`` (falling back to a per-port ``library_path`` / PySpice's own
-search). Each port records its port V(t)/I(t) into ``results.npz`` (keys
-``spice_<idx>_times`` / ``_voltages`` / ``_currents``) with names under
-``summary["spice_ports"]``. One netlist drives one port; several ports run
-independent ngspice instances. (The port series are stored as two
-``_times``/``_values`` pairs — ``spice_<idx>v_*`` for voltage, ``spice_<idx>i_*``
-for current.)
+search). Each port records its port V(t)/I(t) into ``results.npz`` as two
+``_times``/``_values`` pairs — ``spice_<idx>v_*`` for voltage and
+``spice_<idx>i_*`` for current — with names under ``summary["spice_ports"]``.
+One netlist drives one port; several ports run independent ngspice instances.
 
 Lumped R/L/C ports
 ------------------
@@ -1711,7 +1709,7 @@ def run_job(workdir):
                 "material to run the model lossless deliberately.")
         if grid.is_conformal:
             # Provisional: building the Simulation below measures this grid's
-            # stability and may raise the threshold (solver S7), which moves
+            # stability and may raise the threshold, which moves
             # both the threshold and the clamped-face count. They are re-recorded
             # there. Recorded here as well so a mode-only request — which returns
             # before any time loop exists, and so has no stability question to
@@ -1910,7 +1908,7 @@ def run_job(workdir):
     if grid.is_conformal:
         # Only now is the clamp threshold settled. Constructing the Simulation
         # probes this exact scheme for the small-cut instability and raises the
-        # threshold if it has to (solver S7), because 0.4 is not safe on real
+        # threshold if it has to, because 0.4 is not safe on real
         # geometry and stability is not monotone in resolution — the reference
         # coax diverges at a 0.25 mm cell and runs at 0.1875 mm. What the run
         # used is what belongs in the summary; what the job asked for is exactly

@@ -1334,6 +1334,16 @@ def notify_materials_changed(doc):
                 bodies.append(body)
     if hasattr(domain, "TrackedBodies"):
         domain.TrackedBodies = bodies
+    # In electrostatics the geometry *is* the cell-size driver, the way the max
+    # frequency is in full wave, so a change to the assigned set re-derives the
+    # size just as the Simulation panel does when the frequency changes.
+    # Without this, switching to electrostatic before assigning anything (the
+    # natural order) found no feature to measure and left the 1 mm default.
+    from wavesim_gui.commands import is_electrostatic
+    if is_electrostatic(sim):
+        size_m = feature_cell_size_m(sim, domain)
+        if size_m is not None:
+            domain.Dx = domain.Dy = domain.Dz = "{} mm".format(size_m * 1000.0)
     domain.touch()
     doc.recompute()
 

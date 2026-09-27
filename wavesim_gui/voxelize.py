@@ -392,9 +392,10 @@ def _section_nudge(body_shape, sub_mm):
 #
 # 0.0025 is 4x inside the measured threshold. **This deliberately re-baselines
 # every staircase result** -- ``pec_mask`` moves by 2.8% of the metal on that
-# model -- which is why it was not done as part of the conformal work (plan W2
-# scoped itself to the conformal sampler to keep that promise, and
-# CONFORMAL_PEC_PLAN.md W2 records why that scoping was wrong).
+# model -- which is why the conformal work tightened only the conformal
+# sampler's tolerance and left this one alone: that scoping kept the
+# bit-identical promise for existing runs, and was wrong, because the asymmetry
+# it left behind is the same defect in the coarse mask.
 # ``tools/check_mask_symmetry.py`` is the gate.
 COARSE_CHORD_FRACTION = 0.0025
 
@@ -1060,9 +1061,9 @@ def _smooth_dielectric_body(arrays, body_shape, eps_r, mu_r,
 # --------------------------------------------------------------------------- #
 # Conformal (Dey-Mittra / PBA) PEC open fractions
 #
-# A staircased conductor is only first-order accurate and, on a coax modal port,
-# reads Z0 14% high and leaves a parasitic TE11 mode rattling between the ports
-# forever (see CONFORMAL_PEC_PLAN.md). The cure is to let the solver's Faraday
+# A staircased conductor is only first-order accurate and, on the reference
+# coax's modal port, reads Z0 14% high and leaves a parasitic TE11 mode rattling
+# between the ports forever. The cure is to let the solver's Faraday
 # contour integrate the *cut* geometry, which needs six dimensionless arrays: the
 # fraction of each Yee E edge, and of each Yee H face, that is NOT inside metal.
 #
@@ -1474,7 +1475,7 @@ def _fill_pec_materials(arrays, pec_mask, keys):
     ======================================  ==============  ==============
 
     Z0 and eps_eff do not move: the mode solver already applies this rule for
-    itself (solver S5c gives a face straddling the surface the eps of the face
+    itself (the solver gives a face straddling the surface the eps of the face
     *outward*), which is exactly why the port's Z0 was right while the run it
     presented was not. Filling here makes the FDTD read the same material the
     mode solve assumed, in the one place they disagreed.
@@ -1655,8 +1656,11 @@ def voxelize_materials(materials, cell_size_m,
                       update.
         ``grid``    : ``{Nx, Ny, Nz, dx, dy, dz}`` with spacings in metres.
         ``origin_m``: domain min corner in FreeCAD world metres.
-        ``counts``  : ``{dielectric_cells, pec_cells}`` for a quick sanity check,
-                      plus ``{cut_faces, min_open_face}`` for a conformal run.
+        ``counts``  : ``{dielectric_cells, pec_cells, pec_material_cells}`` for
+                      a quick sanity check, plus ``{lossy_cells, max_sigma}``
+                      when anything is lossy, ``{unnamed_pec_cells,
+                      named_conductors}`` when ``conductor_names`` was given,
+                      and ``{cut_faces, min_open_face}`` for a conformal run.
                       ``min_open_face`` is worth watching: the solver's
                       small-cut stability threshold clamps every face below it,
                       and a run whose smallest open face is far under the
@@ -2096,8 +2100,8 @@ def _report_conformal(active, counts, threshold):
     at three cell sizes). Stability is measured by the solver instead: it probes
     the assembled scheme when the ``Simulation`` is built, raises the threshold
     if it has to, and records what actually ran in ``summary.json`` alongside
-    ``conformal_area_threshold_requested`` when the two differ (S7 in
-    CONFORMAL_PEC_PLAN.md; the runner echoes the raise to the report view).
+    ``conformal_area_threshold_requested`` when the two differ (the runner
+    echoes the raise to the report view).
 
     What the number *does* say is how much clamping the run will carry, which is
     an accuracy cost concentrated in H near the conductor -- so that is what the
@@ -2236,9 +2240,10 @@ def build_job_from_document(doc, steps=None, fmax=30.0e9, progress=None):
         candidate = domain_mod.node_coords_m(dom)
         if all(len(a) >= 2 for a in candidate):
             nodes_m = candidate
-    # Subpixel smoothing of dielectric interfaces: on unless the Simulation
-    # container's checkbox is cleared (default True, and True for legacy
-    # documents that predate the property).
+    # Subpixel smoothing of dielectric interfaces: whatever the Simulation
+    # container's checkbox says. A new simulation is created with it **off**;
+    # the getattr default is True only for legacy documents that predate the
+    # property, which were smoothed.
     subpixel = bool(getattr(sim, "SubpixelSmoothing", True))
     # Conformal (Dey-Mittra) PEC: off unless the Simulation asks for it, and off
     # for legacy documents that predate the property.
@@ -2678,81 +2683,3 @@ def _grounded_face_shorts(dom, sim, boundary):
                 .format(name, ", ".join(hit)))
     return out
 
-
-def _floating_face_shorts(dom, sim, boundary, floating):
-    """Warn about each floating conductor that reaches a Dirichlet domain face.
-
-    Same geometry test as :func:`_grounded_face_shorts` -- the grid bounds, not
-    the drawn box, because that is where the condition is applied -- but a
-    harder consequence: a shorted *driven* conductor is only a problem once
-    extraction drives it, while a shorted *floating* one has no solution at all
-    and the solver raises on the first solve.
-    """
-    if not floating:
-        return []
-    dirichlet = {face for face, value in (boundary or {}).items()
-                 if value != "neumann"}
-    if not dirichlet:
-        return []
-
-    out = []
-    contacts = _conductor_face_contacts(dom, sim)
-    for name in sorted(floating):
-        hit = sorted(contacts.get(name, set()) & dirichlet)
-        if hit:
-            out.append(
-                "floating conductor {!r} reaches the domain face(s) {}, which "
-                "are held at a potential. A conductor shorted to a driven wall "
-                "is not floating — it is at that wall's potential — and the "
-                "solver refuses it on the first solve. Move it off the face, "
-                "set those faces to Symmetry, or give the body a potential "
-                "instead.".format(name, ", ".join(hit)))
-    return out
-
-
-def _grounded_face_shorts(dom, sim, boundary):
-    """Warn about each conductor that reaches a Ground domain face.
-
-    Extraction drives every conductor to 1 V in turn, so a conductor touching a
-    face held at 0 V has no solution then even though the potential solve before
-    it was fine. The check is against the **grid** bounds (the node arrays), which
-    is where the boundary condition is actually applied -- and which is the drawn
-    domain box, the absorber being inside it.
-    """
-    from wavesim_gui import materials as materials_mod
-    from wavesim_gui import domain as domain_mod
-
-    try:
-        nodes = domain_mod.node_coords_m(dom)
-    except Exception:
-        return []
-    if not all(len(a) >= 2 for a in nodes):
-        return []
-    lo = [float(a[0]) * _MM_PER_M for a in nodes]
-    hi = [float(a[-1]) * _MM_PER_M for a in nodes]
-    # Half the smallest cell: a body reaching within that of the wall lands on
-    # the boundary node once voxelised.
-    tol = 0.5 * min(min(float(a[i + 1] - a[i]) for i in range(len(a) - 1))
-                    for a in nodes) * _MM_PER_M
-
-    faces = (("xmin", 0, "XMin", lo), ("xmax", 0, "XMax", hi),
-             ("ymin", 1, "YMin", lo), ("ymax", 1, "YMax", hi),
-             ("zmin", 2, "ZMin", lo), ("zmax", 2, "ZMax", hi))
-    out = []
-    for body, name, _volts in materials_mod.conductors(sim):
-        shape = getattr(body, "Shape", None)
-        if shape is None:
-            continue
-        bb = shape.BoundBox
-        touching = [key for key, axis, attr, bound in faces
-                    if boundary.get(key) == "ground"
-                    and abs(getattr(bb, attr) - bound[axis]) <= tol]
-        if touching:
-            out.append(
-                "conductor {!r} reaches the grounded domain face(s) {}, so "
-                "extracting its capacitance shorts it to the wall and the run "
-                "will fail there. Set those faces to Symmetry (right for a "
-                "shielded structure — the mutual capacitances stay exact), add "
-                "background spacing, or clear Extract capacitance."
-                .format(name, ", ".join(touching)))
-    return out

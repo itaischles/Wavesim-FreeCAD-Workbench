@@ -58,7 +58,11 @@ def document_slug(doc):
 
 
 def workdir_for(doc, prefix="run"):
-    """Return *doc*'s working directory for the *prefix* ('run'/'mode') stage.
+    """Return *doc*'s working directory for the *prefix* stage.
+
+    Two prefixes are in use: ``'run'`` for an ordinary Run, and ``'matrix'`` for
+    a port-matrix sweep (see ``portmatrix.sweep_dir_for``). A Compute Mode
+    preview uses :func:`temp_workdir` instead and keeps nothing.
 
     Pure path arithmetic — nothing is created or deleted, so callers can probe
     it with :func:`existing_artefacts` before asking the user to overwrite.

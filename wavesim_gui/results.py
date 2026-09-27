@@ -426,9 +426,11 @@ def _geometry_outlines(obj, deflection_mm):
 
     Returns ``[(rgb, [polyline, ...], is_pec), ...]``: one entry per Material
     with geometry on the plane, each polyline an ``(N, 2)`` array of
-    millimetres in the frame the snapshot is drawn in (world mm less the leaf's
-    ``XWorld``/``YWorld``). Empty when the leaf predates those properties, or
-    when the document no longer holds the simulation.
+    millimetres in the frame the snapshot is drawn in. A leaf carrying
+    ``WorldFrame`` stores world mm already, so the CAD needs no shift at all;
+    an older leaf is drawn from its corner at zero and the section is shifted
+    by ``XWorld``/``YWorld``. Empty when neither is available, or when the
+    document no longer holds the simulation.
 
     ``is_pec`` is carried because the two overlays built from this section want
     different subsets of it -- every material is outlined, only conductors are
@@ -453,7 +455,13 @@ def _geometry_outlines(obj, deflection_mm):
     if sim is None:
         return []
     ax0, ax1 = axes
-    x0, y0 = getattr(obj, "XWorld", None), getattr(obj, "YWorld", None)
+    if bool(getattr(obj, "WorldFrame", False)):
+        # The leaf's own coordinates are world mm, so the section goes on
+        # unshifted. Returning early also keeps the legacy fallback below from
+        # reading a DomainMin that has nothing to do with this frame.
+        x0 = y0 = 0.0
+    else:
+        x0, y0 = getattr(obj, "XWorld", None), getattr(obj, "YWorld", None)
     if x0 is None or y0 is None:
         # A leaf built before the world frame was stored. The runner crops
         # nothing (the absorber lies inside the box), so the drawn region is
@@ -937,27 +945,35 @@ def build_results(doc, sim, workdir, summary):
             if extent is not None:
                 _store_snapshot_extent(leaf, *extent)
             # In-plane node/edge coordinates (metres, solver frame) from the
-            # runner: stored on the leaf as mm relative to the slice corner so
-            # the plot uses pcolormesh on the real (possibly non-uniform) grid.
+            # runner, stored on the leaf as **world** mm so the plot uses
+            # pcolormesh on the real (possibly non-uniform) grid and its axes
+            # are the model's own -- the same frame the mode plots draw in, so
+            # one coax reads on one ruler wherever it appears.
             e0k = "snapshot_{}_edges0".format(idx)
             e1k = "snapshot_{}_edges1".format(idx)
             if e0k in keys and e1k in keys:
-                _store_edges(leaf, "XEdges", npz[e0k])
-                _store_edges(leaf, "YEdges", npz[e1k])
-                if extent is not None:
-                    # ...and where that (relative) frame sits in the world, so
-                    # the plot can draw the CAD cross-section over it.
-                    _store_snapshot_world(leaf, sim, extent[2], extent[3],
-                                          npz[e0k][0], npz[e1k][0])
+                # Where the drawn frame's low corner sits in the world. Computed
+                # first, because everything else on this leaf is shifted by it;
+                # None (no extent, or a domain with no nodes) leaves the leaf in
+                # the old corner-relative frame, which is what a legacy leaf and
+                # its ``_geometry_outlines`` fallback already expect.
+                world = (_store_snapshot_world(leaf, sim, extent[2], extent[3],
+                                               npz[e0k][0], npz[e1k][0])
+                         if extent is not None else None)
+                wx, wy = world if world is not None else (0.0, 0.0)
+                _store_edges(leaf, "XEdges", npz[e0k], offset_mm=wx)
+                _store_edges(leaf, "YEdges", npz[e1k], offset_mm=wy)
                 # Where the absorber starts on each in-plane axis. The frames
                 # span the whole grid (the PML sits inside the domain box, so
                 # cropping it would hide a body carried out through it), and
                 # this is what lets the plot say which part of the picture is
-                # absorber rather than leaving it to be read as domain.
+                # absorber rather than leaving it to be read as domain. Shifted
+                # by the same origin as the edges: the PML shading is drawn
+                # against them, so the two frames move together or not at all.
                 _store_interior(leaf, "XInterior", meta.get("interior0"),
-                                npz[e0k][0])
+                                npz[e0k][0], offset_mm=wx)
                 _store_interior(leaf, "YInterior", meta.get("interior1"),
-                                npz[e1k][0])
+                                npz[e1k][0], offset_mm=wy)
 
         # Electrostatics: one leaf for the scalar results. Created whenever the
         # run was electrostatic, even with no capacitance matrix -- the applied
@@ -971,6 +987,12 @@ def build_results(doc, sim, workdir, summary):
                              else "Electrostatic solution",
                              _KIND_CAPACITANCE, "capacitance")
             _store_electrostatic_meta(leaf, es_meta)
+
+        # The solver frame's zero on each axis, in world mm: every mode's
+        # coordinates are shifted by it on the way in, so the plot's axes are
+        # the model's own and the cross-section on screen sits where the 3-D
+        # view puts it. Read once -- it copies the Domain's node arrays.
+        origins = _grid_origins_mm(sim)
 
         # Port modes (one leaf per solved port mode). Each opens a figure of the
         # mode shape plus the port's per-unit-length parameters.
@@ -991,16 +1013,22 @@ def build_results(doc, sim, workdir, summary):
                 "conductor {}".format(meta.get("conductor_id", "?")))
             leaf = _new_leaf(name, _KIND_MODE, key, "",
                              parent=port_groups.get(port_name))
-            _store_mode_meta(leaf, meta)
-            # Transverse cell-centre coordinates (metres, solver frame) from the
-            # runner: stored as absolute mm so the plot draws the mode on the
-            # real (possibly non-uniform) transverse axes.
+            axes = meta.get("transverse_axes", ["a", "b"])
+            _store_mode_meta(
+                leaf, meta,
+                normal_origin_mm=origins.get(str(meta.get("normal", "")), 0.0))
+            # Transverse **node** coordinates (metres, solver frame) from the
+            # runner -- a mode's profiles are node-indexed, not cell-centred.
+            # Stored as absolute world mm so the plot draws the mode on the real
+            # (possibly non-uniform) transverse axes.
             cak, cbk = key + "_ca", key + "_cb"
             if cak in keys and cbk in keys:
                 _store_edges(leaf, "CoordsA", npz[cak], relative=False,
-                             group="Mode")
+                             group="Mode",
+                             offset_mm=origins.get(str(axes[0]), 0.0))
                 _store_edges(leaf, "CoordsB", npz[cbk], relative=False,
-                             group="Mode")
+                             group="Mode",
+                             offset_mm=origins.get(str(axes[1]), 0.0))
 
         # The port groups join Results last, so they follow the monitor leaves
         # in the tree instead of pushing them down. A group that ended up empty
@@ -1219,47 +1247,87 @@ def _store_snapshot_extent(leaf, width, height, axis_x, axis_y, plane, offset):
 
 
 def _store_snapshot_world(leaf, sim, axis_x, axis_y, first_x_m, first_y_m):
-    """Stash the world-mm position of the drawn slice's (0, 0) corner.
+    """Stash the world-mm position of the drawn slice's low corner; return it.
 
-    The stored edges are relative to the first *drawn* cell edge -- the
-    interior low corner, PML cropped -- while the CAD is in world millimetres.
-    This pair is the only thing that maps between them, and it is knowable only
-    here: the leaf has no idea where the grid origin was, and the Domain's node
-    arrays (which do, in world mm) may have moved by the time the plot opens.
+    The runner's edges are solver-frame metres from the grid origin, while the
+    CAD is in world millimetres. This pair is what maps between them, and it is
+    knowable only here: the leaf has no idea where the grid origin was, and the
+    Domain's node arrays (which do, in world mm) may have moved by the time the
+    plot opens. The caller adds it to everything it stores, so the leaf's own
+    coordinates end up in world mm.
+
+    Also raises ``WorldFrame`` on the leaf, which is what tells the plot its
+    stored coordinates are already world and the CAD needs no shift. A leaf
+    without it predates this and is drawn from its corner at zero, as it was.
+
+    Returns ``(x_mm, y_mm)``, or ``None`` when the domain cannot place it.
     """
     from wavesim_gui import domain as domain_mod
 
     dom = domain_mod.find_domain(sim)
     if dom is None:
-        return
+        return None
     nodes = dict(zip(("x", "y", "z"), domain_mod.node_coords_mm(dom)))
     origin_x, origin_y = nodes.get(axis_x) or [], nodes.get(axis_y) or []
     if not origin_x or not origin_y:
-        return
-    for prop, value in (
-        ("XWorld", origin_x[0] + float(first_x_m) * _MM_PER_M),
-        ("YWorld", origin_y[0] + float(first_y_m) * _MM_PER_M),
-    ):
+        return None
+    world = (origin_x[0] + float(first_x_m) * _MM_PER_M,
+             origin_y[0] + float(first_y_m) * _MM_PER_M)
+    for prop, value in (("XWorld", world[0]), ("YWorld", world[1])):
         if not hasattr(leaf, prop):
             leaf.addProperty("App::PropertyFloat", prop, "Snapshot",
                              "World position (mm) of the drawn slice's origin")
             leaf.setEditorMode(prop, 1)
         setattr(leaf, prop, value)
+    if not hasattr(leaf, "WorldFrame"):
+        leaf.addProperty("App::PropertyBool", "WorldFrame", "Snapshot",
+                         "Stored coordinates are world mm, not corner-relative")
+        leaf.setEditorMode("WorldFrame", 1)
+    leaf.WorldFrame = True
+    return world
 
 
-def _store_edges(leaf, prop, coords_m, relative=True, group="Snapshot"):
+def _grid_origins_mm(sim):
+    """World-mm coordinate of the solver frame's zero, per axis.
+
+    The solver's grid spans exactly the domain box, so its origin is the box's
+    min corner and ``solver_mm + origin`` is world mm on every axis. Returned as
+    ``{"x": .., "y": .., "z": ..}``, empty where the Domain is missing or has no
+    nodes yet -- a caller that gets nothing back falls through to an offset of
+    zero, which is the solver frame these coordinates used to be stored in.
+
+    Read here, at result-build time, and baked into what is stored: the Domain's
+    node arrays may have moved (a re-mesh, a resized body) long before the plot
+    is opened, and an old result must keep plotting where it was solved.
+    """
+    from wavesim_gui import domain as domain_mod
+
+    dom = domain_mod.find_domain(sim) if sim is not None else None
+    if dom is None:
+        return {}
+    return {axis: float(nodes[0])
+            for axis, nodes in zip(("x", "y", "z"),
+                                   domain_mod.node_coords_mm(dom))
+            if nodes}
+
+
+def _store_edges(leaf, prop, coords_m, relative=True, group="Snapshot",
+                 offset_mm=0.0):
     """Stash a coordinate array (solver-frame metres) on a leaf as an mm list.
 
     *relative* subtracts the first coordinate (used for snapshot edges, which are
     drawn from the slice corner at 0); mode transverse coordinates keep their
-    absolute position. Stored as a read-only ``App::PropertyFloatList`` so it
+    absolute position. *offset_mm* is then added, which is how a mode's
+    transverse axes are carried from the solver frame into **world** mm (see
+    :func:`_grid_origins_mm`), so the plot's ``x``/``y`` are the same numbers the
+    3-D view shows. Stored as a read-only ``App::PropertyFloatList`` so it
     survives save/reload with the run output.
     """
     vals = [float(v) for v in coords_m]
     if not vals:
         return
     origin = vals[0] if relative else 0.0
-    mm = [(v - origin) * _MM_PER_M for v in vals]
+    mm = [(v - origin) * _MM_PER_M + float(offset_mm) for v in vals]
     if not hasattr(leaf, prop):
         leaf.addProperty("App::PropertyFloatList", prop, group,
                          "Axis coordinates (mm)")
@@ -1267,19 +1335,21 @@ def _store_edges(leaf, prop, coords_m, relative=True, group="Snapshot"):
     setattr(leaf, prop, mm)
 
 
-def _store_interior(leaf, prop, span_m, origin_m):
+def _store_interior(leaf, prop, span_m, origin_m, offset_mm=0.0):
     """Stash one in-plane axis's absorber-free span on a snapshot leaf (mm).
 
     *span_m* is the runner's ``interior0``/``interior1`` -- the two coordinates
     bounding the region the PML leaves, in the saved edges' frame -- or ``None``
     where that axis absorbs on neither face. Stored the way the edges are:
-    millimetres relative to the first drawn edge (*origin_m*), so the plot can
-    use it against ``XEdges``/``YEdges`` without knowing the solver frame. An
-    axis with no absorber stores an empty list, which is what the plot reads as
-    "nothing to shade here".
+    millimetres from the first drawn edge (*origin_m*) plus the same
+    *offset_mm* they were given, so the plot can use it against
+    ``XEdges``/``YEdges`` without knowing the solver frame. An axis with no
+    absorber stores an empty list, which is what the plot reads as "nothing to
+    shade here".
     """
     vals = ([] if not span_m else
-            [(float(v) - float(origin_m)) * _MM_PER_M for v in span_m])
+            [(float(v) - float(origin_m)) * _MM_PER_M + float(offset_mm)
+             for v in span_m])
     if not hasattr(leaf, prop):
         leaf.addProperty("App::PropertyFloatList", prop, "Snapshot",
                          "Absorber-free span of this axis (mm)")
@@ -1287,12 +1357,17 @@ def _store_interior(leaf, prop, span_m, origin_m):
     setattr(leaf, prop, vals)
 
 
-def _store_mode_meta(leaf, meta):
+def _store_mode_meta(leaf, meta, normal_origin_mm=0.0):
     """Stash a solved TEM mode's geometry + per-unit-length parameters on a leaf.
 
     These read-only properties carry everything the figure needs to draw the
     mode shape (cell sizes, transverse axes, E-component keys) and to report the
     port parameters (Z0, eps_eff, C, L, v) without re-reading ``summary.json``.
+
+    ``ModePosition`` is stored in **world** metres -- *normal_origin_mm* is the
+    world position of the solver frame's zero on the port's normal axis, the
+    same shift the transverse coordinates get in :func:`_store_edges`. The two
+    move together or the annotation box names a plane the axes cannot show.
     """
     def _add(prop, kind, value, group="Mode"):
         if not hasattr(leaf, prop):
@@ -1307,7 +1382,8 @@ def _store_mode_meta(leaf, meta):
     _add("Db", "App::PropertyFloat", float(meta.get("db", 0.0)))
     _add("PortName", "App::PropertyString", str(meta.get("name", "")))
     _add("Normal", "App::PropertyString", str(meta.get("normal", "")))
-    _add("ModePosition", "App::PropertyFloat", float(meta.get("position", 0.0)))
+    _add("ModePosition", "App::PropertyFloat",
+         float(meta.get("position", 0.0)) + float(normal_origin_mm) / _MM_PER_M)
     _add("ConductorId", "App::PropertyInteger", int(meta.get("conductor_id", 0)))
     # The conductor the port's table named, when one did. Empty for a legacy
     # port and for any mode no drive row claimed -- then ConductorId, the
@@ -3160,7 +3236,8 @@ if _GUI_AVAILABLE:
         extent = [0.0, float(size.x), 0.0, float(size.y)] if have_size else None
 
         # Symmetric colour scale for signed fields (RdBu_r); 0..max for
-        # magnitudes (inferno). Log scaling mirrors wavesim's animate_snapshots:
+        # magnitudes and other one-sided scalars (turbo). Log scaling mirrors
+        # wavesim's animate_snapshots:
         # SymLogNorm for signed fields (linear within +/-vmax/1e3, log beyond),
         # LogNorm for magnitudes.
         # Each component is scaled on its own peak, so switching to a weak
@@ -4024,7 +4101,9 @@ if _GUI_AVAILABLE:
             "phi": phi,
             "pec": _load_array(workdir, key + "_pec"),
             "Ea": Ea, "Eb": Eb,
-            # Stored absolute, already in mm.
+            # Stored absolute, already in world mm (runs saved before that are
+            # in the solver frame and plot offset by the domain's min corner --
+            # re-run the port to redraw them in model coordinates).
             "coords_a": list(getattr(obj, "CoordsA", []) or []),
             "coords_b": list(getattr(obj, "CoordsB", []) or []),
             "da": _num("Da"), "db": _num("Db"),
@@ -4041,13 +4120,19 @@ if _GUI_AVAILABLE:
             "fields": str(getattr(obj, "Fields", "")),
         }
 
-    def _mode_data_from_summary(workdir, meta):
+    def _mode_data_from_summary(workdir, meta, origins=None):
         """The same fields, read straight from a solve's npz + ``summary["modes"]``.
 
         Used by :func:`show_mode_preview`, which has no document leaf to read
         from. Every array is pulled into memory here so the caller can delete the
         temp workdir as soon as the figure exists.
+
+        *origins* is :func:`_grid_origins_mm` for the document the solve came
+        from, and shifts the solver-frame coordinates into world mm exactly as
+        the stored path does -- without it a previewed mode and the same mode
+        re-plotted from the tree after a run would draw on different axes.
         """
+        origins = origins or {}
         key = "mode_{}_{}".format(
             meta.get("source_index", 0), meta.get("mode_index", 0)
         )
@@ -4061,10 +4146,11 @@ if _GUI_AVAILABLE:
             Ea = _load_array(workdir, "{}_E_{}".format(key, ecomps[0]))
             Eb = _load_array(workdir, "{}_E_{}".format(key, ecomps[1]))
 
-        def _coords(suffix):
-            """Transverse cell centres as mm (the runner writes solver metres)."""
+        def _coords(suffix, offset_mm):
+            """One transverse node axis as world mm (the runner writes solver m)."""
             arr = _load_array(workdir, key + suffix)
-            return [] if arr is None else [float(v) * _MM_PER_M for v in arr]
+            return ([] if arr is None else
+                    [float(v) * _MM_PER_M + float(offset_mm) for v in arr])
 
         def _num(value):
             return _NAN if value is None else float(value)
@@ -4082,12 +4168,16 @@ if _GUI_AVAILABLE:
             "phi": phi,
             "pec": _load_array(workdir, key + "_pec"),
             "Ea": Ea, "Eb": Eb,
-            "coords_a": _coords("_ca"), "coords_b": _coords("_cb"),
+            "coords_a": _coords("_ca", origins.get(str(axes[0]), 0.0)),
+            "coords_b": _coords("_cb", origins.get(str(axes[1]), 0.0)),
             "da": float(meta.get("da", 0.0)), "db": float(meta.get("db", 0.0)),
             "axis_a": str(axes[0]), "axis_b": str(axes[1]),
             "conductor_id": int(meta.get("conductor_id", 0)),
             "normal": str(meta.get("normal", "")),
-            "position": float(meta.get("position", 0.0)),
+            # World metres, like the stored path's ``ModePosition``.
+            "position": (float(meta.get("position", 0.0))
+                         + origins.get(str(meta.get("normal", "")), 0.0)
+                         / _MM_PER_M),
             "impedance": _num(meta.get("impedance")),
             "eps_eff": _num(meta.get("eps_eff")),
             "capacitance": _num(meta.get("capacitance")),
@@ -4122,9 +4212,14 @@ if _GUI_AVAILABLE:
 
         phi = data["phi"]
         Na, Nb = phi.shape
-        # Where each sample sits, in mm (the workbench's display unit). Prefer the
-        # real transverse coordinate arrays from the runner (which honour a
-        # non-uniform grid); fall back to a constant da/db spacing for older runs.
+        # Where each sample sits, in **world** mm -- the model's own frame, so
+        # the axes here read as the 3-D view's do rather than from the domain's
+        # min corner (both build paths add that corner; see
+        # :func:`_grid_origins_mm`). Prefer the real transverse coordinate
+        # arrays from the runner (which honour a non-uniform grid); fall back to
+        # a constant da/db spacing for older runs, which is also the one case
+        # left drawing from zero -- a run predating the coordinate arrays has
+        # nothing to say where its plane was.
         #
         # φ and the PEC mask are **node**-indexed -- ``phi[i, j]`` is the
         # potential at node ``(a[i], b[j])`` -- and the runner's arrays are the
@@ -4317,10 +4412,10 @@ if _GUI_AVAILABLE:
         smooth = QtWidgets.QCheckBox("Smooth")
         smooth.setChecked(opts["smooth"])
         smooth.setToolTip(
-            "Shade between neighbouring cell centres instead of painting each\n"
-            "cell flat. φ is a point sample at each cell centre, so this adds\n"
-            "no data -- it interpolates the same numbers. Turn it off to see\n"
-            "the cells the mode was solved on."
+            "Shade between neighbouring samples instead of painting each one\n"
+            "flat. φ is a point sample at each grid node, so this adds no\n"
+            "data -- it interpolates the same numbers. Turn it off to see\n"
+            "the grid the mode was solved on."
         )
         row.addWidget(smooth)
 
@@ -4379,7 +4474,7 @@ if _GUI_AVAILABLE:
         dialog.show()
         _register_window(dialog)
 
-    def show_mode_preview(workdir, summary):
+    def show_mode_preview(workdir, summary, doc=None):
         """Plot the modes of a "Compute Mode" solve, without touching the document.
 
         The preview's ``results.npz`` lives in a temp directory the caller deletes
@@ -4392,10 +4487,15 @@ if _GUI_AVAILABLE:
         dropdown scroll through them, and each mode names its energized conductor
         in the dropdown, the figure title and the parameter box. Returns ``False``
         when there was no plottable mode.
+
+        *doc* is the document the solve was built from; it is what lets the plot
+        put its axes in model coordinates rather than the solver's. Omitted, the
+        mode still plots -- from the domain's min corner, as it always did.
         """
+        origins = _grid_origins_mm(active_simulation(doc)) if doc else {}
         datas = []
         for meta in summary.get("modes", []):
-            data = _mode_data_from_summary(workdir, meta)
+            data = _mode_data_from_summary(workdir, meta, origins)
             if data is not None:
                 datas.append(data)
         if not datas:

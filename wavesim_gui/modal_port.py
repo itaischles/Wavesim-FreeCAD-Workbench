@@ -2323,7 +2323,9 @@ if _GUI_AVAILABLE:
                 return
             # Reads every array it needs before returning, so the temp dir below
             # can go while the plot window stays open.
-            if not results_mod.show_mode_preview(workdir, summary):
+            # *doc* only so the plot can draw its axes in model coordinates;
+            # nothing is written to it.
+            if not results_mod.show_mode_preview(workdir, summary, doc):
                 FreeCAD.Console.PrintWarning(
                     "Wavesim: the solved mode of '{}' could not be plotted.\n"
                     .format(port_obj.Label)

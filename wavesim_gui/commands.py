@@ -855,13 +855,14 @@ if _GUI_AVAILABLE:
     Gui.addCommand("Wavesim_NewSimulation", CommandNewSimulation())
 
     class CommandRun:
-        """Run the (Session-2 hardcoded) simulation through the conda bridge.
+        """Run the document's simulation through the conda bridge.
 
-        Serialises a minimal vacuum-box job to a working directory under the
-        configured results folder, runs the conda-side ``runner.py`` out of
-        process with a progress dialog, then reports the summary. Real geometry,
-        materials, sources and monitors arrive in later sessions; this proves the
-        bridge round-trip end to end.
+        Voxelises the document's geometry, materials, sources and monitors into
+        a job + material arrays in a working directory under the configured
+        results folder, runs the conda-side ``runner.py`` out of process with a
+        progress dialog, then builds the Results tree and reports the summary.
+        A document with no material assigned falls back to a minimal vacuum-box
+        job, which is the oldest path here and now only a demo.
         """
 
         def GetResources(self):

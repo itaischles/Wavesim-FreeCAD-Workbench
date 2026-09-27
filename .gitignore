@@ -32,3 +32,12 @@ tools/lumped_geometry.txt
 
 # Report written by tools/check_body_refinement.py
 tools/body_refinement.txt
+
+# Report written by tools/check_feature_edges.py
+tools/feature_edges.txt
+
+# Report written by tools/check_pml_inside.py
+tools/pml_inside.txt
+
+# User manual sources, figures and build output — local working docs
+manual/

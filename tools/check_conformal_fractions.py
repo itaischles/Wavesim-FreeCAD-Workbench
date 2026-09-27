@@ -7,8 +7,9 @@ Python::
     "%LOCALAPPDATA%\\Programs\\FreeCAD 1.1\\bin\\freecadcmd.exe" \\
         tools/check_conformal_fractions.py
 
-Builds the reference coax of ``CONFORMAL_PEC_PLAN.md`` section 7 (a = 3 mm,
-b = 9 mm, cell 0.5 mm) out of ``Part`` solids, voxelises it with
+Builds the reference coax (a = 3 mm, b = 9 mm, cell 0.5 mm) out of ``Part``
+solids -- the same cross-section the solver's own conformal tests use --
+voxelises it with
 ``conformal=True``, and compares all six open-fraction arrays against a
 closed-form answer written here **independently of the voxeliser**. The maths
 mirrors the solver's ``tests/conformal_shapes.py`` but is driven by node arrays
@@ -17,7 +18,7 @@ rather than an ``FDTDGrid``, so this side needs no ``import wavesim``.
 It reports three things, in descending order of importance:
 
 1. **Killed faces.** A face whose open fraction rounds to exactly 0 tells the
-   solver "no contour" (``inv_A = 0``), which is the small-cut remedy S4
+   solver "no contour" (``inv_A = 0``), which is the small-cut remedy
    measured as harmful (+5.77% against +0.21% for clamping). It is only safe
    when all four of its contour edges are covered too, so the tally that matters
    is faces killed while a contour edge is still live.
@@ -409,7 +410,7 @@ def main(out_path):
              "(true open fraction up to %.4f)"
              % (key, int(np.count_nonzero(killed)), worst))
         # A tally is fine as long as those faces really have no open area; a
-        # genuinely cut face killed this way is the S4 failure mode.
+        # genuinely cut face killed this way is that failure mode.
         ok = ok and worst < 1.0e-9
 
     # -- accuracy ------------------------------------------------------------

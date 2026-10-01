@@ -62,6 +62,10 @@ DEFAULTS = {
     # revert switch if the pool ever misbehaves. The parallel and serial paths
     # produce bit-identical arrays (tools/check_sectionpool.py).
     "voxelize_workers": "auto",
+    # How many discrete colours a snapshot map uses when its Banding box is
+    # ticked: the selected colour map cut into this many flat bands, so equal
+    # steps of the field read as contour-like steps of colour.
+    "colormap_bands": 12,
 }
 
 # Environment variable that overrides each key when the stored value is absent.
@@ -72,6 +76,7 @@ _ENV_OVERRIDES = {
     "ngspice_dll": "WAVESIM_NGSPICE_DLL",
     "backend": "WAVESIM_BACKEND",
     "voxelize_workers": "WAVESIM_VOXELIZE_WORKERS",
+    "colormap_bands": "WAVESIM_COLORMAP_BANDS",
 }
 
 
@@ -177,6 +182,25 @@ def get_voxelize_workers():
     ``wavesim_gui.sectionpool.resolve_workers``.
     """
     return get("voxelize_workers") or "auto"
+
+
+# Bounds on the band count: two is the fewest that still says anything, and
+# past a few dozen the bands are too thin to tell from a continuous map.
+BANDS_MIN, BANDS_MAX = 2, 64
+
+
+def get_colormap_bands():
+    """Number of colour bands a snapshot map uses when Banding is on.
+
+    Stored as an int, but an environment override arrives as text and a
+    hand-edited file may hold anything, so it is coerced and clamped here
+    rather than trusted.
+    """
+    try:
+        bands = int(get("colormap_bands"))
+    except (TypeError, ValueError):
+        bands = DEFAULTS["colormap_bands"]
+    return max(BANDS_MIN, min(BANDS_MAX, bands))
 
 
 # --------------------------------------------------------------------------- #
@@ -295,8 +319,20 @@ if _GUI_AVAILABLE:
                     self._browse_ngspice,
                 ),
             )
+            # Colour bands for a snapshot's Banding view. Read when the box is
+            # ticked, so a change here applies to an open plot on its next
+            # toggle rather than only to plots opened afterwards.
+            self._bands_spin = QtWidgets.QSpinBox()
+            self._bands_spin.setRange(BANDS_MIN, BANDS_MAX)
+            self._bands_spin.setValue(get_colormap_bands())
+            self._bands_spin.setToolTip(
+                "Number of discrete colours a snapshot map is cut into when\n"
+                "its Banding box is ticked."
+            )
+
             form.addRow("Solver backend:", self._backend_combo)
             form.addRow("Voxelisation:", self._workers_combo)
+            form.addRow("Colour map bands:", self._bands_spin)
             layout.addLayout(form)
 
             hint = QtWidgets.QLabel(
@@ -379,6 +415,7 @@ if _GUI_AVAILABLE:
             ngspice_dll = self._ngspice_edit.text().strip()
             backend = self._backend_combo.currentData() or "auto"
             workers = self._workers_combo.currentData() or "auto"
+            bands = int(self._bands_spin.value())
 
             warnings = []
             if not os.path.isfile(python_path):
@@ -429,6 +466,7 @@ if _GUI_AVAILABLE:
                     "ngspice_dll": ngspice_dll,
                     "backend": backend,
                     "voxelize_workers": workers,
+                    "colormap_bands": bands,
                 }
             ):
                 FreeCAD.Console.PrintMessage(

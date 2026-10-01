@@ -2884,6 +2884,36 @@ if _GUI_AVAILABLE:
         dialog.show()
         _register_window(dialog)
 
+    def _held_view(axes_of, handler):
+        """Wrap a control's *handler* so the zoom/pan in force survives it.
+
+        A toolbar zoom sets the limits but leaves autoscaling on, so a control
+        that adds or rebuilds an artist snaps the view back to the full extent
+        -- as does one that frames the axes itself (the snapshot's Smooth) or
+        redraws the whole figure (the mode plot). Restoring the limits after
+        the handler, rather than auditing every handler for what it touches,
+        keeps any future control honest too. *axes_of* returns the axes to
+        hold, read again afterwards since a redraw may have replaced them.
+        """
+        def wrapped(*args):
+            ax = axes_of()
+            if ax is None:
+                handler(*args)
+                return
+            # Reading the limits settles any autoscale still pending, so what
+            # is saved is the view the user is actually looking at.
+            xlim, ylim = ax.get_xlim(), ax.get_ylim()
+            handler(*args)
+            ax = axes_of()
+            if ax is None or (ax.get_xlim(), ax.get_ylim()) == (xlim, ylim):
+                return
+            # ``set_xlim`` also turns autoscaling off, which is right: a view
+            # held on purpose should not be undone by the next control either.
+            ax.set_xlim(xlim)
+            ax.set_ylim(ylim)
+            ax.figure.canvas.draw_idle()
+        return wrapped
+
     # Colour-scale clip percentiles offered for snapshot maps, strongest first.
     # 100 means "scale on the true peak" (the old behaviour).
     _CLIP_CHOICES = (99.5, 99.9, 99.0, 98.0, 95.0, 100.0)
@@ -2993,7 +3023,7 @@ if _GUI_AVAILABLE:
     # can drift into the mess that per-cell striding produces (arrows longer
     # than their own spacing, overlapping into a smear that shows neither
     # direction nor magnitude).
-    _ARROWS_ACROSS = 56     # arrows along the longer visible axis
+    _ARROWS_ACROSS = 44     # arrows along the longer visible axis
     # Longest arrow, in arrow pitches. Below 1 by design: with ``pivot="mid"``
     # an arrow reaches half its length each way, so at most half a pitch, and
     # two neighbours at full length pointing straight at each other still leave
@@ -3006,20 +3036,20 @@ if _GUI_AVAILABLE:
     # that density without blotting out what they sit on. ``width`` is in axes
     # widths like the length, so it tracks ``_ARROWS_ACROSS`` inversely -- a
     # denser lattice needs a proportionally thinner arrow to keep the same
-    # shape. The head is kept short for a second reason as well -- see
-    # ``_ARROW_FLOOR``.
-    _ARROW_STYLE = dict(width=0.0019, headwidth=3.0, headlength=3.0,
+    # shape. Slim, but not hairline: the faded arrows are only as visible as
+    # the full-strength ones are bold, so the shaft has to carry some weight.
+    # The head (``headwidth`` shaft widths across) stays well under a pitch,
+    # so side-by-side neighbours never touch either.
+    _ARROW_STYLE = dict(width=0.003, headwidth=3.0, headlength=3.0,
                         headaxislength=2.8, pivot="mid")
 
-    # Shortest arrow drawn, as a fraction of full length. Below ``headlength *
-    # width`` (both in axes-width units) matplotlib stops shortening the shaft
-    # and scales the whole glyph down instead: all head and no shaft, which
-    # reads as a dot. A dot carries no direction, and the colour map underneath
-    # already says the field is weak there, so those are hidden rather than
-    # drawn. Derived from the style above rather than picked, so it stays
-    # exactly at the dot boundary if the style is ever retuned.
-    _ARROW_FLOOR = (_ARROW_STYLE["headlength"] * _ARROW_STYLE["width"]
-                    * _ARROWS_ACROSS / _ARROW_SPAN)
+    # Every arrow is drawn, and each one's opacity follows its drawn length:
+    # alpha = (length / full length) ** _ARROW_FADE. A weak vector is then
+    # short *and* faint, so the field fades into the colour map underneath
+    # instead of stopping at a hard cutoff -- which is what hiding everything
+    # below a length floor did, leaving a visible edge where the arrows ended.
+    # 1 fades linearly; above 1 weak arrows vanish sooner, below 1 later.
+    _ARROW_FADE = 1.0
 
     def _nearest_index(coords, vals):
         """Index of the sample in *coords* nearest each of *vals*."""
@@ -3120,22 +3150,22 @@ if _GUI_AVAILABLE:
         from matplotlib.quiver import Quiver
 
         art = Quiver(ax, px, py, u, v, angles="xy", scale_units="width",
-                     scale=_arrow_scale(ref), color=color, zorder=3,
-                     **_ARROW_STYLE)
+                     scale=_arrow_scale(ref), zorder=3, **_ARROW_STYLE)
+        art.set_facecolor(color)
         ax.add_collection(art, autolim=False)
         return art
 
     def _arrow_uv(u, v, ref, length=None):
-        """``quiver`` components for the vectors (*u*, *v*), drawn at *length*.
+        """``quiver`` components for (*u*, *v*) drawn at *length*, and their fade.
 
-        Direction is kept exact; magnitude is carried by the drawn length,
-        which defaults to the vector's own clipped at *ref* (so the strongest
-        cells saturate at full length instead of setting the scale for
-        everything else). Vectors that would draw shorter than ``_ARROW_FLOOR``
-        come back as NaN, which ``quiver`` renders as nothing at all -- the
-        weak field then fades out of the picture rather than stippling it with
-        dots. Zero-length vectors -- conductor interiors, an unreached domain
-        -- go the same way.
+        Returns ``(u, v, frac)``. Direction is kept exact; magnitude is carried
+        by the drawn length, which defaults to the vector's own clipped at
+        *ref* (so the strongest cells saturate at full length instead of
+        setting the scale for everything else). ``frac`` is that length as a
+        fraction of full length, 0..1, which :func:`_arrow_rgba` turns into the
+        arrow's opacity. Zero-length vectors -- conductor interiors, an
+        unreached domain -- come back as zero with ``frac`` 0, so they draw as
+        nothing visible.
         """
         import numpy as np
 
@@ -3145,9 +3175,73 @@ if _GUI_AVAILABLE:
         if length is None:
             length = np.minimum(m, ref)
         with np.errstate(divide="ignore", invalid="ignore"):
-            f = np.where(m > 0, length / m, 0.0)
-            f = np.where(length >= _ARROW_FLOOR * ref, f, np.nan)
-        return u * f, v * f
+            f = np.nan_to_num(np.where(m > 0, length / m, 0.0))
+            frac = np.nan_to_num(np.clip(length / ref, 0.0, 1.0))
+        return u * f, v * f, frac
+
+    def _arrow_rgba(color, frac):
+        """Per-arrow RGBA: *color*, at an opacity set by each arrow's length."""
+        import numpy as np
+        from matplotlib import colors as mcolors
+
+        rgba = np.empty((len(frac), 4))
+        rgba[:, :3] = mcolors.to_rgb(color)
+        rgba[:, 3] = np.asarray(frac, dtype=float) ** _ARROW_FADE
+        return rgba
+
+    def _banded_cmap(name, bands):
+        """Colour map *name* cut into *bands* flat colours.
+
+        The bands sample the same map end to end, so a banded picture keeps the
+        colours of the continuous one and only loses the shading between them.
+        The colour bar follows on its own: it draws one block per entry of the
+        map it is given.
+        """
+        import matplotlib
+
+        try:
+            return matplotlib.colormaps[name].resampled(int(bands))
+        except AttributeError:          # matplotlib < 3.6
+            from matplotlib import cm
+            return cm.get_cmap(name, int(bands))
+
+    # --- field lines over a potential map ---------------------------------- #
+    # How closely ``streamplot`` packs the field lines: 1 is its default
+    # spacing (a 30 x 30 occupancy grid over the axes), higher is denser.
+    _FIELD_LINE_DENSITY = 1.2
+
+    def _potential_field(phi2d, cx, cy, rings):
+        """In-plane ``E = -grad phi`` on a uniform lattice, for ``streamplot``.
+
+        Returns ``(fx, fy, ex, ey)`` -- the lattice axes and the two components
+        as ``(ny, nx)`` arrays masked inside the conductors -- or ``None`` when
+        the slice is too small or holds no field.
+
+        The potential is resampled first, with the same Catmull-Rom lattice the
+        smoothed map uses: ``streamplot`` insists on an evenly spaced grid,
+        which a graded mesh is not, and differentiating the smooth resample
+        gives lines that curve rather than kink at every cell. Only the
+        in-plane part of E is there to follow: the slice does not carry the
+        potential's slope along its normal. The metal is masked from the
+        CAD rings (where the integration stops), not inferred from E being
+        small, because the resample smears the field a cell or two into it.
+        """
+        import numpy as np
+
+        if len(cx) < 2 or len(cy) < 2:
+            return None
+        fine, (x0, x1, y0, y1) = _smooth_grid(phi2d, cx, cy)
+        fx = np.linspace(x0, x1, fine.shape[1])
+        fy = np.linspace(y0, y1, fine.shape[0])
+        gy, gx = np.gradient(fine, fy, fx)
+        ex, ey = -gx, -gy
+        if not np.any(np.hypot(ex, ey) > 0.0):
+            return None
+        dead = _dead_cells(rings, fx, fy) if rings else None
+        if dead is not None:
+            ex = np.ma.masked_where(dead, ex)
+            ey = np.ma.masked_where(dead, ey)
+        return fx, fy, ex, ey
 
     def _plot_snapshot(obj):
         import numpy as np
@@ -3244,10 +3338,17 @@ if _GUI_AVAILABLE:
         # component rescales rather than showing it washed out.
         from matplotlib import colors as mcolors
 
-        view = {"comp": comp, "frames": frames, "clip": _CLIP_CHOICES[0]}
+        view = {"comp": comp, "frames": frames, "clip": _CLIP_CHOICES[0],
+                "banded": False}
 
         def _cmap_for(choice):
-            return "turbo" if _one_sided(choice) else "RdBu_r"
+            name = "turbo" if _one_sided(choice) else "RdBu_r"
+            if view["banded"]:
+                # Read at each rebuild rather than once, so a band count
+                # changed in Settings reaches an open plot on its next toggle.
+                import wavesim_settings
+                return _banded_cmap(name, wavesim_settings.get_colormap_bands())
+            return name
 
         # (component, percentile) -> vmax. Each limit spans the whole run so the
         # scale holds still while the animation plays, which makes recomputing
@@ -3416,6 +3517,10 @@ if _GUI_AVAILABLE:
 
         _make_image(image["smooth"])
 
+        def _hold(handler):
+            """*handler*, keeping the user's zoom/pan (see ``_held_view``)."""
+            return _held_view(lambda: ax, handler)
+
         # --- geometry outline overlay ------------------------------------- #
         # The field alone does not say where the metal and the dielectric are,
         # and on a slice through a coax that is most of the reading. Each
@@ -3528,6 +3633,52 @@ if _GUI_AVAILABLE:
 
         pml_overlay = _build_pml()
 
+        # --- field lines --------------------------------------------------- #
+        # A potential map shows where the voltage is, but not which way the
+        # field pushes -- that is its slope, which the eye reads badly off a
+        # colour gradient. White lines along E = -grad phi say so directly:
+        # they leave one conductor square to its surface and land on another,
+        # crossing the equipotentials at right angles. Only on a potential
+        # leaf; an E or D slice has its own arrows. Static, so built once.
+        # Above the field map and below the conductor and absorber masks.
+        def _build_field_lines():
+            """Draw the field lines, or ``None`` if there is nothing to draw."""
+            if comps != ["phi"] or len(frames) != 1:
+                return None
+            data2d = np.asarray(frames[0], dtype=float).T
+            ny, nx = data2d.shape
+            cx = _centres(xedges, nx, size.x if have_size else 0.0)
+            cy = _centres(yedges, ny, size.y if have_size else 0.0)
+            field = _potential_field(data2d, cx, cy, pec_rings)
+            if field is None:
+                return None
+            fx, fy, ex, ey = field
+            # No arrows: ``streamplot`` puts one partway along each line,
+            # wherever the line happens to fall, so they scatter at random
+            # and stay put in data units when the view zooms. Direction comes
+            # from the Vectors overlay instead (see ``phi_vectors`` below),
+            # which sits on the same zoom-aware lattice as every other plot.
+            # It has no switch to leave them out, and it adds each one to the
+            # axes as a patch of its own -- the ``arrows`` collection it hands
+            # back is never drawn -- so the patches it added are removed here.
+            before = set(map(id, ax.patches))
+            try:
+                lines = ax.streamplot(
+                    fx, fy, ex, ey, density=_FIELD_LINE_DENSITY,
+                    color="white", linewidth=0.8, zorder=1.5,
+                )
+            except Exception as exc:      # an overlay must not break the plot
+                FreeCAD.Console.PrintWarning(
+                    "Wavesim: could not trace field lines for {} ({})\n"
+                    .format(obj.Label, exc)
+                )
+                return None
+            for patch in [p for p in ax.patches if id(p) not in before]:
+                patch.remove()
+            return [lines.lines]
+
+        field_lines = _build_field_lines()
+
         # --- in-plane vector overlay -------------------------------------- #
         # The two components lying in the slice plane form a vector the colour
         # map cannot show (it is one scalar at a time), so they are drawn as
@@ -3535,6 +3686,26 @@ if _GUI_AVAILABLE:
         # of E the arrows are always (Ex, Ey), whichever scalar is underneath.
         inplane = [c for c in str(getattr(obj, "InPlane", "")).split(",") if c]
         can_quiver = len(inplane) == 2 and all(c in comps for c in inplane)
+
+        # A potential slice records no vector, but its in-plane E is the
+        # potential's slope: derive it once, on the cell-centre grid the run
+        # saved (graded spacing included), and hand it to the overlay as two
+        # one-frame stacks in the run's own (axis1, axis2) layout. Everything
+        # downstream -- lattice, zoom re-siting, fade, log -- is then the same
+        # code that draws a recorded E. On by default, since it is what
+        # carries the field lines' direction.
+        phi_vectors = False
+        if not can_quiver and field_lines is not None:
+            phi = np.asarray(frames[0], dtype=float)
+            n0, n1 = phi.shape
+            gx, gy = np.gradient(
+                phi, _centres(xedges, n0, size.x if have_size else 0.0),
+                _centres(yedges, n1, size.y if have_size else 0.0))
+            inplane = ["E" + str(getattr(obj, "AxisX", "x")),
+                       "E" + str(getattr(obj, "AxisY", "y"))]
+            _cache[inplane[0]] = -gx[np.newaxis]
+            _cache[inplane[1]] = -gy[np.newaxis]
+            can_quiver = phi_vectors = True
 
         # Arrows sit on the shared square lattice (``_arrow_lattice``), clipped
         # to the *visible* axes: sites are recomputed on zoom, and arrow length
@@ -3589,25 +3760,34 @@ if _GUI_AVAILABLE:
                 length = None
                 if log_check.isChecked():
                     # Match the colour map's log compression, so both layers
-                    # say the same thing about a weak field -- including which
-                    # arrows survive the floor, since the compression lifts a
-                    # weak one back above it.
+                    # say the same thing about a weak field -- including how
+                    # faint it draws, since the compression lifts a weak arrow
+                    # back towards full length and so towards full opacity.
                     m = np.sqrt(u ** 2 + v ** 2)
                     with np.errstate(divide="ignore", invalid="ignore"):
                         length = ref * (np.log10(1.0 + m / linthresh)
                                         / np.log10(1.0 + ref / linthresh))
                 return _arrow_uv(u, v, ref, length)
 
-            u0, v0 = _uv(slider.value())
-            art = _add_quiver(ax, px, py, u0, v0, ref, _arrow_color(view["comp"]))
-            quiver["art"], quiver["uv"] = art, _uv
+            u0, v0, frac0 = _uv(slider.value())
+            art = _add_quiver(ax, px, py, u0, v0, ref,
+                              _arrow_rgba(_arrow_color(view["comp"]), frac0))
+            quiver["art"], quiver["uv"], quiver["frac"] = art, _uv, frac0
             return art
 
         def _arrow_color(choice):
             """Arrow colour that reads against the current colour map."""
             return "white" if _one_sided(choice) else "black"
 
-        quiver = {"art": None, "uv": None, "busy": False}
+        quiver = {"art": None, "uv": None, "frac": None, "busy": False}
+
+        def _update_quiver(idx):
+            """Re-point the arrows at frame *idx*: lengths and their fade."""
+            u, v, frac = quiver["uv"](idx)
+            quiver["art"].set_UVC(u, v)
+            quiver["art"].set_facecolor(
+                _arrow_rgba(_arrow_color(view["comp"]), frac))
+            quiver["frac"] = frac
 
         def _resite(*_args):
             """Re-place the arrows for the current view (zoom or pan).
@@ -3638,7 +3818,7 @@ if _GUI_AVAILABLE:
             else:
                 image["art"].set_data(data2d)
             if quiver["art"] is not None:
-                quiver["art"].set_UVC(*quiver["uv"](idx))
+                _update_quiver(idx)
 
         # Arrows on the clipped end(s): with a percentile scale the hottest cells
         # are out of range by design, and the bar should say so rather than let
@@ -3650,13 +3830,34 @@ if _GUI_AVAILABLE:
 
         cbar = {"art": None, "extend": None}
 
+        def _attach_cbar(bar, art):
+            """Re-point colour bar *bar* at image artist *art*.
+
+            Toggling Smooth replaces the artist, and a bar left on the removed
+            one stops tracking the norm. ``update_normal`` alone only swaps the
+            bar's reference: it does not make the link back from the artist
+            that ``figure.colorbar`` makes, and ``Colorbar.remove`` relies on
+            it -- so the next rebuild (switching between a one- and two-sided
+            map) failed halfway, losing the bar and leaving the frame undrawn.
+            This makes the same link ``Colorbar.__init__`` does.
+            """
+            old = bar.mappable
+            if old is not art:
+                cid = getattr(old, "colorbar_cid", None)
+                if cid is not None:
+                    old.callbacks.disconnect(cid)
+                art.colorbar = bar
+                art.colorbar_cid = art.callbacks.connect(
+                    "changed", bar.update_normal)
+            bar.update_normal(art)
+
         def _make_cbar(choice):
             ext = _extend_for(choice)
             if cbar["art"] is not None:
+                # Attached to the live artist either way: the rebuild below
+                # removes the bar through it.
+                _attach_cbar(cbar["art"], image["art"])
                 if cbar["extend"] == ext:
-                    # Re-point it: toggling smooth replaces the artist, and a
-                    # bar left on the removed one stops tracking the norm.
-                    cbar["art"].update_normal(image["art"])
                     cbar["art"].set_label(choice)
                     return
                 cbar["art"].remove()
@@ -3737,6 +3938,24 @@ if _GUI_AVAILABLE:
             "see the actual cells, or to speed up playback on a fine grid."
         )
         controls.addWidget(smooth_check)
+        band_check = QtWidgets.QCheckBox("Banding")
+        band_check.setToolTip(
+            "Cut the colour map into a fixed number of flat bands, so equal\n"
+            "steps of the field read as steps of colour. The number of bands\n"
+            "is set in Wavesim -> Settings."
+        )
+        controls.addWidget(band_check)
+        field_check = None
+        if field_lines is not None:
+            field_check = QtWidgets.QCheckBox("Field lines")
+            field_check.setChecked(True)
+            field_check.setToolTip(
+                "Overlay white lines that follow the in-plane electric field\n"
+                "E = -grad phi, traced from the slope of the potential. They\n"
+                "run from conductor to conductor, crossing the equipotentials\n"
+                "at right angles."
+            )
+            controls.addWidget(field_check)
         mask_check = None
         if pec_mask is not None:
             mask_check = QtWidgets.QCheckBox("Mask PEC")
@@ -3788,17 +4007,17 @@ if _GUI_AVAILABLE:
             image["art"].set_norm(_make_norm(bool(checked)))
             if quiver["art"] is not None:
                 # Arrow lengths follow the same compression as the colour map.
-                quiver["art"].set_UVC(*quiver["uv"](slider.value()))
+                _update_quiver(slider.value())
             dialog._canvas.draw_idle()
 
-        log_check.toggled.connect(on_log)
+        log_check.toggled.connect(_hold(on_log))
 
         def on_clip(idx):
             view["clip"] = float(clip.itemData(idx))
             image["art"].set_norm(_make_norm(log_check.isChecked()))
             dialog._canvas.draw_idle()
 
-        clip.currentIndexChanged.connect(on_clip)
+        clip.currentIndexChanged.connect(_hold(on_clip))
 
         def on_smooth(checked):
             # Shading is set when the mesh is built, so this rebuilds the
@@ -3808,7 +4027,23 @@ if _GUI_AVAILABLE:
             _make_cbar(view["comp"])
             dialog._canvas.draw_idle()
 
-        smooth_check.toggled.connect(on_smooth)
+        smooth_check.toggled.connect(_hold(on_smooth))
+
+        def on_banding(checked):
+            view["banded"] = bool(checked)
+            image["art"].set_cmap(_cmap_for(view["comp"]))
+            _make_cbar(view["comp"])
+            dialog._canvas.draw_idle()
+
+        band_check.toggled.connect(_hold(on_banding))
+
+        def on_field_lines(checked):
+            for art in field_lines:
+                art.set_visible(bool(checked))
+            dialog._canvas.draw_idle()
+
+        if field_check is not None:
+            field_check.toggled.connect(_hold(on_field_lines))
 
         def show_frame(idx):
             idx = max(0, min(int(idx), len(view["frames"]) - 1))
@@ -3835,11 +4070,12 @@ if _GUI_AVAILABLE:
             _make_cbar(choice)
             if quiver["art"] is not None:
                 # The vector is the same; only its contrast with the map changes.
-                quiver["art"].set_color(_arrow_color(choice))
+                quiver["art"].set_facecolor(
+                    _arrow_rgba(_arrow_color(choice), quiver["frac"]))
             show_frame(slider.value())
 
         if component is not None:
-            component.currentTextChanged.connect(on_component)
+            component.currentTextChanged.connect(_hold(on_component))
 
         def on_vectors(checked):
             """Show/hide the arrow overlay, building it on first use."""
@@ -3862,7 +4098,7 @@ if _GUI_AVAILABLE:
             dialog._canvas.draw_idle()
 
         if mask_check is not None:
-            mask_check.toggled.connect(on_mask)
+            mask_check.toggled.connect(_hold(on_mask))
 
         def on_pml_mask(checked):
             # Only the blanking patch: the dashed boundary stays, since where
@@ -3871,7 +4107,7 @@ if _GUI_AVAILABLE:
             dialog._canvas.draw_idle()
 
         if pml_check is not None:
-            pml_check.toggled.connect(on_pml_mask)
+            pml_check.toggled.connect(_hold(on_pml_mask))
 
         def on_geometry(checked):
             for art in outlines:
@@ -3879,15 +4115,17 @@ if _GUI_AVAILABLE:
             dialog._canvas.draw_idle()
 
         if geom_check is not None:
-            geom_check.toggled.connect(on_geometry)
+            geom_check.toggled.connect(_hold(on_geometry))
 
         if vector_check is not None:
-            vector_check.toggled.connect(on_vectors)
+            vector_check.toggled.connect(_hold(on_vectors))
             # Zoom/pan re-places the arrows, so a zoomed-in view gets its own
             # sites at the same density instead of the two that happened to
             # fall inside it. No-op until the overlay exists.
             ax.callbacks.connect("xlim_changed", _resite)
             ax.callbacks.connect("ylim_changed", _resite)
+            if phi_vectors:
+                vector_check.setChecked(True)
 
         timer = _QtCore.QTimer(dialog)
         timer.setInterval(100)  # ms between frames
@@ -4298,17 +4536,18 @@ if _GUI_AVAILABLE:
             # Reference over the sites in view rather than the whole
             # cross-section: zoomed in between the conductors, where the field
             # is a fraction of what it is at the inner one, the local structure
-            # comes up to full length instead of vanishing under the floor.
+            # comes up to full length instead of fading to nothing.
             u_site, v_site = Ea[ix, iy], Eb[ix, iy]
             ref = _arrow_reference(np.sqrt(u_site ** 2 + v_site ** 2))
-            u, v = _arrow_uv(u_site, v_site, ref)
-            # ``_arrow_uv`` hands back NaN for the sites it hides -- inside the
-            # metal (E is exactly zero there) and wherever the field is too weak
-            # to draw as an arrow. Nothing redraws this artist in place, so drop
-            # them outright rather than leave unrendered vertices in it.
-            keep = np.isfinite(u) & np.isfinite(v)
-            arrows["art"] = _add_quiver(ax, px[keep], py[keep], u[keep], v[keep],
-                                        ref, "black")
+            u, v, frac = _arrow_uv(u_site, v_site, ref)
+            # Sites with no field at all -- inside the metal, where E is
+            # exactly zero -- would draw fully transparent. Nothing redraws
+            # this artist in place, so drop them outright rather than carry
+            # invisible vertices in it.
+            keep = frac > 0.0
+            arrows["art"] = _add_quiver(
+                ax, px[keep], py[keep], u[keep], v[keep], ref,
+                _arrow_rgba("black", frac[keep]))
             return arrows["art"]
 
         def _resite(*_args):
@@ -4395,7 +4634,7 @@ if _GUI_AVAILABLE:
             ax.callbacks.connect("xlim_changed", _resite)
             ax.callbacks.connect("ylim_changed", _resite)
 
-    def _mode_view_controls(layout, redraw, has_pec):
+    def _mode_view_controls(layout, redraw, has_pec, figure):
         """Add the mode plot's Smooth / Mask PEC checkboxes to *layout*.
 
         Returns the options dict :func:`_draw_mode` reads; toggling a box
@@ -4408,6 +4647,11 @@ if _GUI_AVAILABLE:
 
         opts = dict(_MODE_VIEW_DEFAULTS)
         row = QtWidgets.QHBoxLayout()
+        # The redraw clears the figure, so the axes to restore onto are the
+        # new ones; the main map is the first axes either way (its colour bar
+        # is added after it).
+        redraw = _held_view(
+            lambda: figure.axes[0] if figure.axes else None, redraw)
 
         smooth = QtWidgets.QCheckBox("Smooth")
         smooth.setChecked(opts["smooth"])
@@ -4468,7 +4712,7 @@ if _GUI_AVAILABLE:
             _draw_mode(figure, data, opts)
             dialog._canvas.draw_idle()
 
-        opts = _mode_view_controls(layout, redraw, _has_pec(data))
+        opts = _mode_view_controls(layout, redraw, _has_pec(data), figure)
         _draw_mode(figure, data, opts)
         dialog._canvas.draw()
         dialog.show()
@@ -4557,7 +4801,7 @@ if _GUI_AVAILABLE:
         # A mask switch if any of the modes has metal to mask -- they are all
         # the same cross-section, so one answer covers the window.
         opts = _mode_view_controls(layout, redraw,
-                                   any(_has_pec(d) for d in datas))
+                                   any(_has_pec(d) for d in datas), figure)
         _draw_mode(figure, datas[0], opts)
         dialog._canvas.draw()
         dialog.show()

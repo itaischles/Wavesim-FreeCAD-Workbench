@@ -44,13 +44,15 @@ def _format_duration(seconds):
     return "{}m {:02d}s".format(minutes, secs)
 
 
-def _progress_label(state, done, n_steps):
+def _progress_label(state, done, n_steps, percent=False):
     """Compose the multi-line progress-dialog label with a live ETA.
 
     Keeps the latest coarse ``STATUS`` text (``state["status"]``) on the first
     line and appends step count, percent, throughput and an estimated time to
     completion built from the wall-clock rate since the first PROGRESS line.
     ``state`` carries the anchor (``step_t0``/``step_done0``) between calls.
+    With *percent* the steps are only units of the bar (an electrostatic solve
+    has none of its own), so the step count and the steps/s rate are left out.
     """
     now = time.perf_counter()
     if state["step_t0"] is None:
@@ -61,8 +63,11 @@ def _progress_label(state, done, n_steps):
     done = max(0, min(int(done), n_steps))
     pct = 100.0 * done / n_steps
 
-    lines = [state["status"], "Step {:,} / {:,}  ({:.1f}%)".format(
-        done, n_steps, pct)]
+    if percent:
+        lines = [state["status"], "{:.1f}% complete".format(pct)]
+    else:
+        lines = [state["status"], "Step {:,} / {:,}  ({:.1f}%)".format(
+            done, n_steps, pct)]
 
     elapsed = now - state["step_t0"]
     stepped = done - state["step_done0"]
@@ -70,10 +75,14 @@ def _progress_label(state, done, n_steps):
         rate = stepped / elapsed
         remaining = n_steps - done
         eta = remaining / rate if rate > 0 else 0.0
-        lines.append(
-            "Elapsed {} · ~{} remaining · {:,.0f} steps/s".format(
-                _format_duration(elapsed), _format_duration(eta), rate)
-        )
+        if percent:
+            lines.append("Elapsed {} · ~{} remaining".format(
+                _format_duration(elapsed), _format_duration(eta)))
+        else:
+            lines.append(
+                "Elapsed {} · ~{} remaining · {:,.0f} steps/s".format(
+                    _format_duration(elapsed), _format_duration(eta), rate)
+            )
     else:
         lines.append("Elapsed {} · estimating time remaining...".format(
             _format_duration(elapsed)))
@@ -167,7 +176,7 @@ def voxelization_progress(parent=None, title="Wavesim",
 
 
 def run_job(workdir, n_steps, parent=None, message="Running FDTD simulation...",
-            busy=False):
+            busy=False, percent=False):
     """Run the job in *workdir* out-of-process with a progress dialog.
 
     Returns the summary dict on success, or ``None`` if the run was cancelled or
@@ -181,6 +190,9 @@ def run_job(workdir, n_steps, parent=None, message="Running FDTD simulation...",
     ...). Pass ``busy=True`` for a job with no meaningful step count (the TEM
     mode-solve): the bar then runs as an animated indeterminate indicator so the
     window visibly is not frozen while ``STATUS`` lines report the live stage.
+    Pass ``percent=True`` when the PROGRESS units are only a scale for the bar
+    (the electrostatic solve): the label then shows a percentage and time
+    remaining rather than a step count and rate.
     """
     from PySide import QtCore
     try:
@@ -262,7 +274,8 @@ def run_job(workdir, n_steps, parent=None, message="Running FDTD simulation...",
                 except (ValueError, IndexError):
                     continue
                 progress.setValue(min(done, n_steps))
-                progress.setLabelText(_progress_label(state, done, n_steps))
+                progress.setLabelText(
+                    _progress_label(state, done, n_steps, percent))
 
     def on_stderr():
         state["stderr"] += bytes(process.readAllStandardError()).decode(

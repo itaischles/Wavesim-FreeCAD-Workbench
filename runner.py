@@ -1216,6 +1216,39 @@ def _es_quantities(np, sol, field):
     return ["Ex", "Ey", "Ez"], list(sol.E_nodes)
 
 
+# An electrostatic run reports progress in thousandths of the whole job: there
+# are no time steps to count, only the fraction of each solve the solver says it
+# has covered. Must match ``ES_PROGRESS_STEPS`` in ``wavesim_gui/commands.py``.
+ES_PROGRESS_STEPS = 1000
+
+
+def _es_progress_stage(func, first, count, n_solves):
+    """``progress=`` keyword for *func* covering solves ``first..first+count``.
+
+    Maps the solver's ``[0, 1]`` fraction onto that stage's share of the run's
+    :data:`ES_PROGRESS_STEPS` (out of *n_solves* equal solves) and prints a
+    ``PROGRESS`` line whenever the integer step moves. Empty if the installed
+    wavesim's *func* predates the ``progress`` argument, in which case the bar
+    only jumps when the stage ends.
+    """
+    import inspect
+    try:
+        if "progress" not in inspect.signature(func).parameters:
+            return {}
+    except (TypeError, ValueError):
+        return {}
+    last = {"done": -1}
+
+    def report(fraction):
+        done = int(ES_PROGRESS_STEPS * (first + count * fraction) / n_solves)
+        done = max(0, min(done, ES_PROGRESS_STEPS))
+        if done > last["done"]:
+            last["done"] = done
+            _emit_progress(done, ES_PROGRESS_STEPS)
+
+    return {"progress": report}
+
+
 def _run_electrostatic(ws, np, grid, job, workdir, voxel_summary):
     """Solve the electrostatic problem described by *job* and write the results.
 
@@ -1242,8 +1275,28 @@ def _run_electrostatic(ws, np, grid, job, workdir, voxel_summary):
                 ", ".join(repr(m) for m in missing),
                 ", ".join(sorted(known)) or "none"))
 
+    # The capacitance conductors are picked before anything is solved so the
+    # progress bar can be shared out up front: one solve for the potentials,
+    # then one per conductor for the matrix, each an equal slice.
+    cap_names, cap_fused = [], []
+    if cfg.get("capacitance"):
+        # One conductor per *body*: two named parts that turn out to be the
+        # same lump of metal cannot be driven independently, and the solver
+        # refuses the pair rather than reporting a capacitance between them.
+        # Picking a representative here turns that refusal into a run that
+        # still produces the matrix, and names the fusion in the summary.
+        for group in ws.body_parts(grid):
+            group = sorted(group)
+            if not group:
+                continue
+            cap_names.append(group[0])
+            if len(group) > 1:
+                cap_fused.append(group)
+    n_solves = 1 + (len(cap_names) if len(cap_names) >= 2 else 0)
+
     _emit_status("Solving electrostatics ({:,} nodes, {} conductor(s))...".format(
         grid.Nx * grid.Ny * grid.Nz, len(known)))
+    _emit_progress(0, ES_PROGRESS_STEPS)
     es = ws.Electrostatics(grid)
     for name, volts in potentials.items():
         es.set_potential(name, float(volts))
@@ -1254,7 +1307,9 @@ def _run_electrostatic(ws, np, grid, job, workdir, voxel_summary):
     for name, charge in floating.items():
         es.set_floating(name, float(charge))
     t0 = time.perf_counter()
-    sol = es.solve(boundary=boundary, method=method)
+    sol = es.solve(boundary=boundary, method=method,
+                   **_es_progress_stage(ws.Electrostatics.solve, 0, 1,
+                                        n_solves))
     wall_time = time.perf_counter() - t0
 
     result_arrays = {}
@@ -1337,26 +1392,17 @@ def _run_electrostatic(ws, np, grid, job, workdir, voxel_summary):
 
     # --- capacitance matrix ---------------------------------------------- #
     if cfg.get("capacitance"):
-        # One conductor per *body*: two named parts that turn out to be the same
-        # lump of metal cannot be driven independently, and the solver refuses
-        # the pair rather than reporting a capacitance between them. Picking a
-        # representative here turns that refusal into a run that still produces
-        # the matrix, and names the fusion in the summary.
-        bodies = ws.body_parts(grid)
-        names, fused = [], []
-        for group in bodies:
-            group = sorted(group)
-            if not group:
-                continue
-            names.append(group[0])
-            if len(group) > 1:
-                fused.append(group)
+        names, fused = cap_names, cap_fused
         if len(names) >= 2:
             _emit_status(
                 "Extracting the capacitance matrix ({} conductors, {} solves)..."
                 .format(len(names), len(names)))
-            cap = ws.capacitance_matrix(grid, names, boundary=boundary,
-                                        method=method)
+            # capacitance_matrix reports over all of its solves at once, so it
+            # is one stage covering every solve after the first.
+            cap = ws.capacitance_matrix(
+                grid, names, boundary=boundary, method=method,
+                **_es_progress_stage(ws.capacitance_matrix, 1, len(names),
+                                     n_solves))
             result_arrays["capacitance_maxwell"] = np.asarray(cap.maxwell)
             es_summary["capacitance"] = {
                 "names": list(cap.names),
@@ -1391,7 +1437,7 @@ def _run_electrostatic(ws, np, grid, job, workdir, voxel_summary):
     with open(os.path.join(workdir, "summary.json"), "w",
               encoding="utf-8") as handle:
         json.dump(summary, handle, indent=2)
-    _emit_progress(1, 1)
+    _emit_progress(ES_PROGRESS_STEPS, ES_PROGRESS_STEPS)
     return summary
 
 

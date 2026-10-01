@@ -322,6 +322,10 @@ def conformal_pec(sim):
 MODE_FDTD = "fdtd"
 MODE_ELECTROSTATIC = "electrostatic"
 
+# Units an electrostatic run's PROGRESS lines count in: thousandths of the run.
+# Must match ``ES_PROGRESS_STEPS`` in runner.py.
+ES_PROGRESS_STEPS = 1000
+
 # What the property editor and the panel show, in enumeration order. The stored
 # value is the label -- a plain string a user can read in the property editor --
 # and :func:`solver_mode` is the one place it becomes a job token.
@@ -931,14 +935,14 @@ if _GUI_AVAILABLE:
             FreeCAD.Console.PrintMessage(
                 "Wavesim: running job in {}\n".format(workdir)
             )
-            # An electrostatic job has no step count to divide a bar by -- the
-            # potential solve and the capacitance extraction are each one opaque
-            # call into scipy -- so it runs the dialog indeterminate and lets the
-            # runner's STATUS lines say what stage it is at.
+            # An electrostatic job has no time steps to count: the runner
+            # reports how far each solve's residual has fallen toward its
+            # tolerance instead, in thousandths of the whole run, so the dialog
+            # shows a percentage rather than a step count.
             if spec.get("mode") == MODE_ELECTROSTATIC:
                 summary = run_mod.run_job(
-                    workdir, 0, parent=Gui.getMainWindow(), busy=True,
-                    message="Solving electrostatics...",
+                    workdir, ES_PROGRESS_STEPS, parent=Gui.getMainWindow(),
+                    message="Solving electrostatics...", percent=True,
                 )
             else:
                 summary = run_mod.run_job(

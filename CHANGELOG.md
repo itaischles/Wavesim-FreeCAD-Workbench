@@ -15,6 +15,14 @@ section is started above it.
 
 ### Added
 
+- A **Field Along Curve** monitor for electrostatic runs (new button in the
+  monitors group). Drag a sketch onto it, then double-click it to pick phi, E
+  or D and the start and end vertices on the curve. After the run its result
+  plots the field against the distance along the curve, from 0 mm at the start.
+  For E or D a dropdown picks |F|, Fx/Fy/Fz, the component along the curve, and
+  the perpendicular component (signed in the sketch plane, and as a magnitude).
+  The plot also shows ∫E·dl for E along the curve, and ∫D·n dl for D in the
+  plane.
 - A **Banding** checkbox on snapshot plots cuts the colour map into a fixed
   number of flat bands. Set the number of bands under *Wavesim → Settings →
   Colour map bands* (default 12).

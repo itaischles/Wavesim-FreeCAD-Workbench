@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """Diagnostic monitors for the Wavesim workbench (Session 7).
 
-Six kinds of monitor are scripted FreeCAD DocumentObjects grouped under the
+Seven kinds of monitor are scripted FreeCAD DocumentObjects grouped under the
 simulation's "Monitors" child group, each mapping onto one of the solver's
 monitor dataclasses (:mod:`wavesim.monitors`):
 
@@ -27,8 +27,13 @@ monitor dataclasses (:mod:`wavesim.monitors`):
   curve, integrated from the curve's first vertex to its last.
 * **Current** (``CurrentMonitor``) -- records I(t) = ∮H·dl around a *closed*
   curve (Ampère's law; the solver closes an open path automatically).
+* **Field along curve** (electrostatic only) -- samples phi, E or D along a
+  curve between two of its vertices; the result plots it against the distance
+  travelled along the curve. The curve is sampled here (points, exact edge
+  tangents, arc length) and the runner interpolates the solution at the points.
 
-The voltage/current monitors take their integration path from a **sketch**: the
+The voltage/current and field-along-curve monitors take their path from a
+**sketch**: the
 user draws an open/closed curve sketch, adds the monitor, then drags the sketch
 onto the monitor in the model tree (mirroring how bodies are assigned to
 Materials). The sketch is claimed as a tree child of the monitor and its curve
@@ -45,7 +50,8 @@ the runner, mirroring :func:`wavesim_gui.source.source_spec`.
 
 Importing this module registers ``Wavesim_AddProbe``, ``Wavesim_AddSnapshot``,
 ``Wavesim_AddEnergyMonitor``, ``Wavesim_AddDissipationMonitor``,
-``Wavesim_AddVoltageMonitor`` and ``Wavesim_AddCurrentMonitor`` with
+``Wavesim_AddVoltageMonitor``, ``Wavesim_AddCurrentMonitor`` and
+``Wavesim_AddFieldLineMonitor`` with
 ``Gui.addCommand`` when a GUI is available.
 """
 
@@ -77,6 +83,7 @@ _CURRENT_MONITOR_ICON = os.path.join(_ICONS_DIR, "current.svg")
 _FIELD_PROBE_ICON = os.path.join(_ICONS_DIR, "probe.svg")
 _ENERGY_MONITOR_ICON = os.path.join(_ICONS_DIR, "energy.svg")
 _DISSIPATION_MONITOR_ICON = os.path.join(_ICONS_DIR, "dissipation.svg")
+_FIELD_LINE_ICON = os.path.join(_ICONS_DIR, "field_line.svg")
 
 # Marker property, mirroring the other entities' identity scheme so the object is
 # recognisable before its Python proxy is re-attached on reload.
@@ -87,6 +94,7 @@ _ENERGY_TYPE = "EnergyMonitor"
 _DISSIPATION_TYPE = "DissipationMonitor"
 _VOLTAGE_TYPE = "VoltageMonitor"
 _CURRENT_TYPE = "CurrentMonitor"
+_FIELD_LINE_TYPE = "FieldLineMonitor"
 
 # Name of the child group (created by CommandNewSimulation) holding monitors.
 _MONITORS_GROUP = "Monitors"
@@ -177,6 +185,13 @@ _MONITOR_COLOR = (0.184, 0.604, 0.525)
 _SNAPSHOT_TRANSPARENCY = 0.65
 
 _MM_PER_M = 1000.0
+
+# Field-line sampling. The job samples every quarter of the smallest cell (well
+# below the grid, so the plot shows what the interpolation gives rather than
+# where the samples happened to land), capped so a long curve on a fine grid
+# cannot write a job of millions of points. The tree preview needs far fewer.
+_FIELD_LINE_MAX_SAMPLES = 20000
+_PREVIEW_SAMPLES = 400
 
 
 # --------------------------------------------------------------------------- #
@@ -566,6 +581,110 @@ class PathMonitorObject:
     __setstate__ = loads
 
 
+# End-vertex sentinel for a field-line monitor: "the end of the curve", which is
+# the last vertex of an open curve and the start again (one full lap) of a closed
+# one. Not just Python's ``-1``: on a closed curve that would be the vertex one
+# edge short of the start, and the default would silently drop the last edge.
+_CURVE_END = -1
+
+
+class FieldLineObject:
+    """``Proxy`` for the electrostatic field-along-a-curve monitor.
+
+    Samples one quantity (phi, E or D) along a sketch curve, between two of its
+    vertices, and plots it against the distance travelled along the curve. The
+    curve comes from a sketch dragged onto the monitor, exactly as for the
+    voltage/current monitors.
+
+    Properties:
+        ``Sketch``      -- link to the curve (drag a sketch onto the monitor).
+        ``Field``       -- 'phi', 'E' or 'D'. A vector field records all three
+                           components; the plot derives |F|, the tangential and
+                           the perpendicular parts from them.
+        ``StartVertex`` -- index into the curve's ordered vertices where the
+                           path starts (distance 0).
+        ``EndVertex``   -- index where it ends; ``-1`` is the curve's own end.
+                           Below the start on an open curve, the path runs
+                           backwards; on a closed curve it runs forward,
+                           wrapping past the curve's first vertex.
+        ``Reversed``    -- closed curves only: go round the other way.
+
+    Hidden ``PathPoints`` holds a coarse world-mm polyline of the selected
+    portion for the view provider, rebuilt by ``execute``.
+    """
+
+    def __init__(self, obj):
+        self.Type = _FIELD_LINE_TYPE
+        obj.Proxy = self
+        _add_type_marker(obj, _FIELD_LINE_TYPE)
+        _ensure_field_line_props(obj)
+
+    def onDocumentRestored(self, obj):
+        obj.Proxy = self
+        self.Type = getattr(self, "Type", _FIELD_LINE_TYPE)
+        _ensure_field_line_props(obj)
+
+    def execute(self, obj):
+        """Rebuild the drawn path preview from the curve and its end vertices."""
+        pts = []
+        sampled = sample_field_line(obj, _PREVIEW_SAMPLES)
+        if sampled is not None:
+            pts = [FreeCAD.Vector(*p) for p in sampled["points"]]
+        obj.PathPoints = pts
+
+    def dumps(self):
+        return {"Type": getattr(self, "Type", _FIELD_LINE_TYPE)}
+
+    def loads(self, state):
+        if isinstance(state, dict):
+            self.Type = state.get("Type", _FIELD_LINE_TYPE)
+        return None
+
+    __getstate__ = dumps
+    __setstate__ = loads
+
+
+def _ensure_field_line_props(obj):
+    """Add any of the field-line monitor's properties *obj* is missing."""
+    if not hasattr(obj, "Sketch"):
+        obj.addProperty(
+            "App::PropertyLink", "Sketch", "Monitor",
+            "Sketch whose curve the field is sampled along (drag a sketch "
+            "from the tree onto this monitor to assign it)",
+        )
+    if not hasattr(obj, "Field"):
+        obj.addProperty(
+            "App::PropertyEnumeration", "Field", "Monitor",
+            "Quantity sampled along the curve: phi (the potential), E or D. "
+            "Every component of a vector is recorded; the one to view is "
+            "chosen when plotting",
+        )
+        obj.Field = list(_ES_FIELDS)
+        obj.Field = "E"
+    if not hasattr(obj, "StartVertex"):
+        obj.addProperty(
+            "App::PropertyInteger", "StartVertex", "Monitor",
+            "Curve vertex the path starts at (distance 0)",
+        )
+        obj.StartVertex = 0
+    if not hasattr(obj, "EndVertex"):
+        obj.addProperty(
+            "App::PropertyInteger", "EndVertex", "Monitor",
+            "Curve vertex the path ends at (-1: the end of the curve)",
+        )
+        obj.EndVertex = _CURVE_END
+    if not hasattr(obj, "Reversed"):
+        obj.addProperty(
+            "App::PropertyBool", "Reversed", "Monitor",
+            "Closed curves only: go round the curve against its own "
+            "direction from the start vertex to the end vertex",
+        )
+        obj.Reversed = False
+    if not hasattr(obj, "PathPoints"):
+        obj.addProperty("App::PropertyVectorList", "PathPoints", "Monitor", "")
+        obj.setEditorMode("PathPoints", 2)  # hidden
+
+
 # --------------------------------------------------------------------------- #
 # Lookup helpers
 # --------------------------------------------------------------------------- #
@@ -655,15 +774,31 @@ def find_current_monitors(sim):
     return _find(sim, is_current_monitor)
 
 
+def is_field_line_monitor(obj):
+    """Return True if *obj* is a Wavesim field-along-a-curve monitor."""
+    return _is_type(obj, _FIELD_LINE_TYPE)
+
+
+def is_sketch_monitor(obj):
+    """True for every monitor kind whose geometry is a sketch dropped on it."""
+    return (is_voltage_monitor(obj) or is_current_monitor(obj)
+            or is_field_line_monitor(obj))
+
+
+def find_field_line_monitors(sim):
+    """Return all field-along-a-curve monitors under the Simulation *sim*."""
+    return _find(sim, is_field_line_monitor)
+
+
 def path_monitor_points_mm(sim):
-    """World-mm bbox corners of every voltage/current monitor curve under *sim*.
+    """World-mm bbox corners of every sketch-path monitor curve under *sim*.
 
     Feeds the domain auto-sizing (like source points and snapshot offsets), so a
     monitor curve outside the material bounds enlarges the domain to contain it
     rather than having its quadrature points clipped to the grid edge.
     """
     pts = []
-    for mon in find_voltage_monitors(sim) + find_current_monitors(sim):
+    for mon in _find(sim, is_sketch_monitor):
         sketch = getattr(mon, "Sketch", None)
         shape = getattr(sketch, "Shape", None) if sketch is not None else None
         if shape is None or not getattr(shape, "Edges", None):
@@ -809,12 +944,13 @@ def _path_deflection_mm(sim):
     return 0.5
 
 
-def _monitor_path_mm(mon, deflection_mm):
-    """Ordered world-mm vertices of *mon*'s linked sketch curve, or ``None``.
+def _curve_wire(mon, warn=True):
+    """The wire of *mon*'s linked sketch curve, or ``None`` if it has none.
 
-    The sketch's edges are sorted into connected wires; the longest wire is
-    discretised to the given chordal tolerance. Vertex order (and so the sign of
-    the recorded integral) follows the wire's own direction.
+    The sketch's edges are sorted into connected wires and the longest one is
+    used; *warn* reports the others being dropped (off for the quiet callers --
+    the tree preview and the panel -- which would otherwise repeat it on every
+    recompute).
     """
     sketch = getattr(mon, "Sketch", None)
     shape = getattr(sketch, "Shape", None) if sketch is not None else None
@@ -831,13 +967,210 @@ def _monitor_path_mm(mon, deflection_mm):
             continue
     if not wires:
         return None
-    if len(wires) > 1:
+    if len(wires) > 1 and warn:
         FreeCAD.Console.PrintWarning(
             "Wavesim: sketch '{}' on monitor '{}' has {} disconnected curves; "
             "using the longest.\n".format(sketch.Label, mon.Label, len(wires))
         )
-    wire = max(wires, key=lambda w: w.Length)
+    return max(wires, key=lambda w: w.Length)
+
+
+def _monitor_path_mm(mon, deflection_mm):
+    """Ordered world-mm vertices of *mon*'s linked sketch curve, or ``None``.
+
+    The longest wire of the sketch is discretised to the given chordal
+    tolerance. Vertex order (and so the sign of the recorded integral) follows
+    the wire's own direction.
+    """
+    wire = _curve_wire(mon)
+    if wire is None:
+        return None
     return wire.discretize(Deflection=max(float(deflection_mm), 1.0e-6))
+
+
+# --------------------------------------------------------------------------- #
+# Field-line geometry
+# --------------------------------------------------------------------------- #
+
+def curve_vertices_mm(mon):
+    """``(vertices, closed)`` of *mon*'s curve, in the wire's own order.
+
+    *vertices* are world-mm ``FreeCAD.Vector`` s, one per edge end; a closed
+    curve lists its first vertex once, not again at the end. ``([], False)``
+    when the monitor has no curve yet. These are what the panel's Start/End
+    boxes offer, and what ``StartVertex``/``EndVertex`` index.
+    """
+    wire = _curve_wire(mon, warn=False)
+    if wire is None:
+        return [], False
+    closed = bool(wire.isClosed())
+    verts = [FreeCAD.Vector(v.Point) for v in wire.OrderedVertexes]
+    # A closed wire may or may not repeat its first vertex; normalise to once.
+    if closed and len(verts) > 1 and (verts[0] - verts[-1]).Length < 1.0e-7:
+        verts = verts[:-1]
+    return verts, closed
+
+
+def _resolve_ends(n_verts, closed, start, end):
+    """Clamp *start*/*end* to the curve and return ``(i, j)`` vertex indices.
+
+    A stored index out of range (the sketch lost vertices since it was set)
+    falls back to the curve's own start/end, rather than failing the run.
+    :data:`_CURVE_END` is the end of the curve: the last vertex of an open one,
+    the start again (a full lap) of a closed one.
+    """
+    last = n_verts if closed else n_verts - 1
+    i = int(start) if 0 <= int(start) < n_verts else 0
+    if int(end) == _CURVE_END or not 0 <= int(end) < n_verts:
+        j = i if closed else last
+    else:
+        j = int(end)
+    return i, j
+
+
+def _path_edges(wire, closed, i, j, reverse=False):
+    """The ``[(edge, reversed), ...]`` that walk the wire from vertex *i* to *j*.
+
+    An open curve walks backwards when *j* is below *i*. A closed curve walks
+    forward (in the wire's own order), wrapping past vertex 0, or the other way
+    round when *reverse* is set; ``i == j`` there is a full lap. The edge's
+    *reversed* flag is whether it has to be traversed against its own
+    parametrisation -- worked out from where its ends actually are, since a
+    sketch edge's direction has nothing to do with its order in the wire.
+    """
+    edges = list(wire.OrderedEdges)
+    verts = [v.Point for v in wire.OrderedVertexes]
+    n = len(edges)
+    if n == 0:
+        return []
+    if closed and reverse:
+        count = (i - j) % n or n
+        order = [((i - 1 - k) % n, True) for k in range(count)]
+    elif closed:
+        count = (j - i) % n or n
+        order = [((i + k) % n, False) for k in range(count)]
+    elif j >= i:
+        order = [(k, False) for k in range(i, j)]
+    else:
+        order = [(k, True) for k in range(i - 1, j - 1, -1)]
+
+    out = []
+    for k, backwards in order:
+        edge = edges[k]
+        # The wire traverses edge k from verts[k] to verts[k+1]; walking the
+        # path backwards swaps them.
+        start = verts[k] if not backwards else verts[(k + 1) % len(verts)]
+        first = edge.valueAt(edge.FirstParameter)
+        last = edge.valueAt(edge.LastParameter)
+        out.append((edge, (last - start).Length < (first - start).Length))
+    return out
+
+
+def _curve_plane_normal(mon, wire):
+    """Unit normal of the plane *mon*'s curve lies in, or ``None`` if none.
+
+    A sketch's own plane when the curve is a sketch -- which also covers a
+    single straight segment, which lies in infinitely many planes and so
+    defines none of its own. Otherwise whatever plane OCC finds the wire in.
+    """
+    sketch = getattr(mon, "Sketch", None)
+    if sketch is not None and str(getattr(sketch, "TypeId", "")).startswith(
+            "Sketcher::"):
+        n = sketch.getGlobalPlacement().Rotation.multVec(FreeCAD.Vector(0, 0, 1))
+        if n.Length > 0:
+            return n.normalize()
+    try:
+        plane = wire.findPlane()
+    except Exception:
+        plane = None
+    if plane is None:
+        return None
+    n = FreeCAD.Vector(plane.Axis)
+    return n.normalize() if n.Length > 0 else None
+
+
+def sample_field_line(mon, max_samples=_FIELD_LINE_MAX_SAMPLES, step_mm=None):
+    """Sample *mon*'s curve between its Start and End vertices, or ``None``.
+
+    Returns a dict of world-mm samples spaced evenly along the curve:
+
+    * ``points``   -- ``[(x, y, z), ...]`` mm;
+    * ``tangents`` -- unit tangent at each point, in the direction of travel,
+      taken from the edge's own geometry rather than a finite difference;
+    * ``s``        -- distance along the path from the start (mm);
+    * ``vertex_s`` -- the distance at each curve vertex the path passes;
+    * ``normal``   -- the curve plane's unit normal, or ``None``;
+    * ``length``   -- total path length (mm).
+
+    At a corner the vertex is kept twice, once per edge, with each edge's own
+    tangent: the tangential field genuinely jumps there, and smoothing the two
+    sides together would plot a value that exists on neither.
+
+    *step_mm* is the sample spacing; ``max_samples`` caps the count, coarsening
+    the step for a long path. ``None`` when there is no curve or the selected
+    portion has no length.
+    """
+    wire = _curve_wire(mon, warn=False)
+    if wire is None:
+        return None
+    verts, closed = curve_vertices_mm(mon)
+    if not verts:
+        return None
+    i, j = _resolve_ends(len(verts), closed,
+                         getattr(mon, "StartVertex", 0),
+                         getattr(mon, "EndVertex", _CURVE_END))
+    path = _path_edges(wire, closed, i, j,
+                       reverse=bool(getattr(mon, "Reversed", False)))
+    total = sum(float(edge.Length) for edge, _rev in path)
+    if total <= 1.0e-9:
+        return None
+    step = total / max(1, int(max_samples) - 1)
+    if step_mm is not None and float(step_mm) > step:
+        step = float(step_mm)
+
+    points, tangents, dist, vertex_s = [], [], [], [0.0]
+    travelled = 0.0
+    for edge, backwards in path:
+        length = float(edge.Length)
+        if length <= 1.0e-12:
+            continue
+        count = max(2, int(round(length / step)) + 1)
+        samples = []
+        for k in range(count):
+            along = length * k / (count - 1)
+            u = edge.getParameterByLength(length - along if backwards else along)
+            t = FreeCAD.Vector(edge.tangentAt(u))
+            samples.append((along, edge.valueAt(u),
+                            t.normalize() if t.Length > 0 else t))
+        # Point the tangents the way the samples actually travel. Checked
+        # rather than assumed: whether ``tangentAt`` honours a reversed edge's
+        # orientation is the library's business, and a wrong guess here would
+        # flip the sign of every tangential value on that edge.
+        if samples[0][2].dot(samples[1][1] - samples[0][1]) < 0:
+            samples = [(a, p, -t) for a, p, t in samples]
+        for k, (along, p, t) in enumerate(samples):
+            # The vertex shared with the previous edge: keep it only when the
+            # direction turns there (see the docstring).
+            if k == 0 and tangents:
+                if (p - FreeCAD.Vector(*points[-1])).Length < 1.0e-9 and \
+                        t.dot(FreeCAD.Vector(*tangents[-1])) > 0.9998:
+                    continue
+            points.append((p.x, p.y, p.z))
+            tangents.append((t.x, t.y, t.z))
+            dist.append(travelled + along)
+        travelled += length
+        vertex_s.append(travelled)
+    if len(points) < 2:
+        return None
+    normal = _curve_plane_normal(mon, wire)
+    return {
+        "points": points,
+        "tangents": tangents,
+        "s": dist,
+        "vertex_s": vertex_s,
+        "normal": (normal.x, normal.y, normal.z) if normal is not None else None,
+        "length": travelled,
+    }
 
 
 def _path_spec(mon, origin_m, deflection_mm):
@@ -867,6 +1200,40 @@ def _path_spec(mon, origin_m, deflection_mm):
     }
 
 
+def field_line_spec(mon, origin_m, step_mm):
+    """Return the ``job.json`` dict for a field-line monitor, or ``None``.
+
+    The curve is sampled here, not in the runner: the runner has no geometry
+    kernel, and the tangents come exactly from the edges rather than from
+    differencing the samples. Points are solver-frame metres; ``s`` is the
+    distance along the path in metres, from 0 at the start vertex. A monitor
+    with no curve, or whose start and end coincide on an open curve, is skipped
+    with a warning so the run still proceeds.
+    """
+    sampled = sample_field_line(mon, step_mm=step_mm)
+    if sampled is None:
+        FreeCAD.Console.PrintWarning(
+            "Wavesim: field-line monitor '{}' has no path to sample (drag a "
+            "sketch onto it, and pick different start and end vertices); "
+            "skipping it.\n".format(mon.Label)
+        )
+        return None
+    return {
+        "name": str(mon.Label or mon.Name),
+        "field": str(getattr(mon, "Field", "E")),
+        "points": [
+            [p[0] / _MM_PER_M - origin_m[0],
+             p[1] / _MM_PER_M - origin_m[1],
+             p[2] / _MM_PER_M - origin_m[2]]
+            for p in sampled["points"]
+        ],
+        "tangents": [list(t) for t in sampled["tangents"]],
+        "s": [d / _MM_PER_M for d in sampled["s"]],
+        "vertex_s": [d / _MM_PER_M for d in sampled["vertex_s"]],
+        "normal": list(sampled["normal"]) if sampled["normal"] else None,
+    }
+
+
 def monitors_spec(sim, origin_m):
     """Return the ``job.json`` ``monitors`` dict for the simulation *sim*.
 
@@ -874,7 +1241,25 @@ def monitors_spec(sim, origin_m):
     only when an explicit monitor asks for it (see :func:`_region_spec`). A
     simulation with no monitors records nothing, so the job contains exactly
     what was asked for and nothing else.
+
+    ``field_lines`` is filled only for an electrostatic run, the one mode that
+    samples them; the full-wave runner has nothing to read them with.
     """
+    from wavesim_gui.commands import is_electrostatic
+
+    field_lines = []
+    if is_electrostatic(sim):
+        # Same quarter-cell spacing the voltage paths are discretised to.
+        step = _path_deflection_mm(sim)
+        field_lines = [
+            s for s in (field_line_spec(m, origin_m, step)
+                        for m in find_field_line_monitors(sim)) if s
+        ]
+    elif find_field_line_monitors(sim):
+        FreeCAD.Console.PrintWarning(
+            "Wavesim: field-along-curve monitors only record in an "
+            "electrostatic run; this full-wave run ignores them.\n"
+        )
     probes = [probe_spec(p, origin_m) for p in find_probes(sim)]
     snapshots = [snapshot_spec(s, origin_m) for s in find_snapshots(sim)]
     deflection = _path_deflection_mm(sim)
@@ -891,6 +1276,7 @@ def monitors_spec(sim, origin_m):
         "dissipation": dissipation_spec(find_dissipation_monitors(sim)),
         "probes": probes, "snapshots": snapshots,
         "voltages": voltages, "currents": currents,
+        "field_lines": field_lines,
     }
 
 
@@ -974,6 +1360,21 @@ def _path_monitor_label(obj):
     if sketch is not None:
         return "{} Monitor ({})".format(kind, sketch.Label)
     return "{} Monitor (no curve)".format(kind)
+
+
+def _field_line_label(obj):
+    sketch = getattr(obj, "Sketch", None)
+    return "Field Along Curve ({}, {})".format(
+        getattr(obj, "Field", "E"),
+        sketch.Label if sketch is not None else "no curve",
+    )
+
+
+def _sketch_monitor_label(obj):
+    """The automatic label of any sketch-path monitor, by its kind."""
+    if is_field_line_monitor(obj):
+        return _field_line_label(obj)
+    return _path_monitor_label(obj)
 
 
 # --------------------------------------------------------------------------- #
@@ -1254,6 +1655,9 @@ if _GUI_AVAILABLE:
     def _after_path_changed(doc):
         """Recompute and re-size the domain after a monitor's curve changes."""
         from wavesim_gui import domain as domain_mod
+        # The monitor's own drawn path is rebuilt on recompute, which the
+        # domain notification skips when there is no domain yet.
+        doc.recompute()
         domain_mod.notify_domain_inputs_changed(doc)
 
     # A path monitor's eye drives the sketch nested under it, exactly as a
@@ -1261,7 +1665,7 @@ if _GUI_AVAILABLE:
     # without this its eye would be a flag that does nothing.
     visibility.register_owner(
         "path_monitor",
-        lambda obj: is_voltage_monitor(obj) or is_current_monitor(obj),
+        is_sketch_monitor,
         lambda mon: [getattr(mon, "Sketch", None)],
     )
     visibility.install()
@@ -1309,9 +1713,9 @@ if _GUI_AVAILABLE:
             """Detach the sketch when it is dragged off the monitor."""
             mon = vobj.Object
             if getattr(mon, "Sketch", None) is obj:
-                old_auto = _path_monitor_label(mon)
+                old_auto = _sketch_monitor_label(mon)
                 mon.Sketch = None
-                labels_mod.retitle(mon, old_auto, _path_monitor_label(mon))
+                labels_mod.retitle(mon, old_auto, _sketch_monitor_label(mon))
                 # The eye stands for the sketch; with none there is nothing
                 # left for it to stand for.
                 visibility.sync_from_children(mon)
@@ -1328,9 +1732,15 @@ if _GUI_AVAILABLE:
             mon = vobj.Object
             if not _is_curve_object(obj):
                 return
-            old_auto = _path_monitor_label(mon)
+            old_auto = _sketch_monitor_label(mon)
             mon.Sketch = obj
-            labels_mod.retitle(mon, old_auto, _path_monitor_label(mon))
+            if is_field_line_monitor(mon):
+                # Vertex indices belong to the old curve; a new one starts
+                # from its own start and runs to its own end.
+                mon.StartVertex = 0
+                mon.EndVertex = _CURVE_END
+                mon.Reversed = False
+            labels_mod.retitle(mon, old_auto, _sketch_monitor_label(mon))
             visibility.sync_from_children(mon)
             _after_path_changed(mon.Document)
 
@@ -1342,6 +1752,87 @@ if _GUI_AVAILABLE:
 
         __getstate__ = dumps
         __setstate__ = loads
+
+    class FieldLineViewProvider(PathMonitorViewProvider):
+        """Tree/3D view provider for the field-along-a-curve monitor.
+
+        Inherits the sketch drag & drop and the linked eye from the path
+        monitors. What it adds is a drawing of the **selected portion** of the
+        curve -- a thick teal line with a filled dot at the start (distance 0)
+        and a ring at the end -- because the panel can pick a stretch of the
+        sketch rather than all of it, and the sketch alone cannot show which.
+        Double-click opens the panel.
+        """
+
+        def attach(self, vobj):
+            from pivy import coin
+
+            self.ViewObject = vobj
+            self.Object = vobj.Object
+            root = coin.SoSeparator()
+
+            style = coin.SoDrawStyle()
+            style.lineWidth = 4
+            style.pointSize = 1
+            root.addChild(style)
+            color = coin.SoBaseColor()
+            color.rgb.setValue(*_MONITOR_COLOR)
+            root.addChild(color)
+
+            self._coords = coin.SoCoordinate3()
+            root.addChild(self._coords)
+            self._line = coin.SoLineSet()
+            root.addChild(self._line)
+
+            # The two ends, each with its own coordinate so a marker set can
+            # draw exactly one point.
+            self._ends = []
+            for marker in (coin.SoMarkerSet.CIRCLE_FILLED_9_9,
+                           coin.SoMarkerSet.CIRCLE_LINE_9_9):
+                sep = coin.SoSeparator()
+                coords = coin.SoCoordinate3()
+                sep.addChild(coords)
+                markers = coin.SoMarkerSet()
+                markers.markerIndex = marker
+                sep.addChild(markers)
+                root.addChild(sep)
+                self._ends.append(coords)
+
+            # Registered as the display mode itself (in place of the mixin's
+            # empty group), so the monitor's eye hides the preview too.
+            vobj.addDisplayMode(root, "Default")
+            self._display_node = root
+            self._rebuild()
+
+        def _rebuild(self):
+            obj = getattr(self, "Object", None)
+            if obj is None or not hasattr(self, "_coords"):
+                return
+            pts = [(v.x, v.y, v.z) for v in (getattr(obj, "PathPoints", [])
+                                              or [])]
+            self._coords.point.setNum(len(pts))
+            if pts:
+                self._coords.point.setValues(0, len(pts), pts)
+            self._line.numVertices.setValue(len(pts) if len(pts) >= 2 else 0)
+            for coords, pt in zip(self._ends, (pts[:1], pts[-1:])):
+                coords.point.setNum(len(pt))
+                if pt:
+                    coords.point.setValues(0, 1, pt)
+
+        def updateData(self, obj, prop):
+            if prop == "PathPoints":
+                self._rebuild()
+
+        def getIcon(self):
+            return _FIELD_LINE_ICON
+
+        def setEdit(self, vobj, mode=0):
+            _open_field_line_panel(vobj.Object)
+            return True
+
+        def doubleClicked(self, vobj):
+            _open_field_line_panel(vobj.Object)
+            return True
 
     # ------------------------------------------------------------------ #
     # Task panels
@@ -1811,6 +2302,210 @@ if _GUI_AVAILABLE:
         def getStandardButtons(self):
             return _ok_cancel_buttons()
 
+    class TaskFieldLinePanel:
+        """Task-tab panel: field, and which stretch of the curve to sample.
+
+        Start and End are picked from the curve's own vertices, so a path can
+        be part of a sketch rather than all of it. Changes show live in the 3D
+        view (the drawn stretch and its end markers) and are rolled back on
+        Cancel.
+        """
+
+        def __init__(self, obj):
+            QtWidgets = _qt_widgets()
+            self.obj = obj
+            self._orig = (int(obj.StartVertex), int(obj.EndVertex),
+                          bool(obj.Reversed))
+            # The field and label change live too, so the tree names what the
+            # panel shows; both are put back on Cancel.
+            self._orig_field = str(getattr(obj, "Field", "E"))
+            self._orig_label = str(obj.Label)
+            self._label_is_auto = labels_mod.is_auto(
+                obj.Label, _field_line_label(obj))
+            self._verts, self._closed = curve_vertices_mm(obj)
+
+            form = QtWidgets.QWidget()
+            form.setWindowTitle("Wavesim Field Along Curve")
+            layout = QtWidgets.QFormLayout(form)
+
+            self._field = QtWidgets.QComboBox()
+            self._field.addItems(_ES_FIELDS)
+            self._field.setCurrentText(str(getattr(obj, "Field", "E")))
+            layout.addRow("Field:", self._field)
+
+            sketch = getattr(obj, "Sketch", None)
+            curve = QtWidgets.QLabel(
+                "{} ({} curve, {} vertices)".format(
+                    sketch.Label, "closed" if self._closed else "open",
+                    len(self._verts))
+                if self._verts else
+                "none — drag a sketch from the tree onto this monitor, then "
+                "open this panel again")
+            curve.setWordWrap(True)
+            layout.addRow("Curve:", curve)
+
+            self._start = QtWidgets.QComboBox()
+            self._end = QtWidgets.QComboBox()
+            n = len(self._verts)
+            for idx, v in enumerate(self._verts):
+                text = "{}: ({:g}, {:g}, {:g}) mm".format(
+                    idx + 1, round(v.x, 4), round(v.y, 4), round(v.z, 4))
+                if idx == 0:
+                    text += "  — curve start"
+                elif idx == n - 1 and not self._closed:
+                    text += "  — curve end"
+                self._start.addItem(text, idx)
+                self._end.addItem(text, idx)
+            i, j = (_resolve_ends(n, self._closed, obj.StartVertex,
+                                  obj.EndVertex) if n else (0, 0))
+            self._start.setCurrentIndex(i)
+            self._end.setCurrentIndex(j)
+            layout.addRow("Start (0 mm):", self._start)
+            layout.addRow("End:", self._end)
+
+            buttons = QtWidgets.QHBoxLayout()
+            self._swap = QtWidgets.QPushButton("Swap start and end")
+            buttons.addWidget(self._swap)
+            buttons.addStretch(1)
+            layout.addRow(buttons)
+
+            self._reverse = QtWidgets.QCheckBox(
+                "Go round the curve the other way")
+            self._reverse.setChecked(bool(obj.Reversed))
+            layout.addRow(self._reverse)
+            self._reverse.setVisible(self._closed)
+
+            self._length = QtWidgets.QLabel()
+            layout.addRow("Path length:", self._length)
+
+            info = QtWidgets.QLabel(
+                "After an electrostatic run the result plots the chosen field "
+                "against the distance travelled along the curve, from 0 mm at "
+                "the start vertex (the filled dot in the 3D view) to the end "
+                "(the ring). For E or D the plot offers |F|, Fx, Fy, Fz, the "
+                "component along the curve (in the direction of travel) and "
+                "the component perpendicular to it."
+                + (" On a closed curve, picking the same start and end vertex "
+                   "samples one full lap." if self._closed else ""))
+            info.setWordWrap(True)
+            layout.addRow(info)
+
+            for widget in (self._start, self._end, self._swap, self._reverse):
+                widget.setEnabled(bool(self._verts))
+
+            self._field.currentTextChanged.connect(self._live_field)
+            self._start.currentIndexChanged.connect(self._live)
+            self._end.currentIndexChanged.connect(self._live)
+            self._reverse.toggled.connect(self._live)
+            self._swap.clicked.connect(self._on_swap)
+            self._update_length()
+            self.form = form
+
+        def _chosen(self):
+            """``(StartVertex, EndVertex, Reversed)`` as the boxes set them.
+
+            The curve's own end is stored as :data:`_CURVE_END` rather than
+            its index, so the path still ends at the end if the sketch later
+            gains vertices.
+            """
+            if not self._verts:
+                return self._orig
+            i = int(self._start.currentData())
+            j = int(self._end.currentData())
+            n = len(self._verts)
+            if (self._closed and j == i) or (not self._closed and j == n - 1):
+                j = _CURVE_END
+            return i, j, self._closed and self._reverse.isChecked()
+
+        def _apply(self, values):
+            self.obj.StartVertex, self.obj.EndVertex, self.obj.Reversed = values
+
+        def _on_swap(self):
+            i, j = self._start.currentIndex(), self._end.currentIndex()
+            for box in (self._start, self._end):
+                box.blockSignals(True)
+            self._start.setCurrentIndex(j)
+            self._end.setCurrentIndex(i)
+            for box in (self._start, self._end):
+                box.blockSignals(False)
+            # On a loop, swapping alone would select the *other* arc; going
+            # round the other way too is what keeps the same stretch, reversed.
+            if self._closed and i != j:
+                self._reverse.blockSignals(True)
+                self._reverse.setChecked(not self._reverse.isChecked())
+                self._reverse.blockSignals(False)
+            self._live()
+
+        def _set_field(self, field):
+            """Set ``Field`` and, unless the user renamed it, the label."""
+            self.obj.Field = field
+            if self._label_is_auto:
+                new = _field_line_label(self.obj)
+                if str(self.obj.Label) != new:
+                    self.obj.Label = new
+
+        def _live_field(self, text):
+            self._set_field(str(text))
+
+        def _live(self, *_):
+            self._apply(self._chosen())
+            self.obj.touch()
+            self.obj.Document.recompute()
+            self._update_length()
+
+        def _update_length(self):
+            sampled = sample_field_line(self.obj, max_samples=2)
+            if sampled is None:
+                self._length.setText(
+                    "no path — pick different start and end vertices"
+                    if self._verts else "—")
+                self._length.setStyleSheet("color: #a03000;")
+                return
+            edges = len(sampled["vertex_s"]) - 1
+            self._length.setText("{:.4g} mm along {} edge{}".format(
+                sampled["length"], edges, "" if edges == 1 else "s"))
+            self._length.setStyleSheet("")
+
+        def accept(self):
+            from wavesim_gui import domain as domain_mod
+
+            doc = self.obj.Document
+            chosen = self._chosen()
+            field = self._field.currentText()
+            # Back to the originals first so the transaction records the whole
+            # change (the live edits landed outside it).
+            self._restore()
+            doc.openTransaction("Wavesim: Edit Field Along Curve")
+            self._set_field(field)
+            self._apply(chosen)
+            doc.commitTransaction()
+            self.obj.touch()
+            doc.recompute()
+            domain_mod.notify_domain_inputs_changed(doc)
+            Gui.Control.closeDialog()
+            return True
+
+        def _restore(self):
+            """Undo every live edit: vertices, field and label."""
+            self._apply(self._orig)
+            self.obj.Field = self._orig_field
+            if str(self.obj.Label) != self._orig_label:
+                self.obj.Label = self._orig_label
+
+        def reject(self):
+            self._restore()
+            self.obj.touch()
+            self.obj.Document.recompute()
+            Gui.Control.closeDialog()
+            return True
+
+        def getStandardButtons(self):
+            return _ok_cancel_buttons()
+
+    def _open_field_line_panel(obj):
+        Gui.Control.closeDialog()
+        Gui.Control.showDialog(TaskFieldLinePanel(obj))
+
     def _open_probe_panel(obj, created=False):
         Gui.Control.closeDialog()
         Gui.Control.showDialog(TaskProbePanel(obj, created=created))
@@ -2063,6 +2758,68 @@ if _GUI_AVAILABLE:
                 "sketch curve (drag the sketch onto the monitor in the tree)",
             }
 
+    class CommandAddFieldLineMonitor:
+        """Add a field-along-a-curve monitor (electrostatic runs only).
+
+        Like the voltage monitor it is created empty and takes its curve from a
+        sketch dragged onto it; a curve already selected when the button is
+        pressed is attached straight away, which saves the drag.
+        """
+
+        def GetResources(self):
+            return {
+                "Pixmap": _FIELD_LINE_ICON,
+                "MenuText": "Add Field Along Curve",
+                "ToolTip": "Plot phi, E or D along a sketch curve against the "
+                "distance travelled along it (electrostatic runs; drag the "
+                "sketch onto the monitor in the tree)",
+            }
+
+        def Activated(self):
+            doc = FreeCAD.ActiveDocument
+            sim = _require_simulation()
+            if sim is None:
+                return
+            picked = [o for o in Gui.Selection.getSelection()
+                      if _is_curve_object(o)]
+            doc.openTransaction("Wavesim: Add Field Along Curve")
+            try:
+                mon = doc.addObject("App::FeaturePython", _FIELD_LINE_TYPE)
+                FieldLineObject(mon)
+                if len(picked) == 1:
+                    mon.Sketch = picked[0]
+                mon.Label = _field_line_label(mon)
+                if mon.ViewObject is not None:
+                    FieldLineViewProvider(mon.ViewObject)
+                monitors_group(sim).addObject(mon)
+            except Exception:
+                doc.abortTransaction()
+                raise
+            doc.commitTransaction()
+            if mon.Sketch is not None:
+                visibility.sync_from_children(mon)
+                _after_path_changed(doc)
+                FreeCAD.Console.PrintMessage(
+                    "Wavesim: field-along-curve monitor uses '{}'. "
+                    "Double-click it to choose the field and the start and "
+                    "end vertices.\n".format(mon.Sketch.Label))
+            else:
+                doc.recompute()
+                FreeCAD.Console.PrintMessage(
+                    "Wavesim: drag a sketch from the model tree onto the "
+                    "Field Along Curve monitor to set its path, then "
+                    "double-click the monitor to choose the field and the "
+                    "start and end vertices.\n")
+
+        def IsActive(self):
+            # Electrostatics only: the field it samples is the static
+            # solution. The full-wave runner has no single field to sample.
+            from wavesim_gui.commands import is_electrostatic
+
+            sim = active_simulation(FreeCAD.ActiveDocument)
+            return sim is not None and is_electrostatic(sim)
+
+    Gui.addCommand("Wavesim_AddFieldLineMonitor", CommandAddFieldLineMonitor())
     Gui.addCommand("Wavesim_AddProbe", CommandAddProbe())
     Gui.addCommand("Wavesim_AddSnapshot", CommandAddSnapshot())
     Gui.addCommand("Wavesim_AddEnergyMonitor", CommandAddEnergyMonitor())

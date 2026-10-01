@@ -12,6 +12,9 @@ Simulation tree holding one leaf object per monitor that produced data:
 * **Snapshot** -- a whole field's 2D slices animated over time, with a dropdown
   choosing the component to view (Ex/Ey/Ez, plus the |E| magnitude derived from
   them) — one monitor, every component.
+* **Field along curve** (electrostatic) -- phi, E or D against the distance
+  along a sketch curve; a vector adds a dropdown for |F|, Fx/Fy/Fz and the
+  parts tangential and perpendicular to the curve.
 
 A port that solves a mode (a Modal Port, or a SPICE port driving a TEM mode) gets
 a **group node of its own** under Results, holding everything that port produced:
@@ -100,6 +103,9 @@ _KIND_ZMATRIX = "zmatrix"
 # answer -- the charges are the matrix's raw material and the energy is the same
 # quadratic form.
 _KIND_CAPACITANCE = "capacitance"
+# phi / E / D sampled along a curve by an electrostatic run, plotted against the
+# distance along it.
+_KIND_FIELD_LINE = "field_line"
 
 # Each result leaf shows the toolbar icon of the monitor/port that produced it.
 _KIND_ICONS = {
@@ -123,6 +129,7 @@ _KIND_ICONS = {
     # Not the energy icon: the electrostatic leaf's headline is the matrix, and
     # two different answers sharing a picture is how a tree stops being read.
     _KIND_CAPACITANCE: _icon("capacitance.svg"),
+    _KIND_FIELD_LINE: _icon("field_line.svg"),
 }
 
 _RESULTS_GROUP = "Results"
@@ -975,6 +982,20 @@ def build_results(doc, sim, workdir, summary):
                 _store_interior(leaf, "YInterior", meta.get("interior1"),
                                 npz[e1k][0], offset_mm=wy)
 
+        # Fields along curves (electrostatic): one leaf each, plotted against
+        # the distance along the curve. Everything the plot needs -- samples,
+        # tangents, arc length -- is in results.npz under the leaf's key.
+        for idx, meta in enumerate(summary.get("field_lines", [])):
+            key = "line_{}".format(idx)
+            comps = [c for c in meta.get("components", [])
+                     if "{}_{}".format(key, c) in keys]
+            if not comps or key + "_s" not in keys:
+                continue
+            leaf = _new_leaf(meta.get("name") or "Field along curve {}".format(
+                idx), _KIND_FIELD_LINE, key)
+            _store_field_line_meta(leaf, meta.get("field", "E"), comps,
+                                   meta.get("normal"))
+
         # Electrostatics: one leaf for the scalar results. Created whenever the
         # run was electrostatic, even with no capacitance matrix -- the applied
         # potentials, the conductor charges and the field energy are the answer
@@ -1219,6 +1240,75 @@ def _store_snapshot_components(leaf, field, comps, inplane):
             leaf.addProperty("App::PropertyString", prop, "Snapshot", "")
             leaf.setEditorMode(prop, 1)
         setattr(leaf, prop, value)
+
+
+def _store_field_line_meta(leaf, field, comps, normal):
+    """Record a field-line leaf's quantity, components and curve-plane normal.
+
+    ``PlaneNormal`` is empty for a curve that lies in no single plane; the plot
+    then offers the magnitude of the perpendicular part but no signed one,
+    since "perpendicular" names no particular direction off a space curve.
+    """
+    normal_text = ",".join("{:.12g}".format(float(c)) for c in normal) \
+        if normal else ""
+    for prop, value in (("Field", str(field)),
+                        ("Components", ",".join(comps)),
+                        ("PlaneNormal", normal_text)):
+        if not hasattr(leaf, prop):
+            leaf.addProperty("App::PropertyString", prop, "Field Along Curve",
+                             "")
+            leaf.setEditorMode(prop, 1)
+        setattr(leaf, prop, value)
+
+
+_FIELD_UNITS = {"phi": "V", "E": "V/m", "D": "C/m²"}
+
+
+def field_line_views(field, components, tangents, normal=None):
+    """The curves a field-along-curve plot offers, in dropdown order.
+
+    *components* maps each recorded component ('phi', or 'Ex'/'Ey'/'Ez' etc.)
+    to its samples; *tangents* is ``(N, 3)`` unit tangents in the direction of
+    travel; *normal* the curve plane's unit normal, or ``None``. Returns
+    ``[(key, label, values, integral_unit), ...]``. ``integral_unit`` is set
+    for the views whose integral along the curve is a physical quantity -- E
+    tangential (a voltage) and D normal (charge per unit length on a 2-D
+    cross-section) -- and the plot quotes that integral.
+
+    A scalar has exactly one view. A vector F gets |F|, its three Cartesian
+    components, the tangential part F·t (signed: positive along the direction of
+    travel), and the perpendicular part as the magnitude |F − (F·t)t|. A planar
+    curve also gets the signed in-plane normal part F·n with n = N × t, the
+    normal pointing to the left of travel as seen from the plane's normal.
+    """
+    import numpy as np
+
+    field = str(field)
+    if field.lower().startswith("phi"):
+        return [("phi", "phi (potential)", np.asarray(components["phi"]), None)]
+
+    f = field[:1].upper()
+    vec = np.stack([np.asarray(components[f + a], dtype=float)
+                    for a in ("x", "y", "z")], axis=1)
+    t = np.asarray(tangents, dtype=float).reshape(-1, 3)
+    mag = np.sqrt(np.sum(vec * vec, axis=1))
+    tan = np.sum(vec * t, axis=1)
+    perp = np.sqrt(np.clip(mag * mag - tan * tan, 0.0, None))
+    views = [("mag", "|{}|".format(f), mag, None)]
+    views += [(f + a, f + a, vec[:, k], None)
+              for k, a in enumerate(("x", "y", "z"))]
+    views.append(("tan", "{}∥ (along the curve)".format(f), tan,
+                  "V" if f == "E" else None))
+    if normal is not None:
+        n = np.cross(np.asarray(normal, dtype=float).reshape(1, 3), t)
+        lengths = np.linalg.norm(n, axis=1)
+        n = n / np.where(lengths > 0, lengths, 1.0)[:, None]
+        views.append(("normal", "{}⊥ (in the curve's plane, left of travel)"
+                      .format(f), np.sum(vec * n, axis=1),
+                      "C/m" if f == "D" else None))
+    views.append(("perp", "|{}⊥| (perpendicular magnitude)".format(f), perp,
+                  None))
+    return views
 
 
 def _store_snapshot_extent(leaf, width, height, axis_x, axis_y, plane, offset):
@@ -1817,6 +1907,8 @@ if _GUI_AVAILABLE:
                 _plot_mode(obj)
             elif kind == _KIND_CAPACITANCE:
                 _show_electrostatic(obj)
+            elif kind == _KIND_FIELD_LINE:
+                _plot_field_line(obj)
             else:
                 FreeCAD.Console.PrintWarning(
                     "Wavesim: unknown result kind '{}'.\n".format(kind)
@@ -2215,6 +2307,98 @@ if _GUI_AVAILABLE:
             obj, "current (A)", "Current: ∮H·dl vs. time", "#9467bd",
             quantity="I",
         )
+
+    def _plot_field_line(obj):
+        """phi / E / D against the distance along the monitor's curve.
+
+        A scalar is one trace. A vector adds a dropdown over
+        :func:`field_line_views`; switching keeps the distance range the user
+        zoomed to and rescales the value axis. Thin dotted lines mark the curve
+        vertices the path passes, so a corner on the sketch can be found on
+        the plot.
+        """
+        import numpy as np
+
+        workdir = str(obj.ResultsDir)
+        key = str(obj.DataKey)
+        field = str(getattr(obj, "Field", "E"))
+        comps = [c for c in str(getattr(obj, "Components", "")).split(",") if c]
+        s = _load_array(workdir, key + "_s")
+        tangents = _load_array(workdir, key + "_tangents")
+        data = {c: _load_array(workdir, "{}_{}".format(key, c)) for c in comps}
+        if s is None or tangents is None or not comps or any(
+                v is None for v in data.values()):
+            _missing(obj)
+            return
+        vertex_s = _load_array(workdir, key + "_vertex_s")
+        normal_text = str(getattr(obj, "PlaneNormal", ""))
+        normal = ([float(c) for c in normal_text.split(",")]
+                  if normal_text else None)
+        views = field_line_views(field, data, tangents, normal)
+        unit = _FIELD_UNITS.get("phi" if field.lower().startswith("phi")
+                                else field[:1].upper(), "")
+        dist_mm = np.asarray(s, dtype=float) * _MM_PER_M
+        # The interior vertices only: the two ends are the axis limits.
+        corners = ([float(v) * _MM_PER_M for v in vertex_s[1:-1]]
+                   if vertex_s is not None else [])
+
+        made = _make_window("Wavesim Results - {}".format(obj.Label))
+        if made is None:
+            return
+        dialog, figure, layout = made
+        state = {"view": 0}
+
+        def draw(fig):
+            _key, label, values, integral_unit = views[state["view"]]
+            ax = fig.add_subplot(111)
+            for x in corners:
+                ax.axvline(x, color="0.6", linestyle=":", linewidth=0.8)
+            if np.nanmin(values) < 0.0 < np.nanmax(values):
+                ax.axhline(0.0, color="0.4", linewidth=0.6)
+            ax.plot(dist_mm, values, color="#2f9a86")
+            ax.set_xlim(0.0, float(dist_mm[-1]))
+            ax.set_xlabel("distance along the curve (mm)")
+            ax.set_ylabel("{} ({})".format(label, unit))
+            ax.set_title(str(obj.Label))
+            ax.grid(True, alpha=0.3)
+            if integral_unit:
+                # FreeCAD 1.1 bundles numpy 1.26: ``trapz``, not ``trapezoid``.
+                trapz = getattr(np, "trapezoid", None) or np.trapz
+                total = float(trapz(values, np.asarray(s, dtype=float)))
+                _corner_text(ax, ["∫ = {:.5g} {}".format(total, integral_unit)])
+
+        if len(views) > 1:
+            _QtCore, QtWidgets = _qt()
+            row = QtWidgets.QHBoxLayout()
+            row.addWidget(QtWidgets.QLabel("Component:"))
+            box = QtWidgets.QComboBox()
+            for _key, label, _values, _unit in views:
+                box.addItem(label)
+            box.setToolTip(
+                "Along the curve: the component in the direction of travel "
+                "(start to end).\n"
+                "Perpendicular: what is left of the field once that is "
+                "removed -- as a magnitude,\nand, for a curve lying in one "
+                "plane, signed along the in-plane normal\n(pointing left of "
+                "the direction of travel).")
+            row.addWidget(box)
+            row.addStretch(1)
+            layout.addLayout(row)
+
+            def on_view(index):
+                old = figure.axes[0].get_xlim() if figure.axes else None
+                state["view"] = int(index)
+                _redraw_guarded(dialog, draw)
+                if old is not None and figure.axes:
+                    figure.axes[0].set_xlim(old)
+                    dialog._canvas.draw_idle()
+
+            box.currentIndexChanged.connect(on_view)
+
+        draw(figure)
+        dialog._canvas.draw()
+        dialog.show()
+        _register_window(dialog)
 
     def _plot_spice_voltage(obj):
         _plot_series(

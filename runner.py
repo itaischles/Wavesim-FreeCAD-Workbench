@@ -162,7 +162,16 @@ job.json schema (Session 2)
         "capacitance": true,                  # also extract the C matrix
         "method": "auto",                     # 'auto'|'direct'|'cg'
         "slices": [{"name":.., "field":"phi"|"E"|"D",
-                    "normal":"z", "position":..}, ...]
+                    "normal":"z", "position":..}, ...],
+        "lines": [{"name":.., "field":"phi"|"E"|"D",
+                   "points": [[x,y,z], ...],     # solver-frame metres
+                   "tangents": [[tx,ty,tz], ...],  # unit, direction of travel
+                   "s": [..],                    # distance along the path, m
+                   "vertex_s": [..],             # s at each curve vertex, m
+                   "normal": [nx,ny,nz] | null}, ...]  # the curve's plane
+                      # Sampled by the workbench (it has the geometry kernel);
+                      # the runner interpolates the field at the points and
+                      # saves line_<i>_<comp> beside the geometry it was given.
       },
       "mode_only": false,                     # solve TEM modes only; no FDTD run
       "monitors": {
@@ -1216,6 +1225,93 @@ def _es_quantities(np, sol, field):
     return ["Ex", "Ey", "Ez"], list(sol.E_nodes)
 
 
+def _rect_interpolator(np, coords, points):
+    """Trilinear interpolation on a rectilinear lattice at *points*.
+
+    *coords* is the three per-axis sample coordinate arrays of the arrays to be
+    sampled (graded spacing is fine: each axis is searched in its own
+    coordinates, not assumed uniform). Returns ``sample(arr) -> values``, one
+    value per point; the weights depend only on the points and the lattice, so
+    they are worked out once and reused for every array on it. A point outside
+    the lattice is clamped to its face, and an axis with a single sample (a 2-D
+    run) contributes no interpolation along it.
+    """
+    pts = np.asarray(points, dtype=np.float64).reshape(-1, 3)
+    lo, hi, frac = [], [], []
+    for axis in range(3):
+        c = np.asarray(coords[axis], dtype=np.float64)
+        n = len(c)
+        p = pts[:, axis]
+        if n < 2:
+            zero = np.zeros(len(p), dtype=np.intp)
+            lo.append(zero)
+            hi.append(zero)
+            frac.append(np.zeros(len(p)))
+            continue
+        i = np.clip(np.searchsorted(c, p, side="right") - 1, 0, n - 2)
+        w = (p - c[i]) / (c[i + 1] - c[i])
+        lo.append(i)
+        hi.append(i + 1)
+        frac.append(np.clip(w, 0.0, 1.0))
+
+    def sample(arr):
+        arr = np.asarray(arr, dtype=np.float64)
+        out = np.zeros(len(pts))
+        for cx in (0, 1):
+            wx = frac[0] if cx else 1.0 - frac[0]
+            ix = hi[0] if cx else lo[0]
+            for cy in (0, 1):
+                wy = frac[1] if cy else 1.0 - frac[1]
+                iy = hi[1] if cy else lo[1]
+                for cz in (0, 1):
+                    wz = frac[2] if cz else 1.0 - frac[2]
+                    iz = hi[2] if cz else lo[2]
+                    out += wx * wy * wz * arr[ix, iy, iz]
+        return out
+
+    return sample
+
+
+def _line_samples(np, grid, sol, field, points):
+    """``(components, values)`` of one electrostatic quantity at *points*.
+
+    phi is interpolated on the nodes it was solved on. E and D are **not** taken
+    from their node-collocated display copies (``E_nodes``): that averaging
+    already spreads a conductor surface over a whole cell, and interpolating it
+    again would blur the field next to the metal -- exactly where a curve along
+    a surface wants it. Each component is sampled on its own Yee edges instead
+    (``Ex[i,j,k]`` at ``(xc[i], y[j], z[k])``; the last index along its own axis
+    has no edge and is dropped), which keeps a field that is uniform up to a
+    conductor exact to within half a cell of it.
+    """
+    shape = sol.phi.shape
+    names = ("x", "y", "z")
+    nodes = [np.asarray(_axis_nodes(grid, a), dtype=np.float64)[:shape[k]]
+             for k, a in enumerate(names)]
+    text = str(field)
+    if text.lower().startswith("phi"):
+        return ["phi"], [_rect_interpolator(np, nodes, points)(sol.phi)]
+
+    head = "D" if text.upper().startswith("D") else "E"
+    edges = sol.D if head == "D" else sol.E
+    comps, values = [], []
+    for k, (name, arr) in enumerate(zip(names, edges)):
+        comps.append(head + name)
+        m = shape[k] - 1
+        if m < 1:
+            # A 2-D run's out-of-plane axis: no edge along it, no component.
+            values.append(np.zeros(len(points)))
+            continue
+        coords = list(nodes)
+        coords[k] = np.asarray(_axis_centers(grid, name),
+                               dtype=np.float64)[:m]
+        cut = [slice(None)] * 3
+        cut[k] = slice(0, m)
+        values.append(_rect_interpolator(np, coords, points)(
+            np.asarray(arr)[tuple(cut)]))
+    return comps, values
+
+
 # An electrostatic run reports progress in thousandths of the whole job: there
 # are no time steps to count, only the fraction of each solve the solver says it
 # has covered. Must match ``ES_PROGRESS_STEPS`` in ``wavesim_gui/commands.py``.
@@ -1359,6 +1455,35 @@ def _run_electrostatic(ws, np, grid, job, workdir, voxel_summary):
             "frames": 1,
         })
 
+    # --- field along curves ---------------------------------------------- #
+    # The workbench sampled each curve; here the solution is interpolated at
+    # those points. The geometry it was given is saved beside the values, so
+    # the plot can take the tangential/normal parts without the document.
+    line_meta = []
+    for idx, spec in enumerate(cfg.get("lines") or []):
+        points = spec.get("points") or []
+        if len(points) < 2:
+            continue
+        comps, values = _line_samples(np, grid, sol, spec.get("field", "phi"),
+                                      points)
+        for comp, vals in zip(comps, values):
+            result_arrays["line_{}_{}".format(idx, comp)] = vals
+        result_arrays["line_{}_s".format(idx)] = np.asarray(
+            spec.get("s") or [], dtype=np.float64)
+        result_arrays["line_{}_points".format(idx)] = np.asarray(
+            points, dtype=np.float64)
+        result_arrays["line_{}_tangents".format(idx)] = np.asarray(
+            spec.get("tangents") or [], dtype=np.float64)
+        result_arrays["line_{}_vertex_s".format(idx)] = np.asarray(
+            spec.get("vertex_s") or [], dtype=np.float64)
+        line_meta.append({
+            "name": spec.get("name", "line"),
+            "field": "phi" if len(comps) == 1 else comps[0][0],
+            "components": comps,
+            "normal": spec.get("normal"),
+            "samples": len(points),
+        })
+
     # --- integrals ------------------------------------------------------- #
     # Charges come from the same face coefficients the operator was assembled
     # from, so the reported charge is exactly the flux the solved equations
@@ -1434,6 +1559,8 @@ def _run_electrostatic(ws, np, grid, job, workdir, voxel_summary):
     summary.update(voxel_summary)
     if snapshot_meta:
         summary["snapshots"] = snapshot_meta
+    if line_meta:
+        summary["field_lines"] = line_meta
     with open(os.path.join(workdir, "summary.json"), "w",
               encoding="utf-8") as handle:
         json.dump(summary, handle, indent=2)

@@ -99,7 +99,9 @@ class WavesimWorkbench(Gui.Workbench):
                 "Wavesim_AddSpiceLinePort",
                 "Wavesim_SetPotential",
             )
-            # Monitors: everything that records, point to whole-domain.
+            # Monitors: everything that records, point to whole-domain. The
+            # field-along-curve monitor is electrostatic-only and greys out in
+            # full-wave mode, the way Set Potential does.
             add_group(
                 "Wavesim_AddProbe",
                 "Wavesim_AddSnapshot",
@@ -107,6 +109,7 @@ class WavesimWorkbench(Gui.Workbench):
                 "Wavesim_AddDissipationMonitor",
                 "Wavesim_AddVoltageMonitor",
                 "Wavesim_AddCurrentMonitor",
+                "Wavesim_AddFieldLineMonitor",
             )
             # The solves, together: the two buttons that cost minutes. The port
             # matrix is the same run repeated once per port with the drive

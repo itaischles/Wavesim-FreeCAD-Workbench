@@ -2477,6 +2477,11 @@ def _electrostatic_spec(sim, dom, vox, monitors):
                  "normal": s["normal"], "position": s["position"]}
                 for s in monitors.get("snapshots", [])
             ],
+            # Curves to sample the solution along, already discretised by the
+            # field-along-curve monitors (points, tangents, arc length). Moved
+            # rather than copied: thousands of samples each, and the
+            # ``monitors`` copy would only be dead weight in job.json.
+            "lines": monitors.pop("field_lines", []),
         },
         # The part labels behind ``pec_id`` in materials.npz. Metadata, so it
         # rides in the job rather than the array file.

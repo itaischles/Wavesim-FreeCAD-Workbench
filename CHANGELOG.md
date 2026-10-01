@@ -25,6 +25,9 @@ section is started above it.
 
 ### Changed
 
+- The **Cross Section On/Off** and **Mesh Grid On/Off** buttons now stay
+  usable while a task panel (Domain, a port, a monitor, ...) is open, instead
+  of greying out until the panel is closed.
 - Vector overlays (on snapshots and on TEM modes) now draw every arrow. Weak
   arrows used to be hidden below a minimum length, which left a hard edge where
   the arrows stopped. Now each arrow's opacity follows its length, so weak field

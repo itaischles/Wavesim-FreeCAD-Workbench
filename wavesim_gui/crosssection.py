@@ -1614,6 +1614,13 @@ if _GUI_AVAILABLE:
 
         _setter = None          # set_active / set_grid
 
+        # FreeCAD greys out every command while a task panel is open unless
+        # it is marked "ForEdit". These two only show or hide a view of the
+        # model, and no panel holds a transaction open that a toggle could be
+        # caught in, so they stay live: cutting the model while the Domain
+        # panel is up is exactly when the mesh lines are wanted.
+        _CMD_TYPE = "ForEdit"
+
         def _toggle(self, index):
             doc = FreeCAD.ActiveDocument
             if index is None:
@@ -1643,6 +1650,7 @@ if _GUI_AVAILABLE:
                 "Pixmap": _XSEC_ICON,
                 "MenuText": "Cross Section On/Off",
                 "Checkable": True,
+                "CmdType": self._CMD_TYPE,
                 "ToolTip": "Show or hide the cross-section, using the settings "
                            "the Cross Section panel last configured. Anything "
                            "on the cut-away side goes with it, cut or not",
@@ -1662,6 +1670,7 @@ if _GUI_AVAILABLE:
                 "Pixmap": _XSEC_GRID_ICON,
                 "MenuText": "Mesh Grid On/Off",
                 "Checkable": True,
+                "CmdType": self._CMD_TYPE,
                 "ToolTip": "Draw the Domain's cell grid on the cut plane. The "
                            "grid is only ever drawn on a cut, so switching it "
                            "on cuts the model as well",

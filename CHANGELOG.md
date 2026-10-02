@@ -38,11 +38,7 @@ section is started above it.
   of greying out until the panel is closed.
 - The progress dialog for an electrostatic run now shows a percentage and an
   estimate of the time left, instead of an animated "busy" bar.
-- Vector overlays (on snapshots and on TEM modes) now draw every arrow. Weak
-  arrows used to be hidden below a minimum length, which left a hard edge where
-  the arrows stopped. Now each arrow's opacity follows its length, so weak field
-  fades smoothly into the colour map. The arrows are also thicker and longer,
-  with slightly fewer of them, so they stay spaced apart.
+- Better visibility for vector overlays (on snapshots and on TEM modes).
 
 ### Fixed
 
@@ -52,9 +48,7 @@ section is started above it.
   after toggling **Smooth** no longer makes the colour bar disappear and leaves
   the plot unchanged.
 
-## [0.1.0] - unreleased
+## [0.1.0]
 
 First public version.
-
-### Added
 

@@ -1,7 +1,7 @@
 # Wavesim FreeCAD Workbench
 
 The Wavesim workbench turns FreeCAD solids into an electromagnetic simulation. You assign a
-material to each body, place sources, ports and monitors, and then **Run Simulation**. The
+material to each body, place sources, ports and monitors, and then run the simulation. The
 separate Wavesim solver performs the computation, and the results return to the FreeCAD
 document tree as plots and tables.
 

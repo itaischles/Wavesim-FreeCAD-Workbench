@@ -39,6 +39,9 @@ section is started above it.
 - The progress dialog for an electrostatic run now shows a percentage and an
   estimate of the time left, instead of an animated "busy" bar.
 - Better visibility for vector overlays (on snapshots and on TEM modes).
+- The `materials.npz` file a run writes is now compressed, which makes it
+  roughly 100 times smaller on disk (239 MB down to 2 MB on a 2.4-million-cell
+  model). Runs read it exactly as before.
 
 ### Fixed
 

@@ -2133,12 +2133,18 @@ def _report_conformal(active, counts, threshold):
 
 
 def write_materials(workdir, arrays):
-    """Save the voxelised material *arrays* to ``<workdir>/materials.npz``."""
+    """Save the voxelised material *arrays* to ``<workdir>/materials.npz``.
+
+    Compressed: the arrays are mostly background with a few distinct values, so
+    deflate takes them ~100x down (239 MB -> 2 MB measured on a 2.4M-cell
+    conformal model) for about a second of extra write time. ``np.load`` reads
+    either kind, so the runner is none the wiser.
+    """
     import os
 
     import numpy as np
 
-    np.savez(os.path.join(workdir, "materials.npz"), **arrays)
+    np.savez_compressed(os.path.join(workdir, "materials.npz"), **arrays)
 
 
 def build_job_from_document(doc, steps=None, fmax=30.0e9, progress=None):

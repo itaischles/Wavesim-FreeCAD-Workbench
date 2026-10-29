@@ -42,6 +42,12 @@ section is started above it.
 - The `materials.npz` file a run writes is now compressed, which makes it
   roughly 100 times smaller on disk (239 MB down to 2 MB on a 2.4-million-cell
   model). Runs read it exactly as before.
+- Voxelising is faster on models whose sections are slow to cut, with the
+  same results to the last bit: about 20% faster on a conformal spark gap
+  (160 s down to 126 s) and on the reference coax (14.4 s down to 11.0 s).
+  The parallel section workers now start after timing a few sample planes
+  instead of a whole serial pass, and conformal PEC no longer cuts each of its
+  node planes twice.
 
 ### Fixed
 

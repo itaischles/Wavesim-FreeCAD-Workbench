@@ -54,30 +54,26 @@ from wavesim_gui import sectionpool, voxelize  # noqa: E402
 def _count_sections(fn):
     """Run *fn* counting planes **actually cut in-process**.
 
-    Not merely the calls: the prefetch leaves the serial loop calling
-    ``_section_polygons`` exactly as before, and it returns a cached polygon
-    list without touching OCC. So a call is only counted when the cache would
-    *not* have served it -- which is the number the pool is supposed to drive
-    towards zero.
+    Not the ``_section_polygons`` calls: the serial loop still makes every one
+    of those, and the prefetch cache or the per-body memo answers most of them
+    without touching OCC. ``_cut_section`` is the one place a plane is really
+    cut in this process -- serial loop and pool calibration probes alike -- so
+    its calls are the number the pool is supposed to drive towards zero.
+    (The workers import their own copy of the module, so their cuts are not
+    counted here.)
     """
     cut = [0]
-    original = voxelize._section_polygons
+    original = voxelize._cut_section
 
-    def counting(body_shape, z_axis, z, deflection, nudge=0.0):
-        cache = voxelize._ACTIVE_CACHE
-        served = (cache is not None and cache.shape is body_shape
-                  and voxelize._is_z_axis(z_axis)
-                  and (float(z), float(deflection),
-                       float(nudge)) in cache.planes)
-        if not served:
-            cut[0] += 1
-        return original(body_shape, z_axis, z, deflection, nudge)
+    def counting(*args, **kwargs):
+        cut[0] += 1
+        return original(*args, **kwargs)
 
-    voxelize._section_polygons = counting
+    voxelize._cut_section = counting
     try:
         return fn(), cut[0]
     finally:
-        voxelize._section_polygons = original
+        voxelize._cut_section = original
 
 
 def _break_one_reply():

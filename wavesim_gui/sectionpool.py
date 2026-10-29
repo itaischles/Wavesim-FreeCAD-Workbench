@@ -217,6 +217,19 @@ class SectionPool(object):
         return (saving >= _STARTUP_ESTIMATE_S * _DISPATCH_MARGIN
                 and serial_s >= _BATCH_MIN_S)
 
+    def wants_probe(self, n_planes, n_probe):
+        """Whether to measure *n_planes* by cutting *n_probe* of them first.
+
+        Only while the pool still has no plane cost to decide on, and only for a
+        batch big enough that, measured, it could be dispatched at all.
+        :meth:`worth_dispatching` refuses every batch until a measurement
+        exists; without a probe the measurement was the whole first batch cut
+        serially, which on a slow-sectioning model is most of what the pool
+        exists to save (48 s of a 165 s spark gap).
+        """
+        return (self.enabled and self._plane_cost_s is None
+                and n_planes - n_probe >= _MIN_BATCH)
+
     def observe(self, n_planes, seconds):
         """Record what *n_planes* actually cost when cut serially.
 

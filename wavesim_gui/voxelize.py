@@ -47,6 +47,7 @@ the line at Z0 there; a conductor carried *past* it would put a second Z0 in
 parallel with the port and reflect about a third of the wave back.
 """
 
+import contextlib
 import math
 import time
 
@@ -431,6 +432,19 @@ _ACTIVE_CACHE = None
 # that error was enough to talk the pool into a 3.1 s sweep it returned in 5.0 s.
 _SECTION_TIMER = None
 
+# Every plane cut for one body during one sampler run, whichever way it was cut;
+# see :func:`_memoized`. None outside such a run.
+_BODY_MEMO = None
+
+# How many planes of a batch are cut in-process to measure what a plane of this
+# geometry costs, when the pool has no measurement yet. The pool used to learn
+# that by cutting the run's whole first batch serially -- 280 planes at 0.16 s,
+# 48 s of a 165 s spark-gap voxelisation, while the workers it went on to start
+# sat unborn. A handful, spread over the batch, measures the same thing: the
+# probes are cut on the very path the serial loop takes, and the decision is
+# then made exactly as before, on that number.
+_PROBE_PLANES = 8
+
 
 class _SectionCache(object):
     """Polygons for one shape, keyed by the arguments that produced them."""
@@ -467,59 +481,126 @@ def _prefetched(pool, body_shape, planes, deflection, nudge=0.0, on_layer=None):
 
     *planes* is an iterable of Z coordinates, all to be cut at the same
     *deflection* and *nudge*. Yields ``True`` when the pool ran -- in which case
-    it has already called *on_layer* once per plane, so the caller's own
+    every plane has already been ticked on *on_layer*, so the caller's own
     per-section tick must not count them again -- and ``False`` when nothing was
     prefetched and the caller should behave exactly as before.
+
+    Two things keep planes off OCC altogether. A plane this body already had cut
+    in the current :func:`_memoized` run is not requested again. And when the
+    pool has no measurement of this geometry yet, :data:`_PROBE_PLANES` planes
+    spread over the batch are cut here and timed, and the pool decides on the
+    rest with that number; the probes' polygons are kept either way, so nothing
+    is ever cut twice.
     """
     import contextlib
-    import time
+
+    z_axis = FreeCAD.Vector(0.0, 0.0, 1.0)
+
+    def _tick(count):
+        for _ in range(count):
+            if on_layer is not None and on_layer():
+                raise VoxelizationCancelled()
+
+    @contextlib.contextmanager
+    def _caching(planes_dict):
+        global _ACTIVE_CACHE
+
+        cache = _SectionCache(body_shape)
+        cache.planes.update(planes_dict)
+        previous = _ACTIVE_CACHE
+        _ACTIVE_CACHE = cache
+        try:
+            yield
+        finally:
+            _ACTIVE_CACHE = previous
 
     @contextlib.contextmanager
     def _run():
-        global _ACTIVE_CACHE
+        global _SECTION_TIMER
 
-        zs = [float(z) for z in planes]
-        if pool is None or not zs:
+        requests = [(float(z), float(deflection), float(nudge)) for z in planes]
+        memo = _BODY_MEMO
+        known = 0
+        if memo is not None and memo.shape is body_shape:
+            todo = [r for r in requests if r not in memo.planes]
+            known = len(requests) - len(todo)
+            requests = todo
+        if pool is None or not requests:
+            # Nothing for the pool; the serial loop ticks every plane, memo
+            # hits included, exactly as before.
             yield False
             return
-        requests = [(z, float(deflection), float(nudge)) for z in zs]
+
+        probed = {}
+        if pool.wants_probe(len(requests), _PROBE_PLANES):
+            n = len(requests)
+            picks = sorted({min(n - 1, int((i + 0.5) * n / _PROBE_PLANES))
+                            for i in range(_PROBE_PLANES)})
+            started = time.perf_counter()
+            for i in picks:
+                z, defl, nud = requests[i]
+                probed[requests[i]] = _cut_section(body_shape, z_axis, z, defl,
+                                                   nud)
+            pool.observe(len(picks), time.perf_counter() - started)
+            requests = [r for r in requests if r not in probed]
+
         try:
             results = pool.sections(body_shape, requests, on_progress=on_layer)
         except sectionpool.SectionPoolCancelled:
             raise VoxelizationCancelled()
         if results is None:
-            # Declined -- usually because the pool has yet to learn what a plane
-            # of this geometry costs. Time the sections of the serial pass it
-            # falls back to and tell it, so the *next* batch is decided on a
-            # measurement of this model rather than a guess about it.
-            global _SECTION_TIMER
-
+            # Declined. The serial loop cuts the rest and ticks every plane
+            # itself, finding any probes in the cache rather than recutting
+            # them. Its cuts are timed and reported, so a pool still waiting
+            # for a measurement (no probe this time: the batch was too small to
+            # bother) learns what this geometry costs from it.
             timer = [0.0, 0]
             previous_timer = _SECTION_TIMER
             _SECTION_TIMER = timer
             try:
-                yield False
+                with _caching(probed):
+                    yield False
             finally:
                 _SECTION_TIMER = previous_timer
             pool.observe(timer[1], timer[0])
             return
 
-        cache = _SectionCache(body_shape)
-        for (z, defl, nud), polys in zip(requests, results):
+        found = dict(probed)
+        for request, polys in zip(requests, results):
             # A plane the pool could not answer -- one whose section raised, or
             # one a dead batch never reached -- comes back as a string, never as
             # the ``None`` that means "this plane misses the solid". Drop those
             # and the serial path below cuts them itself.
             if not isinstance(polys, str):
-                cache.planes[(z, defl, nud)] = polys
-        previous = _ACTIVE_CACHE
-        _ACTIVE_CACHE = cache
-        try:
+                found[request] = polys
+        # The pool ticked the planes it cut; the probes and the memo hits are
+        # this batch's too, and the caller is about to stop ticking.
+        _tick(len(probed) + known)
+        with _caching(found):
             yield True
-        finally:
-            _ACTIVE_CACHE = previous
 
     return _run()
+
+
+@contextlib.contextmanager
+def _memoized(body_shape):
+    """Keep every plane cut for *body_shape* until the block ends.
+
+    The conformal sampler cuts each band layer's z-node plane twice -- once in
+    its node-lattice pass, once more in its fine pass -- at the same height,
+    chord tolerance and nudge, so the second cut is the first one over again.
+    Inside this block :func:`_section_polygons` answers a repeat from here, and
+    :func:`_prefetched` leaves it out of the pool's batch. Scoped to one body's
+    run so the polygons are dropped as soon as they can no longer be asked for.
+    """
+    global _BODY_MEMO
+
+    previous = _BODY_MEMO
+    _BODY_MEMO = _SectionCache(body_shape)
+    try:
+        yield
+    finally:
+        _BODY_MEMO = previous
 
 
 # --------------------------------------------------------------------------- #
@@ -698,22 +779,27 @@ def _section_polygons(body_shape, z_axis, z, deflection, nudge=0.0):
     that was never the body's shape, and their planes are cell *centres*, where
     a surface has no reason to land.
     """
+    key = (float(z), float(deflection), float(nudge))
+    memo = _BODY_MEMO
+    if memo is None or memo.shape is not body_shape or not _is_z_axis(z_axis):
+        memo = None
+    elif key in memo.planes:
+        return memo.planes[key]
+
+    polys = _MISSING
     cache = _ACTIVE_CACHE
     if cache is not None and cache.shape is body_shape and _is_z_axis(z_axis):
-        hit = cache.planes.get((float(z), float(deflection), float(nudge)),
-                               _MISSING)
-        if hit is not _MISSING:
-            return hit
-
-    timer = _SECTION_TIMER
-    if timer is None:
-        return _cut_section(body_shape, z_axis, z, deflection, nudge)
-    started = time.perf_counter()
-    try:
-        return _cut_section(body_shape, z_axis, z, deflection, nudge)
-    finally:
-        timer[0] += time.perf_counter() - started
-        timer[1] += 1
+        polys = cache.planes.get(key, _MISSING)
+    if polys is _MISSING:
+        timer = _SECTION_TIMER
+        started = time.perf_counter()
+        polys = _cut_section(body_shape, z_axis, z, deflection, nudge)
+        if timer is not None:
+            timer[0] += time.perf_counter() - started
+            timer[1] += 1
+    if memo is not None:
+        memo.planes[key] = polys
+    return polys
 
 
 def _cut_section(body_shape, z_axis, z, deflection, nudge=0.0):
@@ -1868,8 +1954,10 @@ def voxelize_materials(materials, cell_size_m,
             # of) the binary mask below: pec_mask stays in the contract as the
             # fully-covered test and as the staircase path's own geometry.
             if c_span is not None:
-                _conformal_pec_body(covered, body_shape, nodes_mm, c_span,
-                                    c_ovr, on_layer=_on_layer, pool=pool)
+                # Its two passes share their z-node planes (see _memoized).
+                with _memoized(body_shape):
+                    _conformal_pec_body(covered, body_shape, nodes_mm, c_span,
+                                        c_ovr, on_layer=_on_layer, pool=pool)
             if smooth:
                 # Subpixel dielectric: fine-sample the body over its bbox
                 # sub-block and reduce to an anisotropic effective permittivity

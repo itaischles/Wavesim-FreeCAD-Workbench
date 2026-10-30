@@ -175,7 +175,7 @@ def _check_document(path):
             try:
                 t0 = time.perf_counter()
                 (_spec, arrays), sections = _count_sections(
-                    lambda: voxelize.build_job_from_document(doc))
+                    lambda: voxelize.build_job_from_document(doc, reuse=False))
                 elapsed = time.perf_counter() - t0
             finally:
                 if undo is not None:

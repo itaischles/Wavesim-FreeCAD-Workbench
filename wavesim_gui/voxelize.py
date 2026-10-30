@@ -2229,13 +2229,22 @@ def write_materials(workdir, arrays):
     either kind, so the runner is none the wiser.
     """
     import os
+    import shutil
 
     import numpy as np
 
-    np.savez_compressed(os.path.join(workdir, "materials.npz"), **arrays)
+    path = os.path.join(workdir, "materials.npz")
+    # Arrays from the voxelisation cache are already on disk, compressed, to
+    # the bit; copying that file is faster than deflating them again.
+    cached = getattr(arrays, "npz_path", None)
+    if cached and os.path.isfile(cached):
+        shutil.copyfile(cached, path)
+        return
+    np.savez_compressed(path, **arrays)
 
 
-def build_job_from_document(doc, steps=None, fmax=30.0e9, progress=None):
+def build_job_from_document(doc, steps=None, fmax=30.0e9, progress=None,
+                            reuse=True):
     """Build a solver job from the active simulation's materials.
 
     Returns ``(spec, arrays)`` where *spec* is the ``job.json`` dict and *arrays*
@@ -2245,6 +2254,11 @@ def build_job_from_document(doc, steps=None, fmax=30.0e9, progress=None):
 
     Raises :class:`GridRequiredError` if materials are assigned but no Domain
     object exists (it should always exist, created with the simulation).
+
+    With *reuse* (the default) the voxelisation goes through
+    :mod:`wavesim_gui.voxcache`, which hands back the document's last one when
+    nothing it depends on has changed. Gates that time or compare voxelisations
+    pass ``reuse=False``, or every pass after their first would be a cache hit.
     """
     from wavesim_gui.commands import active_simulation
     from wavesim_gui import materials as materials_mod
@@ -2355,7 +2369,15 @@ def build_job_from_document(doc, steps=None, fmax=30.0e9, progress=None):
         }
     # Grow the grid to include every source position and snapshot slice, so an
     # input outside the material bounds still lands inside it.
-    vox = voxelize_materials(
+    if reuse:
+        from wavesim_gui import voxcache
+
+        mode = "electrostatic" if electrostatic else "fdtd"
+        sweep = (lambda *args, **kwargs:
+                 voxcache.voxelize(doc, mode, *args, **kwargs))
+    else:
+        sweep = voxelize_materials
+    vox = sweep(
         materials, cell_size_m,
         spacing_lo_m=spacing_lo, spacing_hi_m=spacing_hi,
         pad_lo=pad_lo, pad_hi=pad_hi,

@@ -30,6 +30,17 @@ section is started above it.
   field lines (along E = −∇φ) drawn over them, which you can turn off with the
   **Field lines** checkbox. They also get the **Vectors** arrow overlay, with
   arrows for E = −∇φ, turned on by default.
+- Running a model again no longer voxelises it again when nothing that affects
+  the voxels has changed: geometry, materials, mesh, background, subpixel and
+  conformal settings. Changing monitors (inside the domain), run time or port
+  drives now starts the solver straight away (measured: 64.5 s down to 0.4 s
+  on `tori_and_sphere_ES`, 12.5 s down to 0.04 s on the reference coax). This
+  also works across Run, Port Matrix and Compute
+  Mode, and after closing and reopening the document. The console says when a
+  voxelisation is reused. The last full-wave and the last electrostatic
+  voxelisation are kept separately, in a `voxel_cache` folder next to the
+  document's `run` folder. Turn it off under *Wavesim → Settings →
+  Voxelisation reuse*.
 
 ### Changed
 

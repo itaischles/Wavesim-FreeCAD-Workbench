@@ -62,6 +62,10 @@ DEFAULTS = {
     # revert switch if the pool ever misbehaves. The parallel and serial paths
     # produce bit-identical arrays (tools/check_sectionpool.py).
     "voxelize_workers": "auto",
+    # Whether a run may reuse the document's last voxelisation when nothing it
+    # depends on has changed (wavesim_gui.voxcache). 'on' or 'off'; a string
+    # rather than a bool because a stored False would read as unset.
+    "voxel_cache": "on",
     # How many discrete colours a snapshot map uses when its Banding box is
     # ticked: the selected colour map cut into this many flat bands, so equal
     # steps of the field read as contour-like steps of colour.
@@ -76,6 +80,7 @@ _ENV_OVERRIDES = {
     "ngspice_dll": "WAVESIM_NGSPICE_DLL",
     "backend": "WAVESIM_BACKEND",
     "voxelize_workers": "WAVESIM_VOXELIZE_WORKERS",
+    "voxel_cache": "WAVESIM_VOXEL_CACHE",
     "colormap_bands": "WAVESIM_COLORMAP_BANDS",
 }
 
@@ -184,6 +189,11 @@ def get_voxelize_workers():
     return get("voxelize_workers") or "auto"
 
 
+def get_voxel_cache():
+    """``'on'`` (the default) to reuse an unchanged voxelisation, ``'off'`` not to."""
+    return get("voxel_cache") or "on"
+
+
 # Bounds on the band count: two is the fewest that still says anything, and
 # past a few dozen the bands are too thin to tell from a continuous map.
 BANDS_MIN, BANDS_MAX = 2, 64
@@ -255,6 +265,10 @@ if _GUI_AVAILABLE:
         ("auto", "Parallel (one process per core, minus one)"),
         ("1", "Serial (one process)"),
     ]
+    _CACHE_CHOICES = [
+        ("on", "Reuse the last one when the model is unchanged"),
+        ("off", "Always voxelise again"),
+    ]
 
     class SettingsDialog(QtWidgets.QDialog):
         """Modal dialog to view and edit the workbench solver paths."""
@@ -290,6 +304,14 @@ if _GUI_AVAILABLE:
                 self._workers_combo.addItem(label, value)
             idx = self._workers_combo.findData(current["voxelize_workers"])
             self._workers_combo.setCurrentIndex(idx if idx >= 0 else 0)
+
+            # Voxelisation reuse. 'Always voxelise again' is the escape hatch if
+            # a stored voxelisation is ever suspected of being stale.
+            self._cache_combo = QtWidgets.QComboBox()
+            for value, label in _CACHE_CHOICES:
+                self._cache_combo.addItem(label, value)
+            idx = self._cache_combo.findData(current["voxel_cache"])
+            self._cache_combo.setCurrentIndex(idx if idx >= 0 else 0)
 
             form.addRow(
                 "Solver Python interpreter:",
@@ -332,6 +354,7 @@ if _GUI_AVAILABLE:
 
             form.addRow("Solver backend:", self._backend_combo)
             form.addRow("Voxelisation:", self._workers_combo)
+            form.addRow("Voxelisation reuse:", self._cache_combo)
             form.addRow("Colour map bands:", self._bands_spin)
             layout.addLayout(form)
 
@@ -415,6 +438,7 @@ if _GUI_AVAILABLE:
             ngspice_dll = self._ngspice_edit.text().strip()
             backend = self._backend_combo.currentData() or "auto"
             workers = self._workers_combo.currentData() or "auto"
+            voxel_cache = self._cache_combo.currentData() or "on"
             bands = int(self._bands_spin.value())
 
             warnings = []
@@ -466,6 +490,7 @@ if _GUI_AVAILABLE:
                     "ngspice_dll": ngspice_dll,
                     "backend": backend,
                     "voxelize_workers": workers,
+                    "voxel_cache": voxel_cache,
                     "colormap_bands": bands,
                 }
             ):

@@ -254,7 +254,8 @@ def check_geometry_reaches_absorber():
               "x=%.3f" % nodes[0][6])
         # The warning must stay quiet: this section really is invariant along x
         # and y through its shells.
-        spec, arrays = vox_mod.build_job_from_document(doc, steps=1)
+        spec, arrays = vox_mod.build_job_from_document(doc, steps=1,
+                                                       reuse=False)
         params = domain_mod.domain_grid_params(dom)
         msgs = list(vox_mod.pml_shell_warnings(
             arrays, params["pad_lo"], params["pad_hi"], params["pml_faces"]))
@@ -284,7 +285,8 @@ def check_shell_warning():
     doc, sim, dom = _document(stub, spacing_mm=10.0, d_pml=6,
                               spacings={"x0": 0.0, "x1": 0.0})
     try:
-        _spec, arrays = vox_mod.build_job_from_document(doc, steps=1)
+        _spec, arrays = vox_mod.build_job_from_document(doc, steps=1,
+                                                        reuse=False)
         params = domain_mod.domain_grid_params(dom)
         msgs = list(vox_mod.pml_shell_warnings(
             arrays, params["pad_lo"], params["pad_hi"], params["pml_faces"]))

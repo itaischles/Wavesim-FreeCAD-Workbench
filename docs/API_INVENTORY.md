@@ -5,7 +5,7 @@ that are opened by double-clicking objects) and of the GUI-free scripting API
 call(s) that replace each one. It is written for workbench developers and for
 whoever builds the AI agent, which drives FreeCAD through the
 [Agent bridge](#4-agent-bridge). The MCP server lives in the
-`wavesim-ai-harness` repository.
+[Wavesim-AI-Agent](https://github.com/itaischles/Wavesim-AI-Agent) repository.
 
 Contents
 
@@ -1384,7 +1384,7 @@ those two values for a single job.
 ## 4. Agent bridge
 
 Source: [`wavesim_gui/bridge.py`](../wavesim_gui/bridge.py). An XML-RPC
-listener lets the MCP server in `wavesim-ai-harness` drive this FreeCAD
+listener lets the MCP server in [Wavesim-AI-Agent](https://github.com/itaischles/Wavesim-AI-Agent) drive this FreeCAD
 session.
 
 **Security.**
@@ -1466,7 +1466,7 @@ and `WAVESIM_BRIDGE_TOKEN` override absent stored values.
 ## 5. Alphabetical list of every registered API function
 
 The list below was generated from `wavesim_agent_mcp/api_catalog.json` in the
-`wavesim-ai-harness` repository (API version 1, workbench 0.2.0.dev0), which is
+[Wavesim-AI-Agent](https://github.com/itaischles/Wavesim-AI-Agent) repository (API version 1, workbench 0.2.0.dev0), which is
 a dump of the bridge's `list_functions`. It contains 79 functions. The first
 argument is `sim` or `doc` as described in [§1.2](#12-conventions-api_common-module-docstring).
 

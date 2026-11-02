@@ -15,9 +15,9 @@ section is started above it.
 
 ### Added
 
-- An **Agent bridge** for AI-agent access (new *Agent Bridge On/Off* button
-  next to *Settings*). When switched on, an AI agent in VS Code (through the
-  MCP server of the `wavesim-ai-harness` repository) can build and run
+- An **Agent bridge** for AI-agent access (new *Agent Bridge On/Off* button,
+  a chain-link icon next to *Settings*). When switched on, an AI agent in VS Code (through the
+  MCP server of the [Wavesim-AI-Agent](https://github.com/itaischles/Wavesim-AI-Agent) repository) can build and run
   simulations in this FreeCAD window while you watch. It listens on
   127.0.0.1 only, needs a token, and can call only the scripting API below —
   it cannot run arbitrary code. The status bar shows *Agent bridge: ON* while

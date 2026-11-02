@@ -39,11 +39,11 @@ print(api.validate_setup(sim))
 
 ## Agent bridge
 
-The bridge lets the Wavesim AI agent (VS Code + the `wavesim-ai-harness` MCP
+The bridge lets the Wavesim AI agent (VS Code + the [Wavesim-AI-Agent](https://github.com/itaischles/Wavesim-AI-Agent) MCP
 server) work in this FreeCAD window. You see every object appear as the agent
 builds the model, and you can undo its steps.
 
-**Switching it on.** Press *Agent Bridge On/Off* in the Wavesim toolbar (next to
+**Switching it on.** Press *Agent Bridge On/Off* (chain-link icon) in the Wavesim toolbar (next to
 *Settings*). The status bar shows **Agent bridge: ON (127.0.0.1:9875)**. Press
 again to switch it off.
 

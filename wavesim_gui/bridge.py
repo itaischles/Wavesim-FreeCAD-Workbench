@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """Agent bridge: lets an AI agent drive this FreeCAD session over XML-RPC.
 
-The MCP server in the ``wavesim-ai-harness`` repository talks to FreeCAD
+The MCP server in the ``Wavesim-AI-Agent`` repository talks to FreeCAD
 through this listener. Security and safety rules, all enforced here:
 
 * bound to **127.0.0.1 only**; every call carries the **token** stored in the
@@ -471,7 +471,7 @@ if _GUI_AVAILABLE:
 
     _ICON = os.path.join(FreeCAD.getUserAppDataDir(), "Mod",
                          "wavesim-workbench", "Resources", "icons",
-                         "settings.svg")
+                         "agent_bridge.svg")
 
     class CommandAgentBridge(object):
         """Toggle the Agent bridge (opt-in AI agent access)."""

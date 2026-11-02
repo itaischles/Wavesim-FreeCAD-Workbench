@@ -67,7 +67,7 @@ DEFAULTS = {
     # steps of the field read as contour-like steps of colour.
     "colormap_bands": 12,
     # Agent bridge: the XML-RPC listener an AI agent (via the MCP server in the
-    # wavesim-ai-harness repo) uses to drive this FreeCAD session. Off unless
+    # Wavesim-AI-Agent repo) uses to drive this FreeCAD session. Off unless
     # switched on with the toolbar toggle or auto-started here. Bound to
     # 127.0.0.1 only; every call must carry the token (generated on first use).
     "bridge_autostart": False,

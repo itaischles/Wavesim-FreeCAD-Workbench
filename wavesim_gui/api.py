@@ -23,8 +23,8 @@ from wavesim_gui.api_common import (  # noqa: F401
 )
 
 _MODULES = (
-    "api_simulation", "api_geometry", "api_excitation", "api_monitors",
-    "api_params", "api_preview", "api_run",
+    "api_document", "api_simulation", "api_geometry", "api_excitation",
+    "api_monitors", "api_params", "api_preview", "api_run",
 )
 
 __all__ = ["API_VERSION", "ApiError", "describe", "registered_functions",

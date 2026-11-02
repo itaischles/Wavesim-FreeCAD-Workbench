@@ -66,6 +66,13 @@ DEFAULTS = {
     # ticked: the selected colour map cut into this many flat bands, so equal
     # steps of the field read as contour-like steps of colour.
     "colormap_bands": 12,
+    # Agent bridge: the XML-RPC listener an AI agent (via the MCP server in the
+    # wavesim-ai-harness repo) uses to drive this FreeCAD session. Off unless
+    # switched on with the toolbar toggle or auto-started here. Bound to
+    # 127.0.0.1 only; every call must carry the token (generated on first use).
+    "bridge_autostart": False,
+    "bridge_port": 9875,
+    "bridge_token": "",
 }
 
 # Environment variable that overrides each key when the stored value is absent.
@@ -77,6 +84,9 @@ _ENV_OVERRIDES = {
     "backend": "WAVESIM_BACKEND",
     "voxelize_workers": "WAVESIM_VOXELIZE_WORKERS",
     "colormap_bands": "WAVESIM_COLORMAP_BANDS",
+    "bridge_autostart": "WAVESIM_BRIDGE_AUTOSTART",
+    "bridge_port": "WAVESIM_BRIDGE_PORT",
+    "bridge_token": "WAVESIM_BRIDGE_TOKEN",
 }
 
 
@@ -201,6 +211,79 @@ def get_colormap_bands():
     except (TypeError, ValueError):
         bands = DEFAULTS["colormap_bands"]
     return max(BANDS_MIN, min(BANDS_MAX, bands))
+
+
+def get_bridge_autostart():
+    """Whether the Agent bridge starts with FreeCAD."""
+    value = get("bridge_autostart")
+    if isinstance(value, str):
+        return value.strip().lower() in ("1", "true", "yes", "on")
+    return bool(value)
+
+
+def get_bridge_port():
+    """TCP port of the Agent bridge on 127.0.0.1 (default 9875)."""
+    try:
+        port = int(get("bridge_port"))
+    except (TypeError, ValueError):
+        port = DEFAULTS["bridge_port"]
+    return port if 1024 <= port <= 65535 else DEFAULTS["bridge_port"]
+
+
+def _update_stored(**values):
+    """Change single keys in the settings file, leaving the others as stored.
+
+    Unlike :func:`save`, values that come only from the environment or the
+    defaults are not written into the file.
+    """
+    stored = {}
+    try:
+        with open(CONFIG_PATH, "r", encoding="utf-8") as handle:
+            loaded = json.load(handle)
+        if isinstance(loaded, dict):
+            stored = {k: v for k, v in loaded.items() if k in DEFAULTS}
+    except FileNotFoundError:
+        pass
+    except Exception:
+        return False
+    stored.update(values)
+    try:
+        with open(CONFIG_PATH, "w", encoding="utf-8") as handle:
+            json.dump(stored, handle, indent=2)
+        return True
+    except Exception as exc:  # pragma: no cover - diagnostic path
+        FreeCAD.Console.PrintError(
+            "Wavesim: could not write settings to {}: {}\n".format(
+                CONFIG_PATH, exc))
+        return False
+
+
+def get_bridge_token(create=True):
+    """The Agent bridge token; generated and stored on first use."""
+    token = get("bridge_token")
+    if not token and create:
+        import secrets
+        token = secrets.token_urlsafe(32)
+        _update_stored(bridge_token=token)
+    return token or ""
+
+
+def regenerate_bridge_token():
+    """Replace the token (an agent configured with the old one is locked out)."""
+    import secrets
+    token = secrets.token_urlsafe(32)
+    _update_stored(bridge_token=token)
+    return token
+
+
+def set_bridge_settings(autostart=None, port=None):
+    """Store the bridge's autostart flag and/or port."""
+    values = {}
+    if autostart is not None:
+        values["bridge_autostart"] = bool(autostart)
+    if port is not None:
+        values["bridge_port"] = int(port)
+    return _update_stored(**values) if values else True
 
 
 # --------------------------------------------------------------------------- #
@@ -335,6 +418,36 @@ if _GUI_AVAILABLE:
             form.addRow("Colour map bands:", self._bands_spin)
             layout.addLayout(form)
 
+            # Agent bridge: the token is shown so it can be copied into the
+            # AI agent's config (wavesim-agent config.json -> rpc_token).
+            bridge_box = QtWidgets.QGroupBox("Agent bridge (AI agent access)")
+            bridge_form = QtWidgets.QFormLayout(bridge_box)
+            self._bridge_autostart = QtWidgets.QCheckBox(
+                "Start the Agent bridge when FreeCAD starts")
+            self._bridge_autostart.setChecked(get_bridge_autostart())
+            self._bridge_port = QtWidgets.QSpinBox()
+            self._bridge_port.setRange(1024, 65535)
+            self._bridge_port.setValue(get_bridge_port())
+            self._bridge_token = QtWidgets.QLineEdit(
+                current.get("bridge_token", ""))
+            self._bridge_token.setReadOnly(True)
+            self._bridge_token.setPlaceholderText(
+                "(generated when the bridge is first enabled)")
+            token_row = QtWidgets.QWidget()
+            token_layout = QtWidgets.QHBoxLayout(token_row)
+            token_layout.setContentsMargins(0, 0, 0, 0)
+            token_layout.addWidget(self._bridge_token)
+            copy_btn = QtWidgets.QPushButton("Copy")
+            copy_btn.clicked.connect(self._copy_token)
+            token_layout.addWidget(copy_btn)
+            regen_btn = QtWidgets.QPushButton("Regenerate")
+            regen_btn.clicked.connect(self._regenerate_token)
+            token_layout.addWidget(regen_btn)
+            bridge_form.addRow(self._bridge_autostart)
+            bridge_form.addRow("Port (127.0.0.1):", self._bridge_port)
+            bridge_form.addRow("Token:", token_row)
+            layout.addWidget(bridge_box)
+
             hint = QtWidgets.QLabel(
                 "These point the workbench at the external conda environment "
                 "and the Wavesim solver source. Stored at:\n{}".format(
@@ -407,6 +520,19 @@ if _GUI_AVAILABLE:
             if chosen:
                 self._ngspice_edit.setText(chosen)
 
+        def _copy_token(self):
+            token = self._bridge_token.text() or get_bridge_token()
+            self._bridge_token.setText(token)
+            QtWidgets.QApplication.clipboard().setText(token)
+
+        def _regenerate_token(self):
+            answer = QtWidgets.QMessageBox.question(
+                self, "Wavesim Settings",
+                "Replace the Agent bridge token? An agent configured with "
+                "the old token will be refused until its config is updated.")
+            if answer == QtWidgets.QMessageBox.Yes:
+                self._bridge_token.setText(regenerate_bridge_token())
+
         def accept(self):
             """Validate and persist before closing."""
             python_path = self._python_edit.text().strip()
@@ -467,6 +593,10 @@ if _GUI_AVAILABLE:
                     "backend": backend,
                     "voxelize_workers": workers,
                     "colormap_bands": bands,
+                    "bridge_autostart": self._bridge_autostart.isChecked(),
+                    "bridge_port": int(self._bridge_port.value()),
+                    "bridge_token": (self._bridge_token.text()
+                                     or get_bridge_token(create=False)),
                 }
             ):
                 FreeCAD.Console.PrintMessage(

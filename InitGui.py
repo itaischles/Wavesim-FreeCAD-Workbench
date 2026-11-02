@@ -140,7 +140,17 @@ class WavesimWorkbench(Gui.Workbench):
         # Import failures are reported rather than silently aborting Initialize.
         try:
             import wavesim_settings  # noqa: F401  (registers Gui.addCommand)
-            add_group("Wavesim_Settings")
+            settings_ids = ["Wavesim_Settings"]
+            # The Agent bridge toggle (opt-in AI agent access) sits beside
+            # Settings, where its port and token are configured.
+            try:
+                from wavesim_gui import bridge  # noqa: F401  (registers it)
+                settings_ids.insert(0, "Wavesim_AgentBridge")
+            except Exception as exc:
+                FreeCAD.Console.PrintError(
+                    "Wavesim: failed to load the Agent bridge ({}: {})\n"
+                    .format(type(exc).__name__, exc))
+            add_group(*settings_ids)
         except Exception as exc:
             FreeCAD.Console.PrintError(
                 "Wavesim: failed to load settings module ({}: {})\n".format(
@@ -193,3 +203,16 @@ class WavesimWorkbench(Gui.Workbench):
 WavesimWorkbench.Icon = WB_ICON
 
 Gui.addWorkbench(WavesimWorkbench())
+
+# Agent bridge auto-start (Wavesim -> Settings): once the event loop runs, so
+# the main window and status bar exist. A no-op unless it is switched on.
+try:
+    from PySide import QtCore as _QtCore
+
+    _QtCore.QTimer.singleShot(
+        2500,
+        lambda: __import__("wavesim_gui.bridge",
+                           fromlist=["autostart"]).autostart())
+except Exception as _exc:
+    FreeCAD.Console.PrintError(
+        "Wavesim: Agent bridge auto-start not scheduled ({})\n".format(_exc))

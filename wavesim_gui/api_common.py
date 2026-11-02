@@ -233,6 +233,38 @@ def transaction(doc, title):
         doc.commitTransaction()
 
 
+@contextlib.contextmanager
+def capture_warnings():
+    """Collect what the workbench prints as warnings/errors while running.
+
+    Long operations (voxelization, results loading) report problems through
+    ``FreeCAD.Console``; an API caller should get them back too. The messages
+    still reach the report view. Yields the list being filled.
+    """
+    console = FreeCAD.Console
+    collected = []
+    originals = {}
+    for name in ("PrintWarning", "PrintError"):
+        original = getattr(console, name)
+        originals[name] = original
+
+        def wrapper(message, _orig=original):
+            collected.append(str(message).strip())
+            return _orig(message)
+        try:
+            setattr(console, name, wrapper)
+        except Exception:
+            originals.pop(name, None)
+    try:
+        yield collected
+    finally:
+        for name, original in originals.items():
+            try:
+                setattr(console, name, original)
+            except Exception:
+                pass
+
+
 # --------------------------------------------------------------------------- #
 # Units and quantities
 # --------------------------------------------------------------------------- #

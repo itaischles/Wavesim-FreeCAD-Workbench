@@ -385,6 +385,8 @@ def _shape_digest(shape):
     }
 
 
+_RESULT_TYPES = {"Results", "Result", "ResultPort", "ResultMatrix"}
+
 _SETUP_SKIP = {"Proxy", "ExpressionEngine", "Label2", "Visibility", "Shape",
                "_GroupTouched", "NodesX", "NodesY", "NodesZ", "SnapsX",
                "SnapsY", "SnapsZ", "DomainMin", "DomainMax", "PmlMin",
@@ -455,12 +457,12 @@ def model_fingerprint(doc=None):
     count = 0
     while stack:
         obj = stack.pop(0)
-        if obj.TypeId.startswith("App::DocumentObjectGroup"):
-            if obj.Label == "Results" or obj.Name.startswith("Results"):
-                continue
-            stack.extend(obj.Group)
+        # Loaded results (Results / port groups / Port Matrix) describe a
+        # run, not the model, so loading them must not change the hash.
+        if c.wavesim_type(obj) in _RESULT_TYPES:
             continue
-        if c.wavesim_type(obj) in ("Result", "Results"):
+        if obj.TypeId.startswith("App::DocumentObjectGroup"):
+            stack.extend(obj.Group)
             continue
         setup[obj.Name] = {"type": c.wavesim_type(obj) or obj.TypeId,
                            "props": _object_props(obj, _SETUP_SKIP)}

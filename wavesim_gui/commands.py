@@ -423,6 +423,77 @@ def extract_capacitance(sim):
     return bool(getattr(sim, "ExtractCapacitance", True))
 
 
+def apply_simulation_settings(sim, time_unit=None, frequency_unit=None,
+                              max_time_s=None, max_frequency_hz=None,
+                              subpixel=None, conformal_pec=None,
+                              solver_mode_label=None, extract_cap=None,
+                              previous_max_frequency_hz=None):
+    """Write the simulation-wide settings the Simulation panel edits.
+
+    The single write path shared by the Simulation task panel and the scripting
+    API. ``None`` leaves a setting alone. A property driven by an expression is
+    never written (the expression owns it). When the max frequency or the solver
+    mode changes, the Domain's cell size is re-derived from its new driver, as
+    the panel always did. *previous_max_frequency_hz* is the value to compare
+    against when the caller already changed the frequency (e.g. by binding an
+    expression). The caller owns the transaction and the recompute.
+    """
+    from wavesim_gui import domain as domain_mod
+
+    domain = domain_mod.find_domain(sim)
+    orig_max_freq = float(getattr(sim, "MaxFrequency", 0.0)) \
+        if previous_max_frequency_hz is None \
+        else float(previous_max_frequency_hz)
+    _ensure_solver_mode_props(sim)
+    orig_mode = str(getattr(sim, "SolverMode", MODE_LABELS[0]))
+    if time_unit is not None:
+        sim.TimeUnit = time_unit
+    if frequency_unit is not None:
+        sim.FrequencyUnit = frequency_unit
+    if max_time_s is not None and not expressions.is_bound(sim, "MaxTime"):
+        sim.MaxTime = float(max_time_s)
+    if subpixel is not None:
+        if not hasattr(sim, "SubpixelSmoothing"):
+            sim.addProperty(
+                "App::PropertyBool", "SubpixelSmoothing", "Run",
+                "Anti-staircase dielectric interfaces with an anisotropic "
+                "effective permittivity (subpixel smoothing). PEC is "
+                "unaffected.",
+            )
+        sim.SubpixelSmoothing = bool(subpixel)
+    _ensure_conformal_props(sim)
+    if conformal_pec is not None:
+        sim.ConformalPEC = bool(conformal_pec)
+    if solver_mode_label is not None:
+        sim.SolverMode = solver_mode_label
+    if extract_cap is not None:
+        sim.ExtractCapacitance = bool(extract_cap)
+    _drop_mode_convergence_props(sim)
+    if max_frequency_hz is not None \
+            and not expressions.is_bound(sim, "MaxFrequency"):
+        sim.MaxFrequency = float(max_frequency_hz)
+    new_max_freq = float(getattr(sim, "MaxFrequency", 0.0))
+    # The default cell size is derived, so when its driver changes re-derive
+    # the Domain's cell sizes -- the mesh display and derived counts update
+    # immediately without opening the Domain panel. Two things can change it:
+    # the max frequency (full wave) and the solver mode itself, which swaps the
+    # driver from the wavelength to the geometry. Left alone otherwise, so
+    # custom cell sizes survive an unrelated edit (e.g. a display unit).
+    freq_changed = abs(new_max_freq - orig_max_freq) > 1.0e-6
+    mode_changed = str(getattr(sim, "SolverMode", "")) != orig_mode
+    if domain is not None and (freq_changed or mode_changed):
+        size_m = domain_mod.suggested_cell_size_m(sim, domain=domain)
+        if size_m is not None:
+            size_mm = "{} mm".format(size_m * 1000.0)
+            domain.Dx = domain.Dy = domain.Dz = size_mm
+    # The mode is a property of the *Simulation*, so writing it leaves the
+    # Domain untouched and the recompute would skip it -- and the Domain is what
+    # reads the mode to decide its absorber shell and its wavelength caps.
+    if domain is not None and mode_changed:
+        domain.touch()
+    return freq_changed, mode_changed
+
+
 # --------------------------------------------------------------------------- #
 # GUI: view provider + commands
 # --------------------------------------------------------------------------- #
@@ -713,63 +784,24 @@ if _GUI_AVAILABLE:
                 self._steps.setText("(set a max time and grid cell size)")
 
         def accept(self):
-            from wavesim_gui import domain as domain_mod
-
             doc = self.obj.Document
             doc.openTransaction("Wavesim: Edit Simulation")
-            self.obj.TimeUnit = self._time.currentText()
-            self.obj.FrequencyUnit = self._freq.currentText()
-            # An expression-driven property owns its own value; writing it here
-            # would be undone by the next recompute anyway (the row is greyed).
-            if not expressions.is_bound(self.obj, "MaxTime"):
-                self.obj.MaxTime = units.time_to_si(
-                    self._max_time.value(), self._time_unit
-                )
-            if not hasattr(self.obj, "SubpixelSmoothing"):
-                self.obj.addProperty(
-                    "App::PropertyBool", "SubpixelSmoothing", "Run",
-                    "Anti-staircase dielectric interfaces with an anisotropic "
-                    "effective permittivity (subpixel smoothing). PEC is "
-                    "unaffected.",
-                )
-            self.obj.SubpixelSmoothing = self._subpixel.isChecked()
-            _ensure_conformal_props(self.obj)
-            self.obj.ConformalPEC = self._conformal.isChecked()
-            _ensure_solver_mode_props(self.obj)
-            self.obj.SolverMode = self._mode.currentText()
-            self.obj.ExtractCapacitance = self._capacitance.isChecked()
-            _drop_mode_convergence_props(self.obj)
-            if expressions.is_bound(self.obj, "MaxFrequency"):
-                new_max_freq = float(getattr(self.obj, "MaxFrequency", 0.0))
-            else:
-                new_max_freq = units.freq_to_si(
-                    self._max_freq.value(), self._freq_unit
-                )
-                self.obj.MaxFrequency = new_max_freq
-            # The default cell size is derived, so when its driver changes
-            # re-derive the Domain's cell sizes and recompute -- the mesh display
-            # and derived counts update immediately without opening the Domain
-            # panel. Two things can change it: the max frequency (full wave) and
-            # the solver mode itself, which swaps the driver from the wavelength
-            # to the geometry. ``SolverMode`` is already written above, so the
-            # lookup below reads the new mode. Left alone otherwise, so custom
-            # cell sizes survive an unrelated edit (e.g. a display unit).
-            domain = self._domain
-            freq_changed = abs(new_max_freq - self._orig_max_freq) > 1.0e-6
-            mode_changed = self._mode.currentText() != self._orig_mode
-            if domain is not None and (freq_changed or mode_changed):
-                size_m = domain_mod.suggested_cell_size_m(self.obj, domain=domain)
-                if size_m is not None:
-                    size_mm = "{} mm".format(size_m * 1000.0)
-                    domain.Dx = domain.Dy = domain.Dz = size_mm
-            # The mode is a property of the *Simulation*, so writing it leaves
-            # the Domain untouched and the recompute below would skip it -- and
-            # the Domain is what reads the mode to decide its absorber shell and
-            # its wavelength caps. Without this the mesh, the cell counts and the
-            # drawn PML box all keep the previous mode's answer until something
-            # else happens to touch the Domain.
-            if domain is not None and mode_changed:
-                domain.touch()
+            # Shared with the scripting API: expression-bound properties are
+            # skipped and the Domain cell size re-derived when its driver
+            # (max frequency / solver mode) changes.
+            apply_simulation_settings(
+                self.obj,
+                time_unit=self._time.currentText(),
+                frequency_unit=self._freq.currentText(),
+                max_time_s=units.time_to_si(
+                    self._max_time.value(), self._time_unit),
+                max_frequency_hz=units.freq_to_si(
+                    self._max_freq.value(), self._freq_unit),
+                subpixel=self._subpixel.isChecked(),
+                conformal_pec=self._conformal.isChecked(),
+                solver_mode_label=self._mode.currentText(),
+                extract_cap=self._capacitance.isChecked(),
+            )
             doc.commitTransaction()
             doc.recompute()
             Gui.Control.closeDialog()

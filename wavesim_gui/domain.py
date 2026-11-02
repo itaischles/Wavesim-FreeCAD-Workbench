@@ -2529,16 +2529,18 @@ if _GUI_AVAILABLE:
         Gui.Control.closeDialog()
         Gui.Control.showDialog(TaskDomainPanel(obj))
 
-    def create_domain(doc, sim):
-        """Create the Domain singleton under *sim* and return it.
 
-        Called by the New Simulation command; the domain starts empty and sizes
-        itself once material geometry is assigned.
-        """
-        domain = doc.addObject("App::FeaturePython", "Domain")
-        DomainObject(domain)
-        domain.Label = "Domain"
-        if domain.ViewObject is not None:
-            DomainViewProvider(domain.ViewObject)
-        sim.addObject(domain)
-        return domain
+def create_domain(doc, sim):
+    """Create the Domain singleton under *sim* and return it.
+
+    Called by the New Simulation command (via ``api.new_simulation``); the
+    domain starts empty and sizes itself once material geometry is assigned.
+    GUI-free: the view provider is attached only when a GUI is up.
+    """
+    domain = doc.addObject("App::FeaturePython", "Domain")
+    DomainObject(domain)
+    domain.Label = "Domain"
+    if _GUI_AVAILABLE and domain.ViewObject is not None:
+        DomainViewProvider(domain.ViewObject)
+    sim.addObject(domain)
+    return domain

@@ -643,6 +643,25 @@ def create_material(doc, sim, label, eps=1.0, mu=1.0, pec=False, color=None,
     return mat
 
 
+def assign_body(mat, body):
+    """Attach *body* to *mat* (detaching it from any other) and tint it.
+
+    The single assignment path, shared by tree drag & drop and the scripting
+    API. A PEC material gives the body its conductor properties. The caller
+    owns the transaction and the domain notification.
+    """
+    _detach_body(body, keep=mat)
+    bodies = getattr(mat, "Bodies", []) or []
+    if body not in bodies:
+        mat.Bodies = list(bodies) + [body]
+    if is_pec(mat):
+        # A conductor gains its potential property as soon as it becomes one,
+        # so the property editor offers it without a round trip through the
+        # material panel.
+        ensure_potential_prop(body)
+    _set_body_color(body, material_color(mat))
+
+
 def create_default_materials(doc, sim):
     """Seed a new simulation with the standard Vacuum and PEC materials.
 
@@ -741,16 +760,7 @@ if _GUI_AVAILABLE:
             mat = vobj.Object
             if not _is_solid_body(obj):
                 return
-            _detach_body(obj, keep=mat)
-            bodies = getattr(mat, "Bodies", []) or []
-            if obj not in bodies:
-                mat.Bodies = list(bodies) + [obj]
-            if is_pec(mat):
-                # A conductor gains its potential property as soon as it becomes
-                # one, so the property editor offers it without a round trip
-                # through the material panel.
-                ensure_potential_prop(obj)
-            _set_body_color(obj, material_color(mat))
+            assign_body(mat, obj)
             visibility.sync_from_children(mat)
             _after_bodies_changed(mat.Document)
 
@@ -1024,12 +1034,9 @@ if _GUI_AVAILABLE:
             )
             try:
                 if new:
-                    mat = doc.addObject("App::FeaturePython", "Material")
-                    MaterialObject(mat)
-                    if mat.ViewObject is not None:
-                        MaterialViewProvider(mat.ViewObject)
-                    materials_group(self.sim).addObject(mat)
-                    self.obj = mat
+                    # Same creation path as the scripting API; the label is
+                    # settled below from the Name field.
+                    self.obj = create_material(doc, self.sim, "Material")
                 self.obj.Pec = self._pec.isChecked()
                 # Skip any parameter an expression drives: it owns its value and
                 # would overwrite this one on the next recompute regardless.

@@ -814,40 +814,10 @@ if _GUI_AVAILABLE:
                 )
                 return
 
-            doc.openTransaction("Wavesim: New Simulation")
-            try:
-                sim = doc.addObject(
-                    "App::DocumentObjectGroupPython", "Simulation"
-                )
-                SimulationContainer(sim)
-                sim.Label = "Simulation"
-                if sim.ViewObject is not None:
-                    SimulationViewProvider(sim.ViewObject)
-
-                # The domain is a singleton created with the simulation; it
-                # starts empty and auto-sizes once material geometry is assigned.
-                # Created first so it sits immediately below the Simulation in the
-                # tree (above the Materials/Sources/Monitors groups).
-                from wavesim_gui import domain as domain_mod
-                domain = domain_mod.create_domain(doc, sim)
-
-                for name in _CHILD_GROUPS:
-                    grp = doc.addObject("App::DocumentObjectGroup", name)
-                    grp.Label = name
-                    sim.addObject(grp)
-
-                # Seed the two materials nearly every simulation needs, and make
-                # Vacuum the domain's default background (empty-voxel) medium.
-                from wavesim_gui import materials as materials_mod
-                vacuum, _pec = materials_mod.create_default_materials(doc, sim)
-                if hasattr(domain, "Background"):
-                    domain.Background = vacuum
-            except Exception:
-                doc.abortTransaction()
-                raise
-            doc.commitTransaction()
-
-            doc.recompute()
+            # One creation path: the scripting API builds the container, its
+            # Domain, child groups and default materials (and recomputes).
+            from wavesim_gui import api_simulation
+            api_simulation.new_simulation(doc)
             FreeCAD.Console.PrintMessage("Wavesim: created Simulation.\n")
 
         def IsActive(self):

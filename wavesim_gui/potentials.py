@@ -417,6 +417,31 @@ def color_for(volts, lo, hi):
     return tuple(a[k] + (b[k] - a[k]) * u for k in range(3))
 
 
+def write_conditions(sim, conditions, unset_mode=None):
+    """Store conductor conditions on the bodies, and the document fallback.
+
+    *conditions* is an iterable of ``(body, mode, volts, charge)`` (mode one of
+    ``materials.CONDUCTOR_MODES``; volts/charge may be None to keep the stored
+    number). *unset_mode* (``UNSET_GROUND``/``UNSET_FLOAT``) sets the
+    Simulation's ``UnsetConductorMode``; None leaves it. Shared by the
+    *Set Potential* panel and :func:`wavesim_gui.api_excitation.set_potential`.
+    The caller owns the transaction.
+    """
+    from wavesim_gui import commands as commands_mod
+
+    for body, mode, volts, charge in conditions:
+        # Both numbers go on the body whatever the condition, so a body
+        # switched to Default (or between the other two) comes back to what
+        # was typed rather than to zero.
+        materials_mod.set_conductor_mode(body, mode, volts=volts, charge=charge)
+    # Back-filled here as well as on restore, so a document from before the
+    # property existed can still be told what its unset conductors do.
+    commands_mod._ensure_solver_mode_props(sim)
+    if unset_mode is not None and hasattr(sim, "UnsetConductorMode"):
+        sim.UnsetConductorMode = commands_mod.UNSET_LABELS[
+            1 if unset_mode == UNSET_FLOAT else 0]
+
+
 if _GUI_AVAILABLE:
 
     from wavesim_gui import commands as commands_mod
@@ -790,19 +815,11 @@ if _GUI_AVAILABLE:
             self._harvest()
             self.doc.openTransaction("Wavesim: Conductor Potentials")
             try:
-                for rec in self.rows:
-                    # Both numbers go on the body whatever the condition, so a
-                    # row switched to Default (or between the other two) comes
-                    # back to what was typed rather than to zero.
-                    materials_mod.set_conductor_mode(
-                        rec["body"], rec["combo"].currentText(),
-                        volts=rec["volts"], charge=rec["charge"])
-                # Back-filled here as well as on restore, so a document from
-                # before the property existed can still be told what its
-                # unset conductors do.
-                commands_mod._ensure_solver_mode_props(self.sim)
-                if hasattr(self.sim, "UnsetConductorMode"):
-                    self.sim.UnsetConductorMode =                         commands_mod.UNSET_LABELS[self._default.currentIndex()]
+                write_conditions(
+                    self.sim,
+                    [(rec["body"], rec["combo"].currentText(), rec["volts"],
+                      rec["charge"]) for rec in self.rows],
+                    self._unset_mode())
             except Exception:
                 self.doc.abortTransaction()
                 self._preview.restore()

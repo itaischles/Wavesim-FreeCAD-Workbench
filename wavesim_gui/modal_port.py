@@ -1254,6 +1254,60 @@ def _describe(obj):
     return "{}, {}".format(face, exc.excitation_label(obj, sim))
 
 
+def auto_label(obj):
+    """The tree label a modal port carries until the user renames it."""
+    return "Modal Port ({})".format(_describe(obj))
+
+
+def create_modal_port(doc, sim):
+    """Add a modal port with the default settings to *sim*'s Sources group.
+
+    The single creation path shared by the *Add Modal Port* command (and its
+    legacy *Add TEM Source* id) and
+    :func:`wavesim_gui.api_excitation.add_modal_port`. Fresh ports carry no
+    conductor table; it is filled in when the settings are committed. The
+    caller owns the transaction.
+    """
+    port = doc.addObject("App::FeaturePython", "ModalPort")
+    ModalPortObject(port)
+    port.Label = auto_label(port)
+    if _GUI_AVAILABLE and port.ViewObject is not None:
+        ModalPortViewProvider(port.ViewObject)
+    sources_group(sim).addObject(port)
+    return port
+
+
+def scan_port_plane(sim, face, bounds_sel=None):
+    """``(signal, reference_names, scan)`` for the conductors on *face*'s plane.
+
+    *signal* is :func:`conductors_on_face` minus the reference (grounded)
+    regions, which carry no mode of their own -- the candidate rows of a fresh
+    conductor table, largest first. *scan* maps ``(id(body), sub)`` to every
+    record. Shared by the task panel and the scripting API so both build the
+    same default table.
+    """
+    dom = domain_mod.find_domain(sim) if sim else None
+    found = conductors_on_face(sim, dom, face, bounds_sel)
+    reference = [r["name"] for r in found if r["reference"]]
+    scan = {(id(r["body"]), r["sub"]): r for r in found}
+    return [r for r in found if not r["reference"]], reference, scan
+
+
+def default_drive_rows(signal):
+    """The table a fresh port opens with: every signal conductor, the first
+    (largest) energized. ``[]`` when the plane carries no PEC geometry, which
+    leaves the port on the legacy whole-face drive."""
+    return [{"body": r["body"], "sub": r["sub"], "energized": i == 0}
+            for i, r in enumerate(signal)]
+
+
+def force_spice_bc(obj):
+    """Force a SPICE-driven port's face to PML (it drives an interior plane)."""
+    sim = active_simulation(obj.Document)
+    domain_mod.set_face_bc(domain_mod.find_domain(sim), str(obj.Face),
+                           _SPICE_PORT_BC)
+
+
 # --------------------------------------------------------------------------- #
 # GUI: view provider, task panel, command
 # --------------------------------------------------------------------------- #
@@ -1772,8 +1826,7 @@ if _GUI_AVAILABLE:
                         for body, sub, energized, _index in rows]
             if not found:
                 return [{"body": None, "sub": "", "energized": True}]
-            return [{"body": r["body"], "sub": r["sub"], "energized": i == 0}
-                    for i, r in enumerate(found)]
+            return default_drive_rows(found)
 
         def _face_conductors(self):
             """``conductors_on_face`` for the currently selected face, minus the
@@ -1782,18 +1835,17 @@ if _GUI_AVAILABLE:
             Sets ``_reference_names`` as a side effect, for the panel's hint.
             """
             sim = active_simulation(self.obj.Document)
-            dom = domain_mod.find_domain(sim) if sim else None
             try:
-                found = conductors_on_face(
-                    sim, dom, self._selected_face(),
+                found, reference, scan = scan_port_plane(
+                    sim, self._selected_face(),
                     getattr(self.obj, "BoundsSel", None))
             except Exception as exc_:
                 FreeCAD.Console.PrintWarning(
                     "Wavesim: could not section the port plane: {}\n".format(exc_))
                 return []
-            self._reference_names = [r["name"] for r in found if r["reference"]]
-            self._scan = {(id(r["body"]), r["sub"]): r for r in found}
-            return [r for r in found if not r["reference"]]
+            self._reference_names = reference
+            self._scan = scan
+            return found
 
         def _load_rows(self, rows=None):
             """(Re)build the table and the per-row editors from *rows*."""
@@ -2166,9 +2218,7 @@ if _GUI_AVAILABLE:
             if self._selected_mode() == MODE_SPICE:
                 # Lumped launch on an interior plane: the face behind it must
                 # absorb, so force PML (a waveform port terminates itself).
-                domain_mod.set_face_bc(
-                    domain_mod.find_domain(active_simulation(doc)),
-                    face, _SPICE_PORT_BC)
+                force_spice_bc(self.obj)
             doc.commitTransaction()
             doc.recompute()
             domain_mod.notify_domain_inputs_changed(doc)
@@ -2359,12 +2409,7 @@ if _GUI_AVAILABLE:
 
             doc.openTransaction("Wavesim: Add Modal Port")
             try:
-                port = doc.addObject("App::FeaturePython", "ModalPort")
-                ModalPortObject(port)
-                port.Label = "Modal Port ({})".format(_describe(port))
-                if port.ViewObject is not None:
-                    ModalPortViewProvider(port.ViewObject)
-                sources_group(sim).addObject(port)
+                port = create_modal_port(doc, sim)
             except Exception:
                 doc.abortTransaction()
                 raise

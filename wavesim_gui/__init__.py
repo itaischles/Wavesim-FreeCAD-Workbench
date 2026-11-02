@@ -10,3 +10,7 @@ The workbench's ``Mod`` directory is on ``sys.path`` (that is how
 ``wavesim_settings`` is importable), so ``import wavesim_gui`` resolves both at
 startup and when FreeCAD restores scripted objects from a saved ``.FCStd``.
 """
+
+#: Workbench version (see CHANGELOG.md). Reported by the Agent bridge's
+#: ``bridge_info`` together with ``api_common.API_VERSION``.
+__version__ = "0.2.0.dev0"

@@ -1378,6 +1378,147 @@ def _sketch_monitor_label(obj):
 
 
 # --------------------------------------------------------------------------- #
+# Creation -- the one path shared by the commands and wavesim_gui.api_monitors
+# --------------------------------------------------------------------------- #
+#
+# Each ``new_*`` helper creates the monitor exactly as its command always has
+# (proxy, default settings, auto label, view provider, Monitors group) and does
+# nothing else: the caller owns the transaction, the recompute and whatever
+# comes after (the command opens the task panel, the API applies its arguments).
+
+def _attach_view(obj, provider_name):
+    """Attach the named view provider when there is a GUI and a ViewObject."""
+    if _GUI_AVAILABLE and getattr(obj, "ViewObject", None) is not None:
+        globals()[provider_name](obj.ViewObject)
+
+
+def _default_point_mm(sim):
+    """A sensible default monitor position: the domain/geometry centre."""
+    from wavesim_gui.source import default_position_mm
+    return default_position_mm(sim)
+
+
+def new_probe(sim):
+    """Create a Probe at the domain centre under *sim*'s Monitors group."""
+    doc = sim.Document
+    probe = doc.addObject("App::FeaturePython", "Probe")
+    ProbeObject(probe)
+    probe.Position = _default_point_mm(sim)
+    probe.Label = _probe_label(probe)
+    _attach_view(probe, "ProbeViewProvider")
+    monitors_group(sim).addObject(probe)
+    return probe
+
+
+def new_snapshot(sim):
+    """Create a Snapshot: XY plane through the domain centre (offset along z)."""
+    doc = sim.Document
+    centre = _default_point_mm(sim)
+    snap = doc.addObject("App::FeaturePython", "Snapshot")
+    SnapshotObject(snap)
+    snap.Offset = "{} mm".format(centre.z)
+    snap.Label = _snapshot_label(snap)
+    _attach_view(snap, "SnapshotViewProvider")
+    monitors_group(sim).addObject(snap)
+    return snap
+
+
+def new_energy_monitor(sim):
+    """Create the Energy monitor (callers enforce that there is only one)."""
+    doc = sim.Document
+    energy = doc.addObject("App::FeaturePython", "EnergyMonitor")
+    EnergyObject(energy)
+    energy.Label = _energy_label(energy)
+    _attach_view(energy, "EnergyViewProvider")
+    monitors_group(sim).addObject(energy)
+    return energy
+
+
+def new_dissipation_monitor(sim):
+    """Create the Dissipation monitor (callers enforce that there is only one)."""
+    doc = sim.Document
+    mon = doc.addObject("App::FeaturePython", "DissipationMonitor")
+    DissipationObject(mon)
+    mon.Label = _dissipation_label(mon)
+    _attach_view(mon, "DissipationViewProvider")
+    monitors_group(sim).addObject(mon)
+    return mon
+
+
+def new_path_monitor(sim, type_name):
+    """Create an empty Voltage or Current monitor (*type_name* picks which)."""
+    doc = sim.Document
+    mon = doc.addObject("App::FeaturePython", type_name)
+    PathMonitorObject(mon, type_name)
+    mon.Label = _path_monitor_label(mon)
+    _attach_view(mon, "PathMonitorViewProvider")
+    monitors_group(sim).addObject(mon)
+    return mon
+
+
+def new_field_line_monitor(sim, curve=None):
+    """Create a field-along-a-curve monitor, optionally on *curve* already.
+
+    Setting the curve here (before the label is made) is what the command does
+    with a curve that was selected when it was pressed; the caller then runs
+    the after-attach side effects (see :func:`attach_path`'s tail).
+    """
+    doc = sim.Document
+    mon = doc.addObject("App::FeaturePython", _FIELD_LINE_TYPE)
+    FieldLineObject(mon)
+    if curve is not None:
+        mon.Sketch = curve
+    mon.Label = _field_line_label(mon)
+    _attach_view(mon, "FieldLineViewProvider")
+    monitors_group(sim).addObject(mon)
+    return mon
+
+
+def _is_curve_object(obj):
+    """True if *obj* carries a curve Shape (edges, no solids) -- a sketch,
+    Draft wire, etc. -- and so can serve as a monitor integration path."""
+    shape = getattr(obj, "Shape", None)
+    if shape is None or getattr(shape, "Solids", None):
+        return False
+    return bool(getattr(shape, "Edges", None))
+
+
+def _after_path_changed(doc):
+    """Recompute and re-size the domain after a monitor's curve changes."""
+    from wavesim_gui import domain as domain_mod
+    # The monitor's own drawn path is rebuilt on recompute, which the
+    # domain notification skips when there is no domain yet.
+    doc.recompute()
+    domain_mod.notify_domain_inputs_changed(doc)
+
+
+def attach_path(mon, obj):
+    """Make curve *obj* the path of sketch monitor *mon* -- a tree drop.
+
+    Exactly what dropping a sketch onto the monitor does: link it, restart a
+    field-line monitor's vertex range, re-title an auto label, let the
+    monitor's eye follow the curve, recompute and re-size the domain. Returns
+    False (doing nothing) when *obj* carries no curve.
+    """
+    from wavesim_gui import visibility
+
+    if not _is_curve_object(obj):
+        return False
+    old_auto = _sketch_monitor_label(mon)
+    mon.Sketch = obj
+    if is_field_line_monitor(mon):
+        # Vertex indices belong to the old curve; a new one starts
+        # from its own start and runs to its own end.
+        mon.StartVertex = 0
+        mon.EndVertex = _CURVE_END
+        mon.Reversed = False
+    labels_mod.retitle(mon, old_auto, _sketch_monitor_label(mon))
+    visibility.sync_from_children(mon)
+    _after_path_changed(mon.Document)
+    return True
+
+
+# --------------------------------------------------------------------------- #
 # GUI: view providers, task panels, commands
 # --------------------------------------------------------------------------- #
 
@@ -1644,22 +1785,6 @@ if _GUI_AVAILABLE:
         __getstate__ = dumps
         __setstate__ = loads
 
-    def _is_curve_object(obj):
-        """True if *obj* carries a curve Shape (edges, no solids) -- a sketch,
-        Draft wire, etc. -- and so can serve as a monitor integration path."""
-        shape = getattr(obj, "Shape", None)
-        if shape is None or getattr(shape, "Solids", None):
-            return False
-        return bool(getattr(shape, "Edges", None))
-
-    def _after_path_changed(doc):
-        """Recompute and re-size the domain after a monitor's curve changes."""
-        from wavesim_gui import domain as domain_mod
-        # The monitor's own drawn path is rebuilt on recompute, which the
-        # domain notification skips when there is no domain yet.
-        doc.recompute()
-        domain_mod.notify_domain_inputs_changed(doc)
-
     # A path monitor's eye drives the sketch nested under it, exactly as a
     # Material's drives its bodies -- the monitor draws nothing itself, so
     # without this its eye would be a flag that does nothing.
@@ -1729,20 +1854,7 @@ if _GUI_AVAILABLE:
 
         def dropObject(self, vobj, obj):
             """Attach the dropped sketch as this monitor's integration path."""
-            mon = vobj.Object
-            if not _is_curve_object(obj):
-                return
-            old_auto = _sketch_monitor_label(mon)
-            mon.Sketch = obj
-            if is_field_line_monitor(mon):
-                # Vertex indices belong to the old curve; a new one starts
-                # from its own start and runs to its own end.
-                mon.StartVertex = 0
-                mon.EndVertex = _CURVE_END
-                mon.Reversed = False
-            labels_mod.retitle(mon, old_auto, _sketch_monitor_label(mon))
-            visibility.sync_from_children(mon)
-            _after_path_changed(mon.Document)
+            attach_path(vobj.Object, obj)
 
         def dumps(self):
             return None
@@ -2535,11 +2647,6 @@ if _GUI_AVAILABLE:
             )
         return sim
 
-    def _default_point_mm(sim):
-        """A sensible default monitor position: the domain/geometry centre."""
-        from wavesim_gui.source import default_position_mm
-        return default_position_mm(sim)
-
     class CommandAddProbe:
         """Create a field Probe at the domain centre and open its editor."""
 
@@ -2558,13 +2665,7 @@ if _GUI_AVAILABLE:
                 return
             doc.openTransaction("Wavesim: Add Probe")
             try:
-                probe = doc.addObject("App::FeaturePython", "Probe")
-                ProbeObject(probe)
-                probe.Position = _default_point_mm(sim)
-                probe.Label = _probe_label(probe)
-                if probe.ViewObject is not None:
-                    ProbeViewProvider(probe.ViewObject)
-                monitors_group(sim).addObject(probe)
+                probe = new_probe(sim)
             except Exception:
                 doc.abortTransaction()
                 raise
@@ -2591,17 +2692,9 @@ if _GUI_AVAILABLE:
             sim = _require_simulation()
             if sim is None:
                 return
-            centre = _default_point_mm(sim)
             doc.openTransaction("Wavesim: Add Snapshot")
             try:
-                snap = doc.addObject("App::FeaturePython", "Snapshot")
-                SnapshotObject(snap)
-                # Default XY plane through the domain centre (offset along z).
-                snap.Offset = "{} mm".format(centre.z)
-                snap.Label = _snapshot_label(snap)
-                if snap.ViewObject is not None:
-                    SnapshotViewProvider(snap.ViewObject)
-                monitors_group(sim).addObject(snap)
+                snap = new_snapshot(sim)
             except Exception:
                 doc.abortTransaction()
                 raise
@@ -2635,12 +2728,7 @@ if _GUI_AVAILABLE:
                 return
             doc.openTransaction("Wavesim: Add Energy Monitor")
             try:
-                energy = doc.addObject("App::FeaturePython", "EnergyMonitor")
-                EnergyObject(energy)
-                energy.Label = _energy_label(energy)
-                if energy.ViewObject is not None:
-                    EnergyViewProvider(energy.ViewObject)
-                monitors_group(sim).addObject(energy)
+                energy = new_energy_monitor(sim)
             except Exception:
                 doc.abortTransaction()
                 raise
@@ -2674,12 +2762,7 @@ if _GUI_AVAILABLE:
                 return
             doc.openTransaction("Wavesim: Add Dissipation Monitor")
             try:
-                mon = doc.addObject("App::FeaturePython", "DissipationMonitor")
-                DissipationObject(mon)
-                mon.Label = _dissipation_label(mon)
-                if mon.ViewObject is not None:
-                    DissipationViewProvider(mon.ViewObject)
-                monitors_group(sim).addObject(mon)
+                mon = new_dissipation_monitor(sim)
             except Exception:
                 doc.abortTransaction()
                 raise
@@ -2704,12 +2787,7 @@ if _GUI_AVAILABLE:
                 return
             doc.openTransaction(self._TRANSACTION)
             try:
-                mon = doc.addObject("App::FeaturePython", self._TYPE)
-                PathMonitorObject(mon, self._TYPE)
-                mon.Label = _path_monitor_label(mon)
-                if mon.ViewObject is not None:
-                    PathMonitorViewProvider(mon.ViewObject)
-                monitors_group(sim).addObject(mon)
+                mon = new_path_monitor(sim, self._TYPE)
             except Exception:
                 doc.abortTransaction()
                 raise
@@ -2784,14 +2862,8 @@ if _GUI_AVAILABLE:
                       if _is_curve_object(o)]
             doc.openTransaction("Wavesim: Add Field Along Curve")
             try:
-                mon = doc.addObject("App::FeaturePython", _FIELD_LINE_TYPE)
-                FieldLineObject(mon)
-                if len(picked) == 1:
-                    mon.Sketch = picked[0]
-                mon.Label = _field_line_label(mon)
-                if mon.ViewObject is not None:
-                    FieldLineViewProvider(mon.ViewObject)
-                monitors_group(sim).addObject(mon)
+                mon = new_field_line_monitor(
+                    sim, picked[0] if len(picked) == 1 else None)
             except Exception:
                 doc.abortTransaction()
                 raise

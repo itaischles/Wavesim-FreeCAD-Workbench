@@ -2517,6 +2517,10 @@ def build_job_from_document(doc, steps=None, fmax=30.0e9, progress=None,
         # which the runner resolves to the CUDA GPU when one is available).
         "steps": int(steps),
         "grid": grid,
+        # World position (metres) of the grid's first node. The solver works in
+        # its own frame and ignores it; it is provenance for tools that map
+        # results back onto the model (exporter, voxel preview).
+        "origin_m": [float(v) for v in origin_m],
         # Run provenance, echoed into summary.json by the runner alongside
         # backend/pml_faces: whether this run's dielectric boundaries were
         # smoothed, and whether its conductors were cut cells. Records what

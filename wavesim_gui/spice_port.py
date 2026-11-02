@@ -461,6 +461,56 @@ def _tem_describe(obj):
     return "{}, {}".format(getattr(obj, "Face", "z0"), _netlist_name(obj))
 
 
+def line_auto_label(obj):
+    """The tree label a SPICE line port carries until the user renames it."""
+    return "SPICE Line Port ({})".format(_line_describe(obj))
+
+
+def tem_auto_label(obj):
+    """The tree label a SPICE TEM port carries until the user renames it."""
+    return "SPICE TEM Port ({})".format(_tem_describe(obj))
+
+
+def create_spice_line_port(doc, sim):
+    """Add an unconfigured SPICE line port to *sim*'s Sources group.
+
+    The single creation path shared by the *Add SPICE Line Port* command and
+    :func:`wavesim_gui.api_excitation.add_spice_line_port`. The caller owns the
+    transaction.
+    """
+    port = doc.addObject("App::FeaturePython", "SpiceLinePort")
+    SpiceLinePortObject(port)
+    port.Label = line_auto_label(port)
+    if _GUI_AVAILABLE and port.ViewObject is not None:
+        SpiceLinePortViewProvider(port.ViewObject)
+    sources_group(sim).addObject(port)
+    return port
+
+
+def create_spice_tem_port(doc, sim):
+    """Add an unconfigured SPICE TEM port to *sim*'s Sources group.
+
+    The single creation path shared by the *Add SPICE TEM Port* command and
+    :func:`wavesim_gui.api_excitation.add_spice_tem_port`. Like the command it
+    leaves the face's boundary alone until the settings are committed
+    (:func:`force_tem_bc`). The caller owns the transaction.
+    """
+    port = doc.addObject("App::FeaturePython", "SpiceTEMPort")
+    SpiceTEMPortObject(port)
+    port.Label = tem_auto_label(port)
+    if _GUI_AVAILABLE and port.ViewObject is not None:
+        SpiceTEMPortViewProvider(port.ViewObject)
+    sources_group(sim).addObject(port)
+    return port
+
+
+def force_tem_bc(obj):
+    """Force a SPICE TEM port's launch face to PML (absorbing port)."""
+    domain_mod.set_face_bc(
+        domain_mod.find_domain(active_simulation(obj.Document)),
+        str(obj.Face), _PORT_BC)
+
+
 # --------------------------------------------------------------------------- #
 # GUI: view providers, task panels, commands
 # --------------------------------------------------------------------------- #
@@ -900,9 +950,7 @@ if _GUI_AVAILABLE:
                 self.obj, old_auto,
                 "SPICE TEM Port ({})".format(_tem_describe(self.obj)),
             )
-            domain_mod.set_face_bc(
-                domain_mod.find_domain(active_simulation(doc)), face, _PORT_BC
-            )
+            force_tem_bc(self.obj)
             doc.commitTransaction()
             doc.recompute()
             domain_mod.notify_domain_inputs_changed(doc)
@@ -965,12 +1013,7 @@ if _GUI_AVAILABLE:
                 return
             doc.openTransaction("Wavesim: Add SPICE Line Port")
             try:
-                port = doc.addObject("App::FeaturePython", "SpiceLinePort")
-                SpiceLinePortObject(port)
-                port.Label = "SPICE Line Port ({})".format(_line_describe(port))
-                if port.ViewObject is not None:
-                    SpiceLinePortViewProvider(port.ViewObject)
-                sources_group(sim).addObject(port)
+                port = create_spice_line_port(doc, sim)
             except Exception:
                 doc.abortTransaction()
                 raise
@@ -1002,12 +1045,7 @@ if _GUI_AVAILABLE:
                 return
             doc.openTransaction("Wavesim: Add SPICE TEM Port")
             try:
-                port = doc.addObject("App::FeaturePython", "SpiceTEMPort")
-                SpiceTEMPortObject(port)
-                port.Label = "SPICE TEM Port ({})".format(_tem_describe(port))
-                if port.ViewObject is not None:
-                    SpiceTEMPortViewProvider(port.ViewObject)
-                sources_group(sim).addObject(port)
+                port = create_spice_tem_port(doc, sim)
             except Exception:
                 doc.abortTransaction()
                 raise

@@ -376,6 +376,35 @@ def _describe(obj):
     )
 
 
+def auto_label(obj):
+    """The tree label a beam carries until the user renames it."""
+    return "Gaussian Beam ({})".format(_describe(obj))
+
+
+def create_gaussian_beam(doc, sim):
+    """Add a Gaussian beam with the default settings to *sim*'s Sources group.
+
+    The single creation path shared by the *Add Gaussian Beam* command and
+    :func:`wavesim_gui.api_excitation.add_gaussian_beam`. Like the command, it
+    does **not** touch the launch face's boundary condition -- that is forced
+    to PML when the settings are committed (:func:`force_launch_bc`). The
+    caller owns the transaction.
+    """
+    beam = doc.addObject("App::FeaturePython", "GaussianBeam")
+    GaussianBeamObject(beam)
+    beam.Label = auto_label(beam)
+    if _GUI_AVAILABLE and beam.ViewObject is not None:
+        GaussianBeamViewProvider(beam.ViewObject)
+    sources_group(sim).addObject(beam)
+    return beam
+
+
+def force_launch_bc(obj):
+    """Set the beam's launch face to PML (clean directional boundary launch)."""
+    sim = active_simulation(obj.Document)
+    domain_mod.set_face_bc(domain_mod.find_domain(sim), str(obj.Face), _PORT_BC)
+
+
 # --------------------------------------------------------------------------- #
 # GUI: view provider, task panel, command
 # --------------------------------------------------------------------------- #
@@ -753,8 +782,7 @@ if _GUI_AVAILABLE:
                 "Gaussian Beam ({})".format(_describe(self.obj)),
             )
             # Directional boundary launch: force the launch face to PML.
-            domain_mod.set_face_bc(domain_mod.find_domain(active_simulation(doc)),
-                                   face, _PORT_BC)
+            force_launch_bc(self.obj)
             doc.commitTransaction()
             doc.recompute()
             domain_mod.notify_domain_inputs_changed(doc)
@@ -814,12 +842,7 @@ if _GUI_AVAILABLE:
 
             doc.openTransaction("Wavesim: Add Gaussian Beam")
             try:
-                beam = doc.addObject("App::FeaturePython", "GaussianBeam")
-                GaussianBeamObject(beam)
-                beam.Label = "Gaussian Beam ({})".format(_describe(beam))
-                if beam.ViewObject is not None:
-                    GaussianBeamViewProvider(beam.ViewObject)
-                sources_group(sim).addObject(beam)
+                beam = create_gaussian_beam(doc, sim)
             except Exception:
                 doc.abortTransaction()
                 raise

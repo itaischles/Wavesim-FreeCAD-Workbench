@@ -238,6 +238,29 @@ def default_position_mm(sim):
     return FreeCAD.Vector(0, 0, 0)
 
 
+def auto_label(obj):
+    """The tree label a source carries until the user renames it."""
+    return "Source ({})".format(_describe(obj))
+
+
+def create_source(doc, sim):
+    """Add a point Source with the default settings to *sim*'s Sources group.
+
+    The single creation path shared by the *Add Point Source* command and
+    :func:`wavesim_gui.api_excitation.add_source`, so both produce the same
+    object: default position (domain centre), Ez, the catalogue's default
+    excitation and the auto label. The caller owns the transaction.
+    """
+    src = doc.addObject("App::FeaturePython", "Source")
+    SourceObject(src)
+    src.Position = default_position_mm(sim)
+    src.Label = auto_label(src)
+    if _GUI_AVAILABLE and src.ViewObject is not None:
+        SourceViewProvider(src.ViewObject)
+    sources_group(sim).addObject(src)
+    return src
+
+
 # --------------------------------------------------------------------------- #
 # GUI: view provider, task panel, command
 # --------------------------------------------------------------------------- #
@@ -822,13 +845,7 @@ if _GUI_AVAILABLE:
 
             doc.openTransaction("Wavesim: Add Source")
             try:
-                src = doc.addObject("App::FeaturePython", "Source")
-                SourceObject(src)
-                src.Position = default_position_mm(sim)
-                src.Label = "Source ({})".format(_describe(src))
-                if src.ViewObject is not None:
-                    SourceViewProvider(src.ViewObject)
-                sources_group(sim).addObject(src)
+                src = create_source(doc, sim)
             except Exception:
                 doc.abortTransaction()
                 raise

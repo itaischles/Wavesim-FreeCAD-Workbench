@@ -77,6 +77,7 @@ __all__ = [
     "MatrixPort", "FAMILY_MODAL", "FAMILY_LUMPED",
     "spec_ports", "document_ports", "select_ports", "common_excitation",
     "drive_job", "SweepError", "assemble", "drive_dir_name",
+    "document_spice_ports", "build_sweep", "export_drive_jobs", "document_spec",
 ]
 
 
@@ -172,11 +173,20 @@ def document_ports(sim):
     Nothing here reaches a job file: :func:`select_ports` re-binds the choice to
     the authoritative :func:`spec_ports` list by name once the real spec exists.
     """
+    if sim is None:
+        return []
+    return spec_ports(document_spec(sim))
+
+
+def document_spec(sim):
+    """The ``modal_ports``/``lumped_ports`` part of the job, built from the
+    document without voxelising -- see :func:`document_ports` for why only
+    the names, families and excitations in it are meaningful."""
     from wavesim_gui import lumped_port as lumped_mod
     from wavesim_gui import modal_port as modal_mod
 
     if sim is None:
-        return []
+        return {"modal_ports": [], "lumped_ports": []}
     origin = (0.0, 0.0, 0.0)
     modal_specs = []
     for obj in modal_mod.find_modal_ports(sim):
@@ -187,8 +197,7 @@ def document_ports(sim):
     lumped_specs = [s for s in
                     (lumped_mod.lumped_port_spec(obj, origin)
                      for obj in lumped_mod.find_lumped_ports(sim)) if s]
-    return spec_ports({"modal_ports": modal_specs,
-                       "lumped_ports": lumped_specs})
+    return {"modal_ports": modal_specs, "lumped_ports": lumped_specs}
 
 
 def select_ports(spec, names):
@@ -466,13 +475,17 @@ def sweep_dir_for(doc):
     return job_mod.workdir_for(doc, prefix="matrix")
 
 
-def prepare_sweep_dir(doc, n_drives):
-    """Create (and clear) the sweep directory and its per-drive subdirectories."""
+def prepare_sweep_dir(doc, n_drives, sweep=None):
+    """Create (and clear) the sweep directory and its per-drive subdirectories.
+
+    *sweep* overrides the document's default :func:`sweep_dir_for` location
+    (the scripting API exports a sweep wherever its caller asks).
+    """
     import shutil
 
     from wavesim_gui import job as job_mod
 
-    sweep = sweep_dir_for(doc)
+    sweep = sweep or sweep_dir_for(doc)
     os.makedirs(sweep, exist_ok=True)
     for name in job_mod.JOB_ARTEFACTS:
         path = os.path.join(sweep, name)
@@ -518,6 +531,99 @@ def harvest_drive(sweep_dir, drive):
 
 def _log(message):
     FreeCAD.Console.PrintMessage("Wavesim: " + message + "\n")
+
+
+# --------------------------------------------------------------------------- #
+# The sweep, GUI-free: shared by the Port Matrix command and the scripting API
+# --------------------------------------------------------------------------- #
+
+_NO_STRUCTURE = ("This document has no materials assigned, so there is no "
+                 "structure to extract a matrix from.")
+_SPICE_REFUSAL = (
+    "This document has SPICE co-simulation ports. The sweep cannot silence a "
+    "netlist-driven source, and one left running would corrupt every entry of "
+    "the matrix.\n\nRemove the SPICE ports, or drive them from a Modal or "
+    "Lumped port instead.")
+
+
+def document_spice_ports(sim):
+    """Labels of the objects that would put a ``spice_ports`` entry in the job.
+
+    Mirrors :func:`wavesim_gui.voxelize.build_job_from_document`: SPICE line
+    ports with a usable curve, legacy SPICE TEM ports, and modal ports whose
+    drive mode is SPICE. Lets a caller refuse a sweep before voxelising.
+    """
+    from wavesim_gui import modal_port as modal_mod
+    from wavesim_gui import spice_port as spice_mod
+
+    if sim is None:
+        return []
+    out = [o.Label for o in spice_mod.find_spice_line_ports(sim)
+           if spice_mod._line_endpoints_mm(o) is not None]
+    out += [o.Label for o in spice_mod.find_spice_tem_ports(sim)]
+    out += [o.Label for o in modal_mod.find_modal_ports(sim)
+            if modal_mod.excitation_mode(o) == modal_mod.MODE_SPICE]
+    return out
+
+
+def build_sweep(doc, names, progress=None):
+    """Voxelise *doc* once and bind the chosen port *names* to its job spec.
+
+    Returns ``(spec, arrays, ports, excitation)``. Raises :class:`SweepError`
+    for a document that cannot be swept (no structure, SPICE ports, a missing
+    port, fewer than two ports, no waveform), and lets the voxeliser's own
+    ``VoxelizationCancelled`` / ``GridRequiredError`` through.
+    """
+    from wavesim_gui import voxelize as vox_mod
+
+    spec, arrays = vox_mod.build_job_from_document(doc, progress=progress)
+    if spec is None:
+        raise SweepError(_NO_STRUCTURE)
+    if spec.get("spice_ports"):
+        # Its drive lives in a netlist this module cannot zero, and a source
+        # left running in every run corrupts every entry of the matrix without
+        # any visible symptom.
+        raise SweepError(_SPICE_REFUSAL)
+    ports = select_ports(spec, names)
+    excitation = common_excitation(spec, ports)
+    return spec, arrays, ports, excitation
+
+
+def export_drive_jobs(sweep_dir, spec, arrays, ports, excitation, steps=None):
+    """Write one self-contained workdir per drive under a prepared *sweep_dir*.
+
+    Each ``drive_<k>`` directory gets the :func:`drive_job` for port *k* as its
+    ``job.json`` plus the shared ``materials.npz`` (hard-linked to the one in
+    the sweep root where the filesystem allows, copied otherwise), so the N
+    solver runs can be launched independently -- in any order, or in parallel
+    -- and :func:`assemble` reads their ``results.npz`` exactly as it reads a
+    sweep run by the Port Matrix command. *steps* overrides the job's step
+    count. Returns the list of drive directories.
+    """
+    import shutil
+
+    from wavesim_gui import job as job_mod
+    from wavesim_gui import voxelize as vox_mod
+
+    vox_mod.write_materials(sweep_dir, arrays)
+    shared = os.path.join(sweep_dir, "materials.npz")
+    dirs = []
+    for drive in range(len(ports)):
+        workdir = os.path.join(sweep_dir, drive_dir_name(drive))
+        os.makedirs(workdir, exist_ok=True)
+        job = drive_job(spec, ports, drive, excitation)
+        if steps is not None:
+            job["steps"] = int(steps)
+        job_mod.write_job(workdir, job)
+        target = os.path.join(workdir, "materials.npz")
+        if os.path.isfile(target):
+            os.remove(target)
+        try:
+            os.link(shared, target)
+        except OSError:
+            shutil.copy2(shared, target)
+        dirs.append(workdir)
+    return dirs
 
 
 # --------------------------------------------------------------------------- #
@@ -679,41 +785,18 @@ if _GUI_AVAILABLE:
         vox_dialog, vox_cb = run_mod.voxelization_progress(
             parent, "Wavesim Port Matrix", "Voxelizing geometry (once)...")
         try:
-            spec, arrays = vox_mod.build_job_from_document(doc, progress=vox_cb)
+            spec, arrays, ports, excitation = build_sweep(
+                doc, chosen_names, progress=vox_cb)
         except vox_mod.VoxelizationCancelled:
             vox_dialog.close()
             FreeCAD.Console.PrintWarning("Wavesim: port matrix cancelled.\n")
             return None, None
-        except vox_mod.GridRequiredError as exc:
+        except (vox_mod.GridRequiredError, SweepError) as exc:
             vox_dialog.close()
             _refuse(parent, str(exc))
             return None, None
         finally:
             vox_dialog.close()
-
-        if spec is None:
-            _refuse(parent,
-                    "This document has no materials assigned, so there is no "
-                    "structure to extract a matrix from.")
-            return None, None
-        if spec.get("spice_ports"):
-            # Its drive lives in a netlist this module cannot zero, and a source
-            # left running in every run corrupts every entry of the matrix
-            # without any visible symptom.
-            _refuse(parent,
-                    "This document has SPICE co-simulation ports. The sweep "
-                    "cannot silence a netlist-driven source, and one left "
-                    "running would corrupt every entry of the matrix.\n\n"
-                    "Remove the SPICE ports, or drive them from a Modal or "
-                    "Lumped port instead.")
-            return None, None
-
-        try:
-            ports = select_ports(spec, chosen_names)
-            excitation = common_excitation(spec, ports)
-        except SweepError as exc:
-            _refuse(parent, str(exc))
-            return None, None
 
         sweep_dir = prepare_sweep_dir(doc, len(ports))
         vox_mod.write_materials(sweep_dir, arrays)

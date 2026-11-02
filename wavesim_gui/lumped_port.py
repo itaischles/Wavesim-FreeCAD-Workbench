@@ -530,6 +530,34 @@ def _describe(obj):
     return text
 
 
+def auto_label(obj):
+    """The tree label a lumped port carries until the user renames it."""
+    return "Lumped Port ({})".format(_describe(obj))
+
+
+def create_lumped_port(doc, sim, plus=None, minus=None):
+    """Add a lumped port with the default load to *sim*'s Sources group.
+
+    The single creation path shared by the *Add Lumped Port* command (which
+    seeds *plus*/*minus* from the 3D selection) and
+    :func:`wavesim_gui.api_excitation.add_lumped_port` (which resolves them from
+    object references and sub-shape selectors). Each terminal is an
+    ``App::PropertyLinkSub`` value ``(object, [subnames])`` or None. The caller
+    owns the transaction.
+    """
+    port = doc.addObject("App::FeaturePython", "LumpedPort")
+    LumpedPortObject(port)
+    if plus is not None:
+        port.TerminalPlus = plus
+    if minus is not None:
+        port.TerminalMinus = minus
+    port.Label = auto_label(port)
+    if _GUI_AVAILABLE and port.ViewObject is not None:
+        LumpedPortViewProvider(port.ViewObject)
+    sources_group(sim).addObject(port)
+    return port
+
+
 # --------------------------------------------------------------------------- #
 # The grid the element lands on: endpoint snapping, kappa, C_cell
 # --------------------------------------------------------------------------- #
@@ -1662,16 +1690,7 @@ if _GUI_AVAILABLE:
             plus, minus = selection_terminals()
             doc.openTransaction("Wavesim: Add Lumped Port")
             try:
-                port = doc.addObject("App::FeaturePython", "LumpedPort")
-                LumpedPortObject(port)
-                if plus is not None:
-                    port.TerminalPlus = plus
-                if minus is not None:
-                    port.TerminalMinus = minus
-                port.Label = "Lumped Port ({})".format(_describe(port))
-                if port.ViewObject is not None:
-                    LumpedPortViewProvider(port.ViewObject)
-                sources_group(sim).addObject(port)
+                port = create_lumped_port(doc, sim, plus, minus)
             except Exception:
                 doc.abortTransaction()
                 raise

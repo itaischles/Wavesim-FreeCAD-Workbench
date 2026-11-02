@@ -63,7 +63,8 @@ class _Server(socketserver.ThreadingMixIn, SimpleXMLRPCServer):
 
 
 class _Job(object):
-    __slots__ = ("name", "func", "kwargs", "done", "result", "abandoned")
+    __slots__ = ("name", "func", "kwargs", "done", "result", "abandoned",
+                 "started")
 
     def __init__(self, name, func, kwargs):
         self.name = name
@@ -72,6 +73,7 @@ class _Job(object):
         self.done = threading.Event()
         self.result = None
         self.abandoned = False
+        self.started = False
 
 
 def _summarize_traceback(exc):
@@ -257,7 +259,15 @@ class Bridge(object):
         else:
             self._queue.put(job)
             if not job.done.wait(timeout):
-                job.abandoned = True
+                with self._lock:
+                    job.abandoned = True
+                    started = job.started
+                if not started:
+                    return self._error(
+                        "{} waited {:.0f} s in the queue behind another call "
+                        "and was dropped (not executed). Retry when the bridge "
+                        "is idle (poll status).".format(name, timeout),
+                        "Timeout")
                 return self._error(
                     "{} did not finish within {:.0f} s; it keeps running in "
                     "FreeCAD (poll status).".format(name, timeout), "Timeout")
@@ -267,11 +277,19 @@ class Bridge(object):
         """QTimer slot on the main thread: run the next queued call."""
         if self._busy is not None:
             return  # re-entered from processEvents inside a running call
-        try:
-            job = self._queue.get_nowait()
-        except queue.Empty:
+        while True:
+            try:
+                job = self._queue.get_nowait()
+            except queue.Empty:
+                return
+            with self._lock:
+                if job.abandoned:
+                    # Its caller already got a Timeout: never run it late.
+                    job.done.set()
+                    continue
+                job.started = True
+            self._run(job)
             return
-        self._run(job)
 
     def _run(self, job):
         self._busy = job.name

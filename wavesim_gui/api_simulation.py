@@ -256,7 +256,7 @@ def set_domain(sim=None, spacing=None, boundaries=None, pml_cells=None,
     :param boundaries: full-wave boundary per face, ``'PML'`` or ``'PEC'``;
         single value or dict. Faces carrying a modal port / beam are forced
         by the port at export regardless.
-    :param pml_cells: PML depth in cells (integer 1..64).
+    :param pml_cells: PML depth in cells (integer 1..100, default 8).
     :param background: material filling empty space (name/label), e.g.
         ``"Vacuum"``. Re-derives the cell size, as the Domain panel does.
     :param es_boundaries: electrostatic boundary per face, ``'ground'``
@@ -291,8 +291,8 @@ def set_domain(sim=None, spacing=None, boundaries=None, pml_cells=None,
                                       "electrostatic boundary"))
         if pml_cells is not None:
             n = int(pml_cells)
-            if n != pml_cells or not 1 <= n <= 64:
-                raise ApiError("pml_cells must be an integer in 1..64.")
+            if n != pml_cells or not 1 <= n <= 100:
+                raise ApiError("pml_cells must be an integer in 1..100.")
             domain.PMLThickness = n
         if background is not None:
             mat = c.find_object(doc, background, "material")
@@ -320,14 +320,15 @@ def set_mesh(sim=None, cell_size=None, cells_per_wavelength=None,
     :param cell_size: ``"auto"`` (derive), one length for cubic cells, or
         ``[dx, dy, dz]`` (default unit mm; param expressions allowed). With a
         non-uniform grid it is the coarse (background) target.
-    :param cells_per_wavelength: integer >= 4 (full wave), default 20.
-    :param cells_per_feature: integer >= 1 (electrostatic), default 10.
+    :param cells_per_wavelength: integer 1..1000 (full wave), default 20.
+    :param cells_per_feature: integer 1..1000 (electrostatic), default 10.
     :param nonuniform: graded non-uniform (snapped) grid on/off.
-    :param max_grading: largest neighbour cell-size ratio, 1.0..3.0.
+    :param max_grading: largest neighbour cell-size ratio, 1.0..5.0
+        (solver guidance 1.5-2).
     :param min_cell_size: smallest cell the snapper may create (mm, 0 = no
         limit).
     :param curvature_refinement: refinement factor on curved surfaces
-        (>= 1, 1 = off).
+        (1..64, 1 = off).
     :returns: :func:`mesh_info` after the change.
     """
     sim = c.get_sim(sim)
@@ -339,21 +340,22 @@ def set_mesh(sim=None, cell_size=None, cells_per_wavelength=None,
     with c.transaction(doc, "Wavesim: Edit Domain"):
         if cells_per_wavelength is not None:
             n = int(cells_per_wavelength)
-            if n != cells_per_wavelength or n < 4:
+            if n != cells_per_wavelength or not 1 <= n <= 1000:
                 raise ApiError("cells_per_wavelength must be an integer "
-                               ">= 4.")
+                               "in 1..1000.")
             domain.CellsPerWavelength = n
         if cells_per_feature is not None:
             n = int(cells_per_feature)
-            if n != cells_per_feature or n < 1:
-                raise ApiError("cells_per_feature must be an integer >= 1.")
+            if n != cells_per_feature or not 1 <= n <= 1000:
+                raise ApiError("cells_per_feature must be an integer in "
+                               "1..1000.")
             domain.CellsPerFeature = n
         if nonuniform is not None:
             domain.UseNonuniformGrid = bool(nonuniform)
         if max_grading is not None:
             ratio = float(max_grading)
-            if not 1.0 <= ratio <= 3.0:
-                raise ApiError("max_grading must be in 1.0..3.0.")
+            if not 1.0 <= ratio <= 5.0:
+                raise ApiError("max_grading must be in 1.0..5.0.")
             domain.MaxGradingRatio = ratio
         if min_cell_size is not None:
             kind, number = c.parse_quantity(min_cell_size, "length")
@@ -362,8 +364,8 @@ def set_mesh(sim=None, cell_size=None, cells_per_wavelength=None,
             c.set_quantity(domain, "MinCellSize", min_cell_size, "length")
         if curvature_refinement is not None:
             factor = float(curvature_refinement)
-            if factor < 1.0:
-                raise ApiError("curvature_refinement must be >= 1.")
+            if not 1.0 <= factor <= 64.0:
+                raise ApiError("curvature_refinement must be in 1..64.")
             domain.CurvatureRefinement = factor
         if isinstance(cell_size, str) and cell_size.strip().lower() == "auto":
             rederive = True

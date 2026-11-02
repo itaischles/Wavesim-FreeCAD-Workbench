@@ -15,6 +15,34 @@ section is started above it.
 
 ### Added
 
+- An **Agent bridge** for AI-agent access (new *Agent Bridge On/Off* button
+  next to *Settings*). When switched on, an AI agent in VS Code (through the
+  MCP server of the `wavesim-ai-harness` repository) can build and run
+  simulations in this FreeCAD window while you watch. It listens on
+  127.0.0.1 only, needs a token, and can call only the scripting API below —
+  it cannot run arbitrary code. The status bar shows *Agent bridge: ON* while
+  it runs. *Wavesim → Settings* has a new *Agent bridge* section: start it
+  with FreeCAD, change its port (default 9875), copy or regenerate the token.
+- A **scripting API** (`from wavesim_gui import api`) usable from the Python
+  console: create and edit simulations, materials, domain and mesh,
+  geometry (Part primitives, booleans, arrays, fillets and chamfers with edge
+  selectors, STEP import), sources and ports, monitors, parameter bindings to a
+  `Params` spreadsheet, setup validation, previews, job export and results
+  loading. Every function is one undo step. See `docs/API_INVENTORY.md` and
+  `docs/AGENT_BRIDGE.md`.
+- `exporter.py` next to `runner.py`: exports a finished run's results to CSV,
+  PNG, GIF and Touchstone files with a `summary.md`
+  (`<solver python> exporter.py <run dir> <out dir>`).
+- Headless API tests: `freecadcmd tests\run_api_tests.py`.
+
+### Changed
+
+- The toolbar commands now create their objects through the same functions as
+  the scripting API, so a scripted object and a clicked one are identical. What
+  you see and click is unchanged.
+- A job's `job.json` now also records `origin_m`, the world position of the
+  grid origin (ignored by the solver).
+
 - A **Field Along Curve** monitor for electrostatic runs (new button in the
   monitors group). Drag a sketch onto it, then double-click it to pick phi, E
   or D and the start and end vertices on the curve. After the run its result

@@ -107,6 +107,19 @@ class BridgeTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             bridge.Bridge(_free_port(), "")
 
+    def test_abandoned_job_never_runs(self):
+        b = bridge.Bridge(_free_port(), "t", executor="qt")
+        ran = []
+        stale = bridge._Job("x", lambda: ran.append("stale"), {})
+        stale.abandoned = True
+        fresh = bridge._Job("y", lambda: ran.append("fresh"), {})
+        b._queue.put(stale)
+        b._queue.put(fresh)
+        b._pump()
+        self.assertEqual(ran, ["fresh"])
+        self.assertTrue(stale.done.is_set() and fresh.done.is_set())
+        self.assertTrue(fresh.result["ok"])
+
 
 if __name__ == "__main__":
     unittest.main()

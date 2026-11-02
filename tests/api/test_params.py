@@ -52,6 +52,14 @@ class ParamsTests(DocTestCase):
                             for r in rep["unknown_references"]))
         self.assertEqual(len(api.list_bindings(self.doc)), 2)
 
+    def test_auto_label_uses_bound_value(self):
+        sim = api.new_simulation(self.doc)
+        api.sync_params_to_spreadsheet(self.doc, {"FMAX": _p(8e9, "Hz")})
+        src = api.add_source(sim, position=[0, 0, 0],
+                             excitation={"type": "gaussian", "fmax": "=FMAX"})
+        self.assertAlmostEqual(src.Fmax, 8e9)
+        self.assertIn("8 GHz", src.Label)
+
     def test_bind_errors(self):
         self.doc.addObject("Part::Box", "Box")
         with self.assertRaises(api.ApiError):

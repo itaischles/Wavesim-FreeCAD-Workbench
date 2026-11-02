@@ -399,7 +399,8 @@ _SETUP_SKIP = {"Proxy", "ExpressionEngine", "Label2", "Visibility", "Shape",
 def _object_props(obj, skip):
     out = {}
     for prop in sorted(obj.PropertiesList):
-        if prop in skip or prop in ("Label",):
+        if prop in skip or prop in ("Label",) or prop.startswith(
+                ("WavesimXSec", "WavesimCrossSection")):
             continue
         try:
             group = obj.getGroupOfProperty(prop)
@@ -450,7 +451,8 @@ def model_fingerprint(doc=None):
             digest["material"] = mat.Name
             digest["wavesim_props"] = {
                 p: _canon(getattr(body, p)) for p in sorted(
-                    body.PropertiesList) if p.startswith("Wavesim")}
+                    body.PropertiesList) if p.startswith("Wavesim")
+                and not p.startswith(("WavesimXSec", "WavesimCrossSection"))}
             bodies[body.Name] = digest
     setup = {"simulation": _object_props(sim, _SETUP_SKIP | {"Group"})}
     stack = list(sim.Group)

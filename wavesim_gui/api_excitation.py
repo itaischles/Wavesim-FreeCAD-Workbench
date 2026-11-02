@@ -116,13 +116,19 @@ def _creating(doc, title):
 
 
 def _finish_label(obj, old_auto, new_auto, label):
-    """Apply an explicit *label*, or retitle the auto label like the panels."""
+    """Apply an explicit *label*, or retitle the auto label like the panels.
+
+    *new_auto* is a callable: it is evaluated after a recompute, so values
+    bound to PARAMS expressions (e.g. the waveform's Fmax) are current in the
+    label, as they are once a panel's OK has recomputed.
+    """
     from wavesim_gui import labels as labels_mod
 
     if label:
         c.set_label(obj, label)
     else:
-        labels_mod.retitle(obj, old_auto, new_auto)
+        obj.Document.recompute()
+        labels_mod.retitle(obj, old_auto, new_auto())
 
 
 def _settle(doc):
@@ -435,7 +441,7 @@ def add_source(sim=None, *, label=None, component="Ez", position=None,
         if position is not None:
             c.set_vector(src, "Position", position)
         _write_excitation(src, parsed)
-        _finish_label(src, old_auto, source_mod.auto_label(src), label)
+        _finish_label(src, old_auto, lambda: source_mod.auto_label(src), label)
         _settle(doc)
     return src
 
@@ -492,7 +498,7 @@ def add_gaussian_beam(sim=None, *, label=None, face="z0", angle=0.0, waist=0.0,
         c.set_quantity(beam, "Waist", waist, "length")
         beam.Directional = directional
         _write_excitation(beam, parsed)
-        _finish_label(beam, old_auto, gb.auto_label(beam), label)
+        _finish_label(beam, old_auto, lambda: gb.auto_label(beam), label)
         gb.force_launch_bc(beam)
         _settle(doc)
     return beam
@@ -629,7 +635,7 @@ def add_lumped_port(sim=None, *, label=None, plus=None, minus=None, points=None,
         port.Drive = drive
         _write_excitation(port, parsed)
         lumped_mod.sync_drive_visibility(port)
-        _finish_label(port, old_auto, lumped_mod.auto_label(port), label)
+        _finish_label(port, old_auto, lambda: lumped_mod.auto_label(port), label)
         doc.recompute()
         p0, _p1, warnings = lumped_mod.resolve_line(port)
         if p0 is None:
@@ -877,7 +883,7 @@ def add_modal_port(sim=None, *, label=None, face="z0", drive_mode="waveform",
         for prop, value in (spice or {}).items():
             setattr(port, prop, value)
         modal_mod._sync_mode_visibility(port)
-        _finish_label(port, old_auto, modal_mod.auto_label(port), label)
+        _finish_label(port, old_auto, lambda: modal_mod.auto_label(port), label)
         if mode == modal_mod.MODE_SPICE:
             modal_mod.force_spice_bc(port)
         _settle(doc)
@@ -946,7 +952,7 @@ def add_spice_line_port(sim=None, *, label=None, curve=None, points=None,
         port.Sketch = curve_obj
         for prop, value in settings.items():
             setattr(port, prop, value)
-        _finish_label(port, old_auto, spice_mod.line_auto_label(port), label)
+        _finish_label(port, old_auto, lambda: spice_mod.line_auto_label(port), label)
         _settle(doc)
     return port
 
@@ -993,7 +999,7 @@ def add_spice_tem_port(sim=None, *, label=None, face="z0", fields="EH",
         port.Conductor = conductor_index
         for prop, value in settings.items():
             setattr(port, prop, value)
-        _finish_label(port, old_auto, spice_mod.tem_auto_label(port), label)
+        _finish_label(port, old_auto, lambda: spice_mod.tem_auto_label(port), label)
         spice_mod.force_tem_bc(port)
         _settle(doc)
     return port
@@ -1059,7 +1065,7 @@ def set_excitation(sim=None, *, obj=None, excitation=None, index=0):
         _write_excitation(target, parsed, index)
         if sync_fn is not None:
             sync_fn(target)
-        _finish_label(target, old_auto, auto_fn(target), None)
+        _finish_label(target, old_auto, lambda: auto_fn(target), None)
         _settle(doc)
     return target
 

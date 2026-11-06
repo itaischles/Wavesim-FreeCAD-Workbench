@@ -885,6 +885,7 @@ if _GUI_AVAILABLE:
             from wavesim_gui import job as job_mod
             from wavesim_gui import run as run_mod
             from wavesim_gui import voxelize as vox_mod
+            import wavesim_settings
             try:
                 from PySide import QtWidgets
             except ImportError:
@@ -937,11 +938,42 @@ if _GUI_AVAILABLE:
             FreeCAD.Console.PrintMessage(
                 "Wavesim: running job in {}\n".format(workdir)
             )
+            electrostatic = spec.get("mode") == MODE_ELECTROSTATIC
+
+            # The default: the solver in its own console window, FreeCAD free
+            # meanwhile. The Results tree is built when the run ends -- unless
+            # the document was closed in the meantime, or its Simulation
+            # deleted, in which case the results stay on disk only.
+            if (wavesim_settings.get_run_window() == "console"
+                    and run_mod.console_runs_supported()):
+                doc_name = doc.Name
+
+                def on_done(summary):
+                    run_doc = FreeCAD.listDocuments().get(doc_name)
+                    if run_doc is None:
+                        FreeCAD.Console.PrintWarning(
+                            "Wavesim: the document was closed during the "
+                            "run; its results are in {}\n".format(workdir))
+                        return
+                    from wavesim_gui import results as results_mod
+                    sim = active_simulation(run_doc)
+                    if sim is not None:
+                        results_mod.build_results(run_doc, sim, workdir,
+                                                  summary)
+                    _show_run_summary(summary, workdir)
+
+                run_mod.start_console_run(
+                    workdir, on_done, parent=Gui.getMainWindow(),
+                    title="Wavesim - {}".format(doc.Label),
+                    percent=electrostatic,
+                )
+                return
+
             # An electrostatic job has no time steps to count: the runner
             # reports how far each solve's residual has fallen toward its
             # tolerance instead, in thousandths of the whole run, so the dialog
             # shows a percentage rather than a step count.
-            if spec.get("mode") == MODE_ELECTROSTATIC:
+            if electrostatic:
                 summary = run_mod.run_job(
                     workdir, ES_PROGRESS_STEPS, parent=Gui.getMainWindow(),
                     message="Solving electrostatics...", percent=True,
@@ -958,8 +990,18 @@ if _GUI_AVAILABLE:
                 _show_run_summary(summary, workdir)
 
         def IsActive(self):
-            # Enabled only once a simulation container exists in the document.
-            return active_simulation(FreeCAD.ActiveDocument) is not None
+            # Enabled only once a simulation container exists in the document,
+            # and not while that document's console run is still going -- a
+            # second run would clear the folder the first is writing into.
+            doc = FreeCAD.ActiveDocument
+            if active_simulation(doc) is None:
+                return False
+            from wavesim_gui import run as run_mod
+            if run_mod.console_run_active():
+                from wavesim_gui import job as job_mod
+                return not run_mod.console_run_active(
+                    job_mod.workdir_for(doc, prefix="run"))
+            return True
 
     def _show_run_summary(summary, workdir):
         """Pop a short info dialog with the grid dims, CFL dt and timing."""

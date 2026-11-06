@@ -33,8 +33,11 @@ import wavesim_settings
 # Every file the runner or the workbench writes into a workdir. Cleared before a
 # new run so a stale artefact (e.g. a materials.npz from a previous geometry, or
 # the results of a run that this one is about to replace) can never be picked up
-# as if it belonged to the new job.
-JOB_ARTEFACTS = ("job.json", "materials.npz", "results.npz", "summary.json")
+# as if it belonged to the new job. ``exit.json`` is the console run's
+# end-of-run marker (see run.start_console_run); it is deleted once read, so it
+# is here only for a run whose FreeCAD session ended before the run did.
+JOB_ARTEFACTS = ("job.json", "materials.npz", "results.npz", "summary.json",
+                 "exit.json")
 
 _UNSAFE_CHARS = re.compile(r"[^A-Za-z0-9._-]+")
 

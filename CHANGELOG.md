@@ -34,6 +34,13 @@ section is started above it.
   PNG, GIF and Touchstone files with a `summary.md`
   (`<solver python> exporter.py <run dir> <out dir>`).
 - Headless API tests: `freecadcmd tests\run_api_tests.py`.
+- *Run Simulation* now runs the solver in **its own console window**, and
+  FreeCAD stays usable while it runs. The window shows the solver's status
+  lines and a progress bar with elapsed time, time remaining and steps per
+  second. **Closing the window cancels the run**, as *Cancel* did. The
+  Results tree is built when the run finishes. *Wavesim → Settings → Solver
+  run* switches back to the progress dialog. Windows only; elsewhere the
+  dialog is always used. Port Matrix and Compute Mode still use the dialog.
 
 ### Changed
 

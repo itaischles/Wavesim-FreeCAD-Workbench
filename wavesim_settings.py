@@ -66,6 +66,10 @@ DEFAULTS = {
     # depends on has changed (wavesim_gui.voxcache). 'on' or 'off'; a string
     # rather than a bool because a stored False would read as unset.
     "voxel_cache": "on",
+    # Where Run Simulation runs the solver: 'console' (its own console window,
+    # FreeCAD stays usable, closing the window cancels -- Windows only) or
+    # 'dialog' (a progress dialog FreeCAD waits on, the original behaviour).
+    "run_window": "console",
     # How many discrete colours a snapshot map uses when its Banding box is
     # ticked: the selected colour map cut into this many flat bands, so equal
     # steps of the field read as contour-like steps of colour.
@@ -88,6 +92,7 @@ _ENV_OVERRIDES = {
     "backend": "WAVESIM_BACKEND",
     "voxelize_workers": "WAVESIM_VOXELIZE_WORKERS",
     "voxel_cache": "WAVESIM_VOXEL_CACHE",
+    "run_window": "WAVESIM_RUN_WINDOW",
     "colormap_bands": "WAVESIM_COLORMAP_BANDS",
     "bridge_autostart": "WAVESIM_BRIDGE_AUTOSTART",
     "bridge_port": "WAVESIM_BRIDGE_PORT",
@@ -202,6 +207,13 @@ def get_voxelize_workers():
 def get_voxel_cache():
     """``'on'`` (the default) to reuse an unchanged voxelisation, ``'off'`` not to."""
     return get("voxel_cache") or "on"
+
+
+def get_run_window():
+    """``'console'`` (the default) to run the solver in its own console window,
+    ``'dialog'`` for the blocking progress dialog."""
+    value = get("run_window") or "console"
+    return value if value in ("console", "dialog") else "console"
 
 
 # Bounds on the band count: two is the fewest that still says anything, and
@@ -352,6 +364,12 @@ if _GUI_AVAILABLE:
         ("on", "Reuse the last one when the model is unchanged"),
         ("off", "Always voxelise again"),
     ]
+    # Where Run Simulation runs the solver. Port Matrix and Compute Mode always
+    # use the progress dialog.
+    _RUN_WINDOW_CHOICES = [
+        ("console", "In its own console window (FreeCAD stays usable)"),
+        ("dialog", "In a progress dialog (FreeCAD waits)"),
+    ]
 
     class SettingsDialog(QtWidgets.QDialog):
         """Modal dialog to view and edit the workbench solver paths."""
@@ -396,6 +414,16 @@ if _GUI_AVAILABLE:
             idx = self._cache_combo.findData(current["voxel_cache"])
             self._cache_combo.setCurrentIndex(idx if idx >= 0 else 0)
 
+            self._run_window_combo = QtWidgets.QComboBox()
+            for value, label in _RUN_WINDOW_CHOICES:
+                self._run_window_combo.addItem(label, value)
+            idx = self._run_window_combo.findData(get_run_window())
+            self._run_window_combo.setCurrentIndex(idx if idx >= 0 else 0)
+            self._run_window_combo.setToolTip(
+                "Where Run Simulation runs the solver. In a console window,\n"
+                "closing the window cancels the run (Windows only; elsewhere\n"
+                "the progress dialog is always used).")
+
             form.addRow(
                 "Solver Python interpreter:",
                 self._row(
@@ -438,6 +466,7 @@ if _GUI_AVAILABLE:
             form.addRow("Solver backend:", self._backend_combo)
             form.addRow("Voxelisation:", self._workers_combo)
             form.addRow("Voxelisation reuse:", self._cache_combo)
+            form.addRow("Solver run:", self._run_window_combo)
             form.addRow("Colour map bands:", self._bands_spin)
             layout.addLayout(form)
 
@@ -565,6 +594,7 @@ if _GUI_AVAILABLE:
             backend = self._backend_combo.currentData() or "auto"
             workers = self._workers_combo.currentData() or "auto"
             voxel_cache = self._cache_combo.currentData() or "on"
+            run_window = self._run_window_combo.currentData() or "console"
             bands = int(self._bands_spin.value())
 
             warnings = []
@@ -617,6 +647,7 @@ if _GUI_AVAILABLE:
                     "backend": backend,
                     "voxelize_workers": workers,
                     "voxel_cache": voxel_cache,
+                    "run_window": run_window,
                     "colormap_bands": bands,
                     "bridge_autostart": self._bridge_autostart.isChecked(),
                     "bridge_port": int(self._bridge_port.value()),

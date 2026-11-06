@@ -6,6 +6,12 @@ Spawns the conda-side ``runner.py`` on a serialised job directory with
 the runner prints to stdout, and lets the user cancel by killing the process.
 On success it loads ``summary.json`` and returns it to the caller.
 
+:func:`start_console_run` is the non-blocking alternative Run Simulation uses by
+default on Windows: the runner goes into its own console window (through
+``console_runner.py``, which draws the status and progress there and kills the
+solver when the window is closed), this function returns at once, and a timer
+hands the summary to a callback when ``exit.json`` says the run is over.
+
 Kept separate from :mod:`wavesim_gui.commands` so the QProcess plumbing can be
 reused (and tested) independently of the command wiring.
 """
@@ -25,6 +31,25 @@ _WB_DIR = os.path.join(
     FreeCAD.getUserAppDataDir(), "Mod", "wavesim-workbench"
 )
 RUNNER_PATH = os.path.join(_WB_DIR, "runner.py")
+# The console wrapper a non-blocking run starts runner.py through (it runs under
+# the solver Python too, stdlib-only).
+CONSOLE_RUNNER_PATH = os.path.join(_WB_DIR, "console_runner.py")
+
+# Written by console_runner.py when runner.py exits by itself; its absence with
+# the console gone means the window was closed, i.e. the run was cancelled.
+EXIT_FILE = "exit.json"
+
+# A console run's mid-run results: FreeCAD writes the request (its content a
+# sequence number) and the runner answers into partial/<seq>/, summary.json
+# last. runner.py's PARTIAL_REQUEST / PARTIAL_DIR are the other half.
+PARTIAL_REQUEST = "partial.request"
+PARTIAL_DIR = "partial"
+
+# How often a console run is checked for having ended.
+_POLL_MS = 500
+
+_CREATE_NEW_CONSOLE = 0x00000010
+_CREATE_BREAKAWAY_FROM_JOB = 0x01000000
 
 
 def _format_duration(seconds):
@@ -341,6 +366,11 @@ def run_job(workdir, n_steps, parent=None, message="Running FDTD simulation...",
         )
         return None
 
+    _report_complete(summary, workdir)
+    return summary
+
+
+def _report_complete(summary, workdir):
     FreeCAD.Console.PrintMessage(
         "Wavesim: run complete in {:.2f}s ({} steps, dt={:.3e}s). "
         "Output in {}\n".format(
@@ -348,4 +378,322 @@ def run_job(workdir, n_steps, parent=None, message="Running FDTD simulation...",
             summary.get("dt", float("nan")), workdir,
         )
     )
-    return summary
+
+
+# --------------------------------------------------------------------------- #
+# Non-blocking run in a console window
+# --------------------------------------------------------------------------- #
+
+# Console runs still going, by normalised workdir. Holds each run's process and
+# poll timer, so neither is garbage collected while the solver works.
+_CONSOLE_RUNS = {}
+
+
+def _run_key(workdir):
+    return os.path.normcase(os.path.abspath(workdir))
+
+
+def console_runs_supported():
+    """Whether this platform can run the solver in its own console window.
+
+    The wrapper's cancel-on-close rests on a Windows Job Object; elsewhere a run
+    takes the blocking :func:`run_job` path.
+    """
+    return os.name == "nt"
+
+
+def console_run_active(workdir=None):
+    """True while a console run is going -- in *workdir*, or anywhere if None."""
+    if workdir is None:
+        return bool(_CONSOLE_RUNS)
+    return _run_key(workdir) in _CONSOLE_RUNS
+
+
+def partial_results_available(workdir):
+    """True if the console run in *workdir* can be asked for its results so far.
+
+    Only a time-domain run can (an electrostatic solve has no "so far"), and not
+    while an earlier request is still waiting for its answer.
+    """
+    run = _CONSOLE_RUNS.get(_run_key(workdir))
+    return (run is not None and run["on_partial"] is not None
+            and run["outcome"] is None and run["pending"] is None)
+
+
+def request_partial_results(workdir):
+    """Ask the console run in *workdir* for the results it has recorded so far.
+
+    Returns at once; the runner writes them at its next time step and the run's
+    poll timer hands them to its *on_partial* callback. Returns ``True`` if the
+    request went out.
+    """
+    if not partial_results_available(workdir):
+        return False
+    run = _CONSOLE_RUNS[_run_key(workdir)]
+    seq = run["seq"] + 1
+    path = os.path.join(workdir, PARTIAL_REQUEST)
+    tmp = path + ".tmp"
+    try:
+        with open(tmp, "w", encoding="utf-8") as handle:
+            handle.write(str(seq))
+        os.replace(tmp, path)
+    except OSError as exc:
+        FreeCAD.Console.PrintError(
+            "Wavesim: could not ask the run for its results so far: {}\n"
+            .format(exc))
+        return False
+    run["seq"] = seq
+    run["pending"] = seq
+    FreeCAD.Console.PrintMessage(
+        "Wavesim: asked the solver for the results so far; they appear in the "
+        "tree once it has written them.\n")
+    return True
+
+
+def _read_partial(workdir, seq):
+    """The answer to request *seq*: ``(folder, summary)``, or ``None`` yet."""
+    folder = os.path.join(workdir, PARTIAL_DIR, str(seq))
+    summary = _read_summary(folder)
+    if not summary or "partial" not in summary:
+        return None
+    return folder, summary
+
+
+def _discard_partials(workdir, keep=None):
+    """Delete the mid-run answers in *workdir*, all but *keep* (never raises).
+
+    A folder whose files are still open somewhere stays; the next run's
+    :func:`wavesim_gui.job.prepare_workdir` takes it.
+    """
+    import shutil
+
+    root = os.path.join(workdir, PARTIAL_DIR)
+    if keep is None:
+        shutil.rmtree(root, ignore_errors=True)
+        for name in (PARTIAL_REQUEST, PARTIAL_REQUEST + ".tmp"):
+            try:
+                os.remove(os.path.join(workdir, name))
+            except OSError:
+                pass
+        return
+    try:
+        names = os.listdir(root)
+    except OSError:
+        return
+    for name in names:
+        if name != str(keep):
+            shutil.rmtree(os.path.join(root, name), ignore_errors=True)
+
+
+def _read_exit(workdir):
+    """Return the parsed ``exit.json`` from *workdir*, or ``None``."""
+    try:
+        with open(os.path.join(workdir, EXIT_FILE), "r", encoding="utf-8") as handle:
+            return json.load(handle)
+    except Exception:
+        return None
+
+
+def _discard_exit(workdir):
+    """Delete ``exit.json`` (and any half-written temp of it) once it is read.
+
+    It exists only to tell this side the run is over, so a finished run folder
+    holds exactly what a blocking run leaves.
+    """
+    try:
+        names = os.listdir(workdir)
+    except OSError:
+        return
+    for name in names:
+        if name == EXIT_FILE or (name.startswith(EXIT_FILE + ".")
+                                 and name.endswith(".tmp")):
+            try:
+                os.remove(os.path.join(workdir, name))
+            except OSError:
+                pass
+
+
+def _gui_busy():
+    """Whether now is a bad moment to rebuild the Results tree.
+
+    A task panel has a transaction of its own open and a modal dialog is in the
+    middle of something; landing a ``Build Results`` transaction inside either
+    would tangle the user's undo history with the run's. The run's outcome is
+    kept and delivered on a later tick instead.
+    """
+    try:
+        import FreeCADGui
+        if FreeCADGui.Control.activeDialog():
+            return True
+    except Exception:
+        pass
+    try:
+        from PySide import QtWidgets
+    except ImportError:
+        from PySide import QtGui as QtWidgets
+    return QtWidgets.QApplication.activeModalWidget() is not None
+
+
+def _console_outcome(workdir, process):
+    """``(outcome, summary, error)`` once the console run is over, else None.
+
+    *outcome* is ``'ok'``, ``'failed'`` or ``'cancelled'``. ``exit.json`` says
+    the runner ended by itself; a console that is gone without one was closed.
+    """
+    info = _read_exit(workdir)
+    if info is not None:
+        summary = _read_summary(workdir)
+        if info.get("returncode") == 0 and summary and summary.get("ok", False):
+            return "ok", summary, None
+        error = ((summary or {}).get("error") or info.get("error")
+                 or "the solver exited with code {} -- see its console "
+                    "window".format(info.get("returncode")))
+        return "failed", None, error
+    if process.poll() is not None:
+        return "cancelled", None, None
+    return None
+
+
+def start_console_run(workdir, on_done, parent=None, title="Wavesim",
+                      percent=False, on_partial=None):
+    """Start the job in *workdir* in its own console window and return at once.
+
+    The non-blocking sibling of :func:`run_job`: ``console_runner.py`` runs
+    ``runner.py`` in a new console that shows the status lines and a progress
+    bar, and FreeCAD stays usable meanwhile. Closing that window cancels the
+    run, as the dialog's Cancel button does. A timer polls for the end; on
+    success *on_done(summary)* is called on the GUI thread (failure and cancel
+    are reported here, as :func:`run_job` reports them). Delivery waits while a
+    task panel or modal dialog is open -- see :func:`_gui_busy`.
+
+    *percent* is :func:`run_job`'s: the PROGRESS units are only a bar scale.
+
+    *on_partial(summary, folder)*, if given, makes the run answer
+    :func:`request_partial_results`: it is called with each answer (a summary
+    carrying a ``partial`` entry, and the folder holding its ``results.npz``),
+    under the same busy rule. A finished run deletes the answers once *on_done*
+    has replaced what was built from them; a failed or cancelled one leaves the
+    last one on disk, for the tree still showing it.
+    Returns ``True`` if the run started.
+    """
+    import subprocess
+
+    from PySide import QtCore
+    try:
+        from PySide import QtWidgets
+    except ImportError:
+        from PySide import QtGui as QtWidgets
+
+    key = _run_key(workdir)
+    if key in _CONSOLE_RUNS:
+        QtWidgets.QMessageBox.warning(
+            parent, "Wavesim Run",
+            "A run is already going in\n{}\n\nClose its console window to "
+            "cancel it, or wait for it to finish.".format(workdir))
+        return False
+
+    python_exe = wavesim_settings.get_wavesim_python()
+    for path, what in ((python_exe, "Solver Python interpreter"),
+                       (RUNNER_PATH, "runner.py"),
+                       (CONSOLE_RUNNER_PATH, "console_runner.py")):
+        if not os.path.isfile(path):
+            QtWidgets.QMessageBox.critical(
+                parent, "Wavesim Run",
+                "{} not found:\n{}\n\nSet the interpreter in Wavesim -> "
+                "Settings.".format(what, path))
+            return False
+
+    _discard_exit(workdir)
+    _discard_partials(workdir)
+    cmd = [python_exe, CONSOLE_RUNNER_PATH, "--runner", RUNNER_PATH,
+           "--workdir", workdir, "--title", title]
+    if percent:
+        cmd.append("--percent")
+
+    # Breakaway first: if FreeCAD itself sits in a kill-on-close job (started
+    # from an IDE or a terminal), the run should not die with it. Not every job
+    # allows it, hence the plain retry.
+    process = None
+    error = None
+    for flags in (_CREATE_NEW_CONSOLE | _CREATE_BREAKAWAY_FROM_JOB,
+                  _CREATE_NEW_CONSOLE):
+        try:
+            process = subprocess.Popen(cmd, cwd=workdir, creationflags=flags)
+            break
+        except OSError as exc:
+            error = exc
+    if process is None:
+        QtWidgets.QMessageBox.critical(
+            parent, "Wavesim Run",
+            "Failed to start the solver console:\n{}\n\n{}".format(
+                subprocess.list2cmdline(cmd), error))
+        return False
+
+    timer = QtCore.QTimer()
+    timer.setInterval(_POLL_MS)
+    # seq: the last request's number; pending: the one still unanswered;
+    # shown: whether an answer reached the tree.
+    run = {"process": process, "timer": timer, "outcome": None,
+           "on_partial": on_partial, "seq": 0, "pending": None,
+           "shown": False}
+
+    def _deliver(callback, *args):
+        try:
+            callback(*args)
+        except Exception as exc:
+            import traceback
+            FreeCAD.Console.PrintError(
+                "Wavesim: could not load the results: {}\n{}".format(
+                    exc, traceback.format_exc()))
+            return False
+        return True
+
+    def poll():
+        if run["outcome"] is None:
+            outcome = _console_outcome(workdir, process)
+            if outcome is not None:
+                # The end outranks an answer still on its way.
+                run["outcome"] = outcome
+                run["pending"] = None
+                _discard_exit(workdir)
+        if run["outcome"] is None:
+            if run["pending"] is None:
+                return
+            answer = _read_partial(workdir, run["pending"])
+            if answer is None or _gui_busy():
+                return
+            run["pending"] = None
+            folder, summary = answer
+            if _deliver(on_partial, summary, folder):
+                run["shown"] = True
+                _discard_partials(workdir, keep=os.path.basename(folder))
+            return
+        if _gui_busy():
+            return
+        timer.stop()
+        _CONSOLE_RUNS.pop(key, None)
+        status, summary, error = run["outcome"]
+        kept = (" The results so far stay in the tree until the next run."
+                if run["shown"] else "")
+        if status == "cancelled":
+            FreeCAD.Console.PrintWarning("Wavesim: run cancelled.{}\n".format(
+                kept))
+            return
+        if status == "failed":
+            FreeCAD.Console.PrintError("Wavesim: run failed: {}{}\n".format(
+                error, kept))
+            QtWidgets.QMessageBox.critical(
+                parent, "Wavesim Run",
+                "The solver run failed:\n\n{}".format(error))
+            return
+        _report_complete(summary, workdir)
+        _deliver(on_done, summary)
+        _discard_partials(workdir)
+
+    timer.timeout.connect(poll)
+    _CONSOLE_RUNS[key] = run
+    timer.start()
+    FreeCAD.Console.PrintMessage(
+        "Wavesim: the solver is running in its own console window; FreeCAD "
+        "stays usable. Close that window to cancel the run.\n")
+    return True

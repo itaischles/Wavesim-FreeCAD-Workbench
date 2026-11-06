@@ -487,6 +487,81 @@ def _emit_status(message):
     sys.stdout.flush()
 
 
+# The FreeCAD side asks for the results so far by writing this file into the
+# run folder; its content is the request's sequence number. The answer goes to
+# partial/<seq>/ -- a fresh folder per answer, because on Windows a file FreeCAD
+# still has open cannot be replaced -- with summary.json written last, as the
+# sign the folder is complete. The FreeCAD side (wavesim_gui/run.py) owns the
+# other half of this contract.
+PARTIAL_REQUEST = "partial.request"
+PARTIAL_DIR = "partial"
+# How often the step callback looks for a request, in seconds.
+_PARTIAL_POLL_S = 0.25
+
+
+class _PartialResults:
+    """Answer FreeCAD's mid-run requests for the results recorded so far."""
+
+    def __init__(self, workdir):
+        self.workdir = workdir
+        self.request = os.path.join(workdir, PARTIAL_REQUEST)
+        self.root = os.path.join(workdir, PARTIAL_DIR)
+        self._next_check = 0.0
+        self._seq = None
+
+    def requested(self):
+        """True if a request is waiting; consumes it. Cheap between checks."""
+        now = time.monotonic()
+        if now < self._next_check:
+            return False
+        self._next_check = now + _PARTIAL_POLL_S
+        if not os.path.isfile(self.request):
+            return False
+        try:
+            with open(self.request, "r", encoding="utf-8") as handle:
+                self._seq = int(handle.read().strip() or 0)
+            os.remove(self.request)
+        except (OSError, ValueError):
+            return False      # half-written or just replaced: next check
+        return True
+
+    def write(self, done, collect):
+        """Write ``collect()``'s arrays and summary to ``partial/<seq>/``.
+
+        A failure is reported and swallowed: a request for a look at the run
+        must never be what ends it.
+        """
+        import numpy as np
+
+        t0 = time.perf_counter()
+        _emit_status("Writing the results so far for FreeCAD (step {:,})..."
+                     .format(done))
+        out = os.path.join(self.root, str(self._seq))
+        try:
+            os.makedirs(out, exist_ok=True)
+            arrays, summary = collect()
+            np.savez(os.path.join(out, "results.npz"), **arrays)
+            tmp = os.path.join(out, "summary.json.tmp")
+            with open(tmp, "w", encoding="utf-8") as handle:
+                json.dump(summary, handle, indent=2)
+            os.replace(tmp, os.path.join(out, "summary.json"))
+        except Exception as exc:
+            _emit_status("Could not write the results so far: {}".format(exc))
+            return
+        _emit_status("Results so far written ({:.1f} s)."
+                     .format(time.perf_counter() - t0))
+
+    def discard(self):
+        """Delete every answer and any unanswered request (never raises)."""
+        import shutil
+
+        shutil.rmtree(self.root, ignore_errors=True)
+        try:
+            os.remove(self.request)
+        except OSError:
+            pass
+
+
 # --------------------------------------------------------------------------- #
 # Backend selection — pick the fastest available update-kernel backend
 # --------------------------------------------------------------------------- #
@@ -2106,10 +2181,18 @@ def run_job(workdir):
     progress_every = max(1, n_steps // 100)
     _emit_progress(0, n_steps)
 
+    # FreeCAD can ask for the results so far while the run goes (see
+    # _PartialResults); the check is a clock read per step and a file stat at
+    # most a few times a second.
+    partial = _PartialResults(workdir)
+
     def callback(_sim, n):
         done = n + 1
         if done % progress_every == 0 or done == n_steps:
             _emit_progress(done, n_steps)
+        if done < n_steps and partial.requested():
+            partial.write(done, lambda: _collect(False, time.perf_counter() - t0,
+                                                 done))
 
     # Replace the last setup STATUS (solver load / TEM mode build) so the dialog
     # label reflects what is actually happening while the bar advances — naming
@@ -2121,264 +2204,288 @@ def run_job(workdir):
     }.get(backend, backend)
     _emit_status("Running FDTD simulation on {} ({} time steps)...".format(
         backend_label, n_steps))
+
+    # --- write results ---------------------------------------------------- #
+    def _collect(final, wall_time, steps_done=None):
+        """``(result_arrays, summary)`` from what the monitors hold right now.
+
+        Called once at the end (*final*) and also mid-run, from the step
+        callback, when FreeCAD asks for the results so far: every monitor and
+        port record is a list that grows step by step, so a copy of it at step
+        n is the run up to step n. A mid-run call has no teardown and repeats
+        no one-off warnings, and its summary carries a ``partial`` entry saying
+        how far the run had got.
+        """
+        # Seed with the solved TEM-mode profiles so they ride along in the same
+        # results.npz the monitors write into.
+        result_arrays = dict(mode_arrays)
+        for region, mon in energy:
+            result_arrays[_ENERGY_KEY[region] + "_times"] = np.asarray(mon.times)
+            result_arrays[_ENERGY_KEY[region] + "_values"] = np.asarray(mon.values)
+        for region, mon in dissipation:
+            key = _DISSIPATION_KEY[region]
+            result_arrays[key + "_times"] = np.asarray(mon.times)
+            result_arrays[key + "_values"] = np.asarray(mon.values)
+
+        # Probes: one time series each, keyed by index (names kept in the summary).
+        probe_meta = []
+        for idx, (name, mon) in enumerate(probes):
+            result_arrays["probe_{}_times".format(idx)] = np.asarray(mon.times)
+            result_arrays["probe_{}_values".format(idx)] = np.asarray(mon.values)
+            probe_meta.append({"name": name, "component": mon.component})
+
+        # Snapshots: per recorded component a stack of frames (n_frames, N_axis1,
+        # N_axis2), plus the times and the two in-plane node (edge) coordinate arrays
+        # (metres, solver frame) shared by the components, so the results plot honours
+        # non-uniform spacing via pcolormesh.
+        d_pml = int(boundary.get("d_pml", 10))
+        pml_set = set(pml_faces)
+
+        def _interior_pad(axis):
+            """Absorber cell counts (lo, hi) at the two faces of *axis*."""
+            return (
+                d_pml if (axis + "0") in pml_set else 0,
+                d_pml if (axis + "1") in pml_set else 0,
+            )
+
+        def _interior_span(edges, axis):
+            """The absorber-free coordinate span of *axis*, in the *edges* frame.
+
+            The PML lies **inside** the domain box, so a snapshot is saved whole --
+            cropping it would hide exactly the geometry a body was carried out
+            through the absorber to model, which is what carrying it there was for.
+            Instead the interior's two coordinates ride along in the summary and the
+            results plot shades the rest, so the picture says where the absorber is
+            rather than pretending the domain stops at it. ``None`` on an axis that
+            absorbs on neither face.
+            """
+            lo, hi = _interior_pad(axis)
+            if not lo and not hi:
+                return None
+            return [float(edges[lo]), float(edges[len(edges) - 1 - hi])]
+
+        snapshot_meta = []
+        for idx, (name, field, mons) in enumerate(snapshots):
+            saved = []
+            interior = (None, None)
+            for comp, mon in mons:
+                if not mon.snapshots:
+                    continue
+                data = np.asarray(mon.snapshots)
+                ax0, ax1 = _INPLANE_AXES.get(getattr(mon, "normal", "z"), ("x", "y"))
+                edges0 = np.asarray(_axis_nodes(grid, ax0), dtype=np.float64)
+                edges1 = np.asarray(_axis_nodes(grid, ax1), dtype=np.float64)
+                # The frames are collocated to cell centres by the solver's
+                # SnapshotMonitor and are therefore one cell short per in-plane axis
+                # (cells 0..N-2); the node array is the pcolormesh edge array for
+                # them, trimmed to match.
+                edges0 = edges0[:data.shape[1] + 1]
+                edges1 = edges1[:data.shape[2] + 1]
+                result_arrays["snapshot_{}_{}_data".format(idx, comp)] = data
+                if not saved:
+                    # Same plane and cadence for every component: save once.
+                    result_arrays["snapshot_{}_times".format(idx)] = \
+                        np.asarray(mon.snap_times)
+                    result_arrays["snapshot_{}_edges0".format(idx)] = edges0
+                    result_arrays["snapshot_{}_edges1".format(idx)] = edges1
+                    interior = (_interior_span(edges0, ax0),
+                                _interior_span(edges1, ax1))
+                saved.append(comp)
+            # The two components lying *in* the slice plane, in array-index order —
+            # the in-plane vector the results plot draws as a quiver overlay. Named
+            # here because only this side knows the slice normal.
+            normal = getattr(mons[0][1], "normal", "z") if mons else "z"
+            pax0, pax1 = _INPLANE_AXES.get(normal, ("x", "y"))
+            snapshot_meta.append({
+                "name": name, "field": field, "components": saved,
+                "inplane": [field + pax0, field + pax1],
+                "frames": len(mons[0][1].snapshots) if mons else 0,
+                # Absorber-free span per in-plane axis, in the saved edges' own
+                # frame (metres); null where that axis absorbs on neither face.
+                "interior0": interior[0], "interior1": interior[1],
+            })
+
+        # Voltage/current line integrals: one time series each, keyed by index.
+        voltage_meta = []
+        for idx, (name, mon) in enumerate(voltages):
+            result_arrays["voltage_{}_times".format(idx)] = np.asarray(mon.times)
+            result_arrays["voltage_{}_values".format(idx)] = np.asarray(mon.values)
+            voltage_meta.append({"name": name})
+
+        current_meta = []
+        for idx, (name, mon) in enumerate(currents):
+            result_arrays["current_{}_times".format(idx)] = np.asarray(mon.times)
+            result_arrays["current_{}_values".format(idx)] = np.asarray(mon.values)
+            current_meta.append({"name": name})
+
+        # Modal ports: the V(t)/I(t) each ModalPort recorded at its own sheet, saved
+        # in the same two-``_times``/``_values``-pairs shape as a SPICE port so the
+        # results tree reuses the shared 1-D plotter. Keyed by the port's *plane*
+        # index, which is what ``mode_<si>_<mi>`` uses -- that is the only link
+        # between a port's series and its mode shapes.
+        #
+        # Both series are the port's own record and are co-timed at step n: V is the
+        # eps-weighted modal projection of the plane E, I the Poynting-paired
+        # projection of the H plane one cell inside the sheet, positive *into* the
+        # domain. ``reference_impedance`` (= 1/(s*G), the impedance that pair is
+        # self-consistent against, so a = (V + Z_ref*I)/2 is the incident wave) is
+        # set when the port compiles, hence always present here.
+        #
+        # ``sheet_divergence`` is the port's own health check, and the one number
+        # that says whether the run behind it can be trusted at all: the injected
+        # sheet must have zero transverse divergence at the plane's *free* nodes,
+        # because the ghost plane runs open loop and anything left over integrates
+        # into a static field on both port planes rather than radiating away. The
+        # solver measures it when the port compiles and warns on its own — but a
+        # Python warning goes to stderr, which the workbench only surfaces when a run
+        # fails, so it is echoed here as a status line and stored in the summary.
+        # Round-off is ~1e-14 and a real failure ~1e-1, so the threshold is not a
+        # tuning knob; it comes from the solver so there is one owner of it.
+        try:
+            from wavesim.mode_solver import _SHEET_DIVERGENCE_TOL as _DIV_TOL
+        except ImportError:          # a solver predating the measurement
+            _DIV_TOL = None
+        port_meta = []
+        for si, name, port in modal_ports:
+            times = np.asarray(port.times)
+            result_arrays["port_{}v_times".format(si)] = times
+            result_arrays["port_{}v_values".format(si)] = np.asarray(port.voltages)
+            result_arrays["port_{}i_times".format(si)] = times
+            result_arrays["port_{}i_values".format(si)] = np.asarray(port.currents)
+            divergence = getattr(port, "sheet_divergence", None)
+            port_meta.append({
+                "name": name, "source_index": si, "kind": "modal",
+                "reference_impedance": _f(getattr(port, "reference_impedance", None)),
+                "modal_conductance": _f(getattr(port, "modal_conductance", None)),
+                "sheet_divergence": _f(divergence),
+            })
+            if final and _DIV_TOL is not None and divergence is not None \
+                    and divergence > _DIV_TOL:
+                _emit_status(
+                    "Port '{}': the injected modal sheet has a transverse "
+                    "divergence of {:.3g} (round-off is ~1e-14). It will pile a "
+                    "static field onto both port planes instead of radiating. The "
+                    "usual cause is a permittivity map that disagrees with its own "
+                    "cut-cell geometry - check eps_x/eps_y/eps_z against "
+                    "pec_edge_open_*.".format(name, divergence))
+
+        # SPICE ports: the co-simulated port V(t)/I(t) recorded by each SpicePort,
+        # saved as two ``_times``/``_values`` series (voltage 'v', current 'i') so the
+        # results tree can reuse the shared 1-D plotter. Then tear down ngspice.
+        spice_meta = []
+        for idx, (name, port) in enumerate(spice_ports):
+            times = np.asarray(port.times)
+            result_arrays["spice_{}v_times".format(idx)] = times
+            result_arrays["spice_{}v_values".format(idx)] = np.asarray(port.voltages)
+            result_arrays["spice_{}i_times".format(idx)] = times
+            result_arrays["spice_{}i_values".format(idx)] = np.asarray(port.currents)
+            spice_meta.append({"name": name})
+
+        # Lumped R/L/C ports: the same two series, under their own key prefix. The
+        # branch values ride in the summary so a results window can say what the
+        # element *was* without reopening job.json.
+        lumped_meta = []
+        for idx, (name, port, cfg) in enumerate(lumped_ports):
+            times = np.asarray(port.times)
+            result_arrays["lumped_{}v_times".format(idx)] = times
+            result_arrays["lumped_{}v_values".format(idx)] = np.asarray(port.voltages)
+            result_arrays["lumped_{}i_times".format(idx)] = times
+            result_arrays["lumped_{}i_values".format(idx)] = np.asarray(port.currents)
+            meta = {"name": name,
+                    "topology": str(cfg.get("topology", "series")),
+                    "drive": str(cfg.get("drive", "none"))}
+            for key in ("resistance", "inductance", "capacitance"):
+                if cfg.get(key) is not None:
+                    meta[key] = float(cfg[key])
+            # kappa is the element's own model of the grid it landed on. It is *not*
+            # a series parasitic (the element delivers exactly its own admittance);
+            # what it buys is the gap capacitance dt/kappa = eps*dA/dl the bridged
+            # cells keep in parallel, which is what a user comparing the recorded Z
+            # against a nominal R/L/C needs, and which moves with the mesh.
+            try:
+                kappa = float(port.self_coupling(grid))
+            except Exception:
+                kappa = None
+            if kappa:
+                meta["kappa"] = kappa
+                meta["c_cell"] = float(grid.dt) / kappa
+            lumped_meta.append(meta)
+
+        summary = {
+            "ok": True,
+            "dt": float(grid.dt),
+            "steps": n_steps,
+            "wall_time_s": wall_time,
+            "Nx": int(grid.Nx), "Ny": int(grid.Ny), "Nz": int(grid.Nz),
+            "backend": sim.backend,
+            "sim_time_s": float(grid.time_step * grid.dt),
+            "pml_faces": list(pml_faces),
+            "pec_faces": list(pec_faces),
+            "subpixel": bool(job.get("subpixel", False)),
+            # Read off the grid, not the job: this is what the run's conductors
+            # actually were. The job's request can go unhonoured (an incomplete or
+            # absent array set falls back to staircase), and a stored result that
+            # claims conformal when it staircased is worse than no field at all.
+            "conformal_pec": bool(grid.is_conformal),
+            # Likewise off the grid: whether this run stepped the lossy E update.
+            "lossy": bool(grid.is_lossy),
+        }
+        summary.update(voxel_summary)
+        # Per recorded region: <key>_final / <key>_max, so a run recording both the
+        # whole grid and the interior reports each ("energy_*" is the whole grid).
+        for region, mon in energy:
+            if mon.values:
+                summary[_ENERGY_KEY[region] + "_final"] = float(mon.values[-1])
+                summary[_ENERGY_KEY[region] + "_max"] = float(max(mon.values))
+        # Dissipation reports a third number the energy series has no analogue for:
+        # the time integral of the power, i.e. the joules the lossy material
+        # actually absorbed over the run. That is the quantity to compare against
+        # U(0) - U(t), and it is the monitor's own trapezoid so the two agree.
+        for region, mon in dissipation:
+            if mon.values:
+                key = _DISSIPATION_KEY[region]
+                summary[key + "_final"] = float(mon.values[-1])
+                summary[key + "_max"] = float(max(mon.values))
+                summary[key + "_energy"] = float(mon.energy())
+        if probe_meta:
+            summary["probes"] = probe_meta
+        if snapshot_meta:
+            summary["snapshots"] = snapshot_meta
+        if voltage_meta:
+            summary["voltages"] = voltage_meta
+        if current_meta:
+            summary["currents"] = current_meta
+        if spice_meta:
+            summary["spice_ports"] = spice_meta
+        if lumped_meta:
+            summary["lumped_ports"] = lumped_meta
+        if port_meta:
+            summary["ports"] = port_meta
+        if mode_meta:
+            summary["modes"] = mode_meta
+        if not final:
+            summary["partial"] = {
+                "steps_done": int(steps_done),
+                "steps_total": n_steps,
+                "sim_time_s": float(grid.time_step * grid.dt),
+            }
+        return result_arrays, summary
+
     t0 = time.perf_counter()
     sim.run(n_steps, callback=callback)
     wall_time = time.perf_counter() - t0
+    # Whatever a mid-run request left behind goes before the final results
+    # land, so a finished run folder holds what it always did.
+    partial.discard()
 
-    # --- write results ---------------------------------------------------- #
-    # Seed with the solved TEM-mode profiles so they ride along in the same
-    # results.npz the monitors write into.
-    result_arrays = dict(mode_arrays)
-    for region, mon in energy:
-        result_arrays[_ENERGY_KEY[region] + "_times"] = np.asarray(mon.times)
-        result_arrays[_ENERGY_KEY[region] + "_values"] = np.asarray(mon.values)
-    for region, mon in dissipation:
-        key = _DISSIPATION_KEY[region]
-        result_arrays[key + "_times"] = np.asarray(mon.times)
-        result_arrays[key + "_values"] = np.asarray(mon.values)
-
-    # Probes: one time series each, keyed by index (names kept in the summary).
-    probe_meta = []
-    for idx, (name, mon) in enumerate(probes):
-        result_arrays["probe_{}_times".format(idx)] = np.asarray(mon.times)
-        result_arrays["probe_{}_values".format(idx)] = np.asarray(mon.values)
-        probe_meta.append({"name": name, "component": mon.component})
-
-    # Snapshots: per recorded component a stack of frames (n_frames, N_axis1,
-    # N_axis2), plus the times and the two in-plane node (edge) coordinate arrays
-    # (metres, solver frame) shared by the components, so the results plot honours
-    # non-uniform spacing via pcolormesh.
-    d_pml = int(boundary.get("d_pml", 10))
-    pml_set = set(pml_faces)
-
-    def _interior_pad(axis):
-        """Absorber cell counts (lo, hi) at the two faces of *axis*."""
-        return (
-            d_pml if (axis + "0") in pml_set else 0,
-            d_pml if (axis + "1") in pml_set else 0,
-        )
-
-    def _interior_span(edges, axis):
-        """The absorber-free coordinate span of *axis*, in the *edges* frame.
-
-        The PML lies **inside** the domain box, so a snapshot is saved whole --
-        cropping it would hide exactly the geometry a body was carried out
-        through the absorber to model, which is what carrying it there was for.
-        Instead the interior's two coordinates ride along in the summary and the
-        results plot shades the rest, so the picture says where the absorber is
-        rather than pretending the domain stops at it. ``None`` on an axis that
-        absorbs on neither face.
-        """
-        lo, hi = _interior_pad(axis)
-        if not lo and not hi:
-            return None
-        return [float(edges[lo]), float(edges[len(edges) - 1 - hi])]
-
-    snapshot_meta = []
-    for idx, (name, field, mons) in enumerate(snapshots):
-        saved = []
-        interior = (None, None)
-        for comp, mon in mons:
-            if not mon.snapshots:
-                continue
-            data = np.asarray(mon.snapshots)
-            ax0, ax1 = _INPLANE_AXES.get(getattr(mon, "normal", "z"), ("x", "y"))
-            edges0 = np.asarray(_axis_nodes(grid, ax0), dtype=np.float64)
-            edges1 = np.asarray(_axis_nodes(grid, ax1), dtype=np.float64)
-            # The frames are collocated to cell centres by the solver's
-            # SnapshotMonitor and are therefore one cell short per in-plane axis
-            # (cells 0..N-2); the node array is the pcolormesh edge array for
-            # them, trimmed to match.
-            edges0 = edges0[:data.shape[1] + 1]
-            edges1 = edges1[:data.shape[2] + 1]
-            result_arrays["snapshot_{}_{}_data".format(idx, comp)] = data
-            if not saved:
-                # Same plane and cadence for every component: save once.
-                result_arrays["snapshot_{}_times".format(idx)] = \
-                    np.asarray(mon.snap_times)
-                result_arrays["snapshot_{}_edges0".format(idx)] = edges0
-                result_arrays["snapshot_{}_edges1".format(idx)] = edges1
-                interior = (_interior_span(edges0, ax0),
-                            _interior_span(edges1, ax1))
-            saved.append(comp)
-        # The two components lying *in* the slice plane, in array-index order —
-        # the in-plane vector the results plot draws as a quiver overlay. Named
-        # here because only this side knows the slice normal.
-        normal = getattr(mons[0][1], "normal", "z") if mons else "z"
-        pax0, pax1 = _INPLANE_AXES.get(normal, ("x", "y"))
-        snapshot_meta.append({
-            "name": name, "field": field, "components": saved,
-            "inplane": [field + pax0, field + pax1],
-            "frames": len(mons[0][1].snapshots) if mons else 0,
-            # Absorber-free span per in-plane axis, in the saved edges' own
-            # frame (metres); null where that axis absorbs on neither face.
-            "interior0": interior[0], "interior1": interior[1],
-        })
-
-    # Voltage/current line integrals: one time series each, keyed by index.
-    voltage_meta = []
-    for idx, (name, mon) in enumerate(voltages):
-        result_arrays["voltage_{}_times".format(idx)] = np.asarray(mon.times)
-        result_arrays["voltage_{}_values".format(idx)] = np.asarray(mon.values)
-        voltage_meta.append({"name": name})
-
-    current_meta = []
-    for idx, (name, mon) in enumerate(currents):
-        result_arrays["current_{}_times".format(idx)] = np.asarray(mon.times)
-        result_arrays["current_{}_values".format(idx)] = np.asarray(mon.values)
-        current_meta.append({"name": name})
-
-    # Modal ports: the V(t)/I(t) each ModalPort recorded at its own sheet, saved
-    # in the same two-``_times``/``_values``-pairs shape as a SPICE port so the
-    # results tree reuses the shared 1-D plotter. Keyed by the port's *plane*
-    # index, which is what ``mode_<si>_<mi>`` uses -- that is the only link
-    # between a port's series and its mode shapes.
-    #
-    # Both series are the port's own record and are co-timed at step n: V is the
-    # eps-weighted modal projection of the plane E, I the Poynting-paired
-    # projection of the H plane one cell inside the sheet, positive *into* the
-    # domain. ``reference_impedance`` (= 1/(s*G), the impedance that pair is
-    # self-consistent against, so a = (V + Z_ref*I)/2 is the incident wave) is
-    # set when the port compiles, hence always present here.
-    #
-    # ``sheet_divergence`` is the port's own health check, and the one number
-    # that says whether the run behind it can be trusted at all: the injected
-    # sheet must have zero transverse divergence at the plane's *free* nodes,
-    # because the ghost plane runs open loop and anything left over integrates
-    # into a static field on both port planes rather than radiating away. The
-    # solver measures it when the port compiles and warns on its own — but a
-    # Python warning goes to stderr, which the workbench only surfaces when a run
-    # fails, so it is echoed here as a status line and stored in the summary.
-    # Round-off is ~1e-14 and a real failure ~1e-1, so the threshold is not a
-    # tuning knob; it comes from the solver so there is one owner of it.
-    try:
-        from wavesim.mode_solver import _SHEET_DIVERGENCE_TOL as _DIV_TOL
-    except ImportError:          # a solver predating the measurement
-        _DIV_TOL = None
-    port_meta = []
-    for si, name, port in modal_ports:
-        times = np.asarray(port.times)
-        result_arrays["port_{}v_times".format(si)] = times
-        result_arrays["port_{}v_values".format(si)] = np.asarray(port.voltages)
-        result_arrays["port_{}i_times".format(si)] = times
-        result_arrays["port_{}i_values".format(si)] = np.asarray(port.currents)
-        divergence = getattr(port, "sheet_divergence", None)
-        port_meta.append({
-            "name": name, "source_index": si, "kind": "modal",
-            "reference_impedance": _f(getattr(port, "reference_impedance", None)),
-            "modal_conductance": _f(getattr(port, "modal_conductance", None)),
-            "sheet_divergence": _f(divergence),
-        })
-        if _DIV_TOL is not None and divergence is not None \
-                and divergence > _DIV_TOL:
-            _emit_status(
-                "Port '{}': the injected modal sheet has a transverse "
-                "divergence of {:.3g} (round-off is ~1e-14). It will pile a "
-                "static field onto both port planes instead of radiating. The "
-                "usual cause is a permittivity map that disagrees with its own "
-                "cut-cell geometry - check eps_x/eps_y/eps_z against "
-                "pec_edge_open_*.".format(name, divergence))
-
-    # SPICE ports: the co-simulated port V(t)/I(t) recorded by each SpicePort,
-    # saved as two ``_times``/``_values`` series (voltage 'v', current 'i') so the
-    # results tree can reuse the shared 1-D plotter. Then tear down ngspice.
-    spice_meta = []
-    for idx, (name, port) in enumerate(spice_ports):
-        times = np.asarray(port.times)
-        result_arrays["spice_{}v_times".format(idx)] = times
-        result_arrays["spice_{}v_values".format(idx)] = np.asarray(port.voltages)
-        result_arrays["spice_{}i_times".format(idx)] = times
-        result_arrays["spice_{}i_values".format(idx)] = np.asarray(port.currents)
-        spice_meta.append({"name": name})
+    result_arrays, summary = _collect(True, wall_time)
+    # SPICE ports: tear down ngspice now the records are copied out.
+    for _name, port in spice_ports:
         try:
             port.close()
         except Exception:
             pass
-
-    # Lumped R/L/C ports: the same two series, under their own key prefix. The
-    # branch values ride in the summary so a results window can say what the
-    # element *was* without reopening job.json.
-    lumped_meta = []
-    for idx, (name, port, cfg) in enumerate(lumped_ports):
-        times = np.asarray(port.times)
-        result_arrays["lumped_{}v_times".format(idx)] = times
-        result_arrays["lumped_{}v_values".format(idx)] = np.asarray(port.voltages)
-        result_arrays["lumped_{}i_times".format(idx)] = times
-        result_arrays["lumped_{}i_values".format(idx)] = np.asarray(port.currents)
-        meta = {"name": name,
-                "topology": str(cfg.get("topology", "series")),
-                "drive": str(cfg.get("drive", "none"))}
-        for key in ("resistance", "inductance", "capacitance"):
-            if cfg.get(key) is not None:
-                meta[key] = float(cfg[key])
-        # kappa is the element's own model of the grid it landed on. It is *not*
-        # a series parasitic (the element delivers exactly its own admittance);
-        # what it buys is the gap capacitance dt/kappa = eps*dA/dl the bridged
-        # cells keep in parallel, which is what a user comparing the recorded Z
-        # against a nominal R/L/C needs, and which moves with the mesh.
-        try:
-            kappa = float(port.self_coupling(grid))
-        except Exception:
-            kappa = None
-        if kappa:
-            meta["kappa"] = kappa
-            meta["c_cell"] = float(grid.dt) / kappa
-        lumped_meta.append(meta)
-
     np.savez(os.path.join(workdir, "results.npz"), **result_arrays)
-
-    summary = {
-        "ok": True,
-        "dt": float(grid.dt),
-        "steps": n_steps,
-        "wall_time_s": wall_time,
-        "Nx": int(grid.Nx), "Ny": int(grid.Ny), "Nz": int(grid.Nz),
-        "backend": sim.backend,
-        "sim_time_s": float(grid.time_step * grid.dt),
-        "pml_faces": list(pml_faces),
-        "pec_faces": list(pec_faces),
-        "subpixel": bool(job.get("subpixel", False)),
-        # Read off the grid, not the job: this is what the run's conductors
-        # actually were. The job's request can go unhonoured (an incomplete or
-        # absent array set falls back to staircase), and a stored result that
-        # claims conformal when it staircased is worse than no field at all.
-        "conformal_pec": bool(grid.is_conformal),
-        # Likewise off the grid: whether this run stepped the lossy E update.
-        "lossy": bool(grid.is_lossy),
-    }
-    summary.update(voxel_summary)
-    # Per recorded region: <key>_final / <key>_max, so a run recording both the
-    # whole grid and the interior reports each ("energy_*" is the whole grid).
-    for region, mon in energy:
-        if mon.values:
-            summary[_ENERGY_KEY[region] + "_final"] = float(mon.values[-1])
-            summary[_ENERGY_KEY[region] + "_max"] = float(max(mon.values))
-    # Dissipation reports a third number the energy series has no analogue for:
-    # the time integral of the power, i.e. the joules the lossy material
-    # actually absorbed over the run. That is the quantity to compare against
-    # U(0) - U(t), and it is the monitor's own trapezoid so the two agree.
-    for region, mon in dissipation:
-        if mon.values:
-            key = _DISSIPATION_KEY[region]
-            summary[key + "_final"] = float(mon.values[-1])
-            summary[key + "_max"] = float(max(mon.values))
-            summary[key + "_energy"] = float(mon.energy())
-    if probe_meta:
-        summary["probes"] = probe_meta
-    if snapshot_meta:
-        summary["snapshots"] = snapshot_meta
-    if voltage_meta:
-        summary["voltages"] = voltage_meta
-    if current_meta:
-        summary["currents"] = current_meta
-    if spice_meta:
-        summary["spice_ports"] = spice_meta
-    if lumped_meta:
-        summary["lumped_ports"] = lumped_meta
-    if port_meta:
-        summary["ports"] = port_meta
-    if mode_meta:
-        summary["modes"] = mode_meta
     with open(os.path.join(workdir, "summary.json"), "w", encoding="utf-8") as handle:
         json.dump(summary, handle, indent=2)
 

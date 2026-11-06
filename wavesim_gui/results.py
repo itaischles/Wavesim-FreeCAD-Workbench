@@ -756,6 +756,12 @@ def build_results(doc, sim, workdir, summary):
     *workdir* holds ``results.npz``; *summary* is the parsed ``summary.json``
     (used for monitor names/components). Returns the Results group, or ``None``
     if nothing could be loaded.
+
+    A summary with a ``partial`` entry is a console run's answer to a mid-run
+    request (see :func:`wavesim_gui.run.request_partial_results`): the tree is
+    the same less what only the whole record can give -- the impedance leaves,
+    and the spectrum views (see :func:`_partial_note`) -- and says how far the
+    run had got, on the group label and in every plot window it opens.
     """
     import numpy as np
 
@@ -775,6 +781,9 @@ def build_results(doc, sim, workdir, summary):
         return None
 
     workdir = workdir.replace("\\", "/")
+    partial = _partial_note(sim, summary)
+    # A Z(f) from a truncated record is the transform of a different signal.
+    impedance_leaf = (lambda *_a, **_k: None) if partial else _impedance_leaf
 
     doc.openTransaction("Wavesim: Build Results")
     try:
@@ -782,7 +791,8 @@ def build_results(doc, sim, workdir, summary):
 
         grp = doc.addObject("App::DocumentObjectGroupPython", "Results")
         ResultsContainer(grp)
-        grp.Label = "Results"
+        grp.Label = "Results (partial: {})".format(partial) if partial \
+            else "Results"
         grp.ResultsDir = workdir
         if grp.ViewObject is not None:
             ResultsViewProvider(grp.ViewObject)
@@ -798,6 +808,15 @@ def build_results(doc, sim, workdir, summary):
             leaf.ResultsDir = workdir
             leaf.Component = component
             leaf.CurrentKey = current_key
+            # A mode shape is solved before the first step, so it is whole
+            # even in a partial tree.
+            if partial and kind != _KIND_MODE:
+                leaf.addProperty(
+                    "App::PropertyString", "Partial", "Result",
+                    "How far the run had got when these results were written "
+                    "(empty for a finished run)")
+                leaf.Partial = partial
+                leaf.setEditorMode("Partial", 1)
             if leaf.ViewObject is not None:
                 ResultViewProvider(leaf.ViewObject)
                 # A result leaf exists or it does not -- there is no hidden
@@ -883,7 +902,7 @@ def build_results(doc, sim, workdir, summary):
             if "spice_{}i_values".format(idx) in keys:
                 _new_leaf("{} current".format(name), _KIND_SPICE_I,
                           "spice_{}i".format(idx), parent=parent)
-            _impedance_leaf(_new_leaf, keys, name, "spice_{}v".format(idx),
+            impedance_leaf(_new_leaf, keys, name, "spice_{}v".format(idx),
                             "spice_{}i".format(idx), parent=parent)
 
         # Lumped R/L/C ports: the same V(t)/I(t) pair. A lumped port has no mode
@@ -898,7 +917,7 @@ def build_results(doc, sim, workdir, summary):
                     continue
                 leaf = _new_leaf("{} {}".format(name, label), kind, key)
                 _store_lumped_meta(leaf, meta)
-            leaf = _impedance_leaf(_new_leaf, keys, name,
+            leaf = impedance_leaf(_new_leaf, keys, name,
                                    "lumped_{}v".format(idx),
                                    "lumped_{}i".format(idx))
             if leaf is not None:
@@ -922,7 +941,7 @@ def build_results(doc, sim, workdir, summary):
                 # The plot annotates Z_ref, so the leaf carries it too rather
                 # than reaching back into its group at draw time.
                 _store_port_meta(leaf, meta)
-            leaf = _impedance_leaf(_new_leaf, keys, name,
+            leaf = impedance_leaf(_new_leaf, keys, name,
                                    "port_{}v".format(si), "port_{}i".format(si),
                                    parent=parent)
             if leaf is not None:
@@ -1063,12 +1082,40 @@ def build_results(doc, sim, workdir, summary):
     except Exception:
         doc.abortTransaction()
         raise
+    finally:
+        # Closed, not left to the garbage collector: on Windows an open file
+        # cannot be deleted, and a mid-run answer's folder is deleted as soon
+        # as the next one (or the finished run) replaces it.
+        npz.close()
     doc.commitTransaction()
     doc.recompute()
-    FreeCAD.Console.PrintMessage(
-        "Wavesim: results added to the tree (double-click a node to plot).\n"
-    )
+    if partial:
+        FreeCAD.Console.PrintMessage(
+            "Wavesim: results so far ({}) are in the tree; the run goes "
+            "on.\n".format(partial))
+    else:
+        FreeCAD.Console.PrintMessage(
+            "Wavesim: results added to the tree (double-click a node to "
+            "plot).\n")
     return grp
+
+
+def _partial_note(sim, summary):
+    """How far a mid-run summary's run had got, e.g. ``45%, t = 1.2 of 2.67 ns``.
+
+    Empty for a finished run's summary -- which is also how every caller tells
+    the two apart.
+    """
+    info = summary.get("partial")
+    if not info:
+        return ""
+    done = int(info.get("steps_done", 0))
+    total = max(1, int(info.get("steps_total", 1)))
+    unit = units.get_time_unit(sim)
+    now = units.time_from_si(float(info.get("sim_time_s", 0.0)), unit)
+    end = units.time_from_si(float(summary.get("dt", 0.0)) * total, unit)
+    return "{:.0f}%, t = {:.3g} of {:.3g} {}".format(
+        100.0 * done / total, now, end, unit)
 
 
 _MATRIX_GROUP = "Port Matrix"
@@ -1684,6 +1731,21 @@ if _GUI_AVAILABLE:
         def getIcon(self):
             return _RESULTS_ICON
 
+        def setupContextMenu(self, vobj, menu):
+            # Refresh Results, where the results are, while a run can answer.
+            from wavesim_gui import job as job_mod
+            from wavesim_gui import run as run_mod
+            doc = vobj.Object.Document
+            if not run_mod.partial_results_available(
+                    job_mod.workdir_for(doc, prefix="run")):
+                return
+            from PySide import QtGui
+            action = menu.addAction(QtGui.QIcon(_icon("results_refresh.svg")),
+                                    "Refresh Results")
+            action.triggered.connect(
+                lambda *_a: run_mod.request_partial_results(
+                    job_mod.workdir_for(doc, prefix="run")))
+
         def dumps(self):
             return None
 
@@ -1821,17 +1883,22 @@ if _GUI_AVAILABLE:
         """Return the named array from ``<workdir>/results.npz`` (or None)."""
         import numpy as np
         try:
-            data = np.load(os.path.join(workdir, "results.npz"))
-            return data[key] if key in data.files else None
+            # Closed at once, so the folder can be deleted under an open plot
+            # (a mid-run answer's folder goes when the next one arrives).
+            with np.load(os.path.join(workdir, "results.npz")) as data:
+                return data[key] if key in data.files else None
         except Exception:
             return None
 
-    def _make_window(title):
+    def _make_window(title, obj=None):
         """Create a non-modal plot window with an embedded matplotlib canvas.
 
         Returns (dialog, figure, vbox_layout) -- the caller adds extra controls
         to the layout. Returns ``None`` if matplotlib could not be loaded.
+        *obj*, the leaf being plotted, marks the window when it holds a
+        run's results so far rather than its whole record.
         """
+        partial = str(getattr(obj, "Partial", "") or "")
         _QtCore, QtWidgets = _qt()
         try:
             FigureCanvas, NavToolbar, Figure = _mpl()
@@ -1843,13 +1910,26 @@ if _GUI_AVAILABLE:
             return None
 
         dialog = QtWidgets.QDialog(Gui.getMainWindow())
-        dialog.setWindowTitle(title)
+        dialog.setWindowTitle("{} (partial: {})".format(title, partial)
+                              if partial else title)
         dialog.setWindowFlags(_QtCore.Qt.Window)
         dialog.resize(640, 480)
         # Destroy the C++ object on close so it (and its figure/canvas/timer) is
         # freed rather than lingering as a hidden child of the main window.
         dialog.setAttribute(_QtCore.Qt.WA_DeleteOnClose, True)
         layout = QtWidgets.QVBoxLayout(dialog)
+        if partial:
+            # A label, not a figure title: the plotters redraw their figures
+            # from scratch when an option changes, and the note must survive.
+            banner = QtWidgets.QLabel(
+                "Partial results: the run up to {}. This window keeps "
+                "showing them; reopen the result for newer ones.".format(
+                    partial))
+            banner.setWordWrap(True)
+            banner.setStyleSheet(
+                "QLabel { background: #fff3cd; color: #664d03; "
+                "border: 1px solid #ffe69c; padding: 4px; }")
+            layout.addWidget(banner)
 
         figure = Figure(figsize=(6, 4.5), tight_layout=True)
         canvas = FigureCanvas(figure)
@@ -1956,7 +2036,7 @@ if _GUI_AVAILABLE:
             _missing(obj)
             return
 
-        made = _make_window("Wavesim Results - {}".format(obj.Label))
+        made = _make_window("Wavesim Results - {}".format(obj.Label), obj)
         if made is None:
             return
         dialog, figure, layout = made
@@ -1973,7 +2053,9 @@ if _GUI_AVAILABLE:
             if annotate is not None:
                 annotate(ax, times, values)
 
-        if quantity is None:
+        # The spectrum of a record cut off mid-ring is not the structure's, so
+        # a partial leaf keeps to the time plot.
+        if quantity is None or getattr(obj, "Partial", ""):
             draw_time(figure)
         else:
             _add_domain_switch(dialog, layout, draw_time,
@@ -2342,7 +2424,7 @@ if _GUI_AVAILABLE:
         corners = ([float(v) * _MM_PER_M for v in vertex_s[1:-1]]
                    if vertex_s is not None else [])
 
-        made = _make_window("Wavesim Results - {}".format(obj.Label))
+        made = _make_window("Wavesim Results - {}".format(obj.Label), obj)
         if made is None:
             return
         dialog, figure, layout = made
@@ -2518,7 +2600,7 @@ if _GUI_AVAILABLE:
             _missing(obj)
             return
 
-        made = _make_window("Wavesim Results - {}".format(obj.Label))
+        made = _make_window("Wavesim Results - {}".format(obj.Label), obj)
         if made is None:
             return
         dialog, figure, layout = made
@@ -2928,7 +3010,7 @@ if _GUI_AVAILABLE:
             _missing(obj)
             return
 
-        made = _make_window("Wavesim Results - {}".format(obj.Label))
+        made = _make_window("Wavesim Results - {}".format(obj.Label), obj)
         if made is None:
             return
         dialog, figure, layout = made
@@ -3562,7 +3644,7 @@ if _GUI_AVAILABLE:
                 )
             return mcolors.Normalize(vmin=-vmax, vmax=vmax)
 
-        made = _make_window("Wavesim Results - {}".format(obj.Label))
+        made = _make_window("Wavesim Results - {}".format(obj.Label), obj)
         if made is None:
             return
         dialog, figure, layout = made
@@ -4887,7 +4969,7 @@ if _GUI_AVAILABLE:
         if data is None:
             _missing(obj)
             return
-        made = _make_window("Wavesim Results - {}".format(obj.Label))
+        made = _make_window("Wavesim Results - {}".format(obj.Label), obj)
         if made is None:
             return
         dialog, figure, layout = made

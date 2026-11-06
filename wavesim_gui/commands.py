@@ -39,6 +39,7 @@ _SIM_ICON = os.path.join(_ICONS_DIR, "sim_new.svg")
 # toolbar command keeps _SIM_ICON).
 _SIM_TREE_ICON = os.path.join(_ICONS_DIR, "simulation.svg")
 _RUN_ICON = os.path.join(_ICONS_DIR, "run.svg")
+_REFRESH_RESULTS_ICON = os.path.join(_ICONS_DIR, "results_refresh.svg")
 
 # Marker property stamped on the container. Identifying the simulation by a
 # stored property (rather than by ``Proxy`` type) keeps :func:`active_simulation`
@@ -962,10 +963,23 @@ if _GUI_AVAILABLE:
                                                   summary)
                     _show_run_summary(summary, workdir)
 
+                # Refresh Results' answer: the same tree, from the run so far.
+                def on_partial(summary, folder):
+                    run_doc = FreeCAD.listDocuments().get(doc_name)
+                    if run_doc is None:
+                        return
+                    from wavesim_gui import results as results_mod
+                    sim = active_simulation(run_doc)
+                    if sim is not None:
+                        results_mod.build_results(run_doc, sim, folder,
+                                                  summary)
+
                 run_mod.start_console_run(
                     workdir, on_done, parent=Gui.getMainWindow(),
                     title="Wavesim - {}".format(doc.Label),
                     percent=electrostatic,
+                    # An electrostatic solve has no "so far" to show.
+                    on_partial=None if electrostatic else on_partial,
                 )
                 return
 
@@ -1002,6 +1016,42 @@ if _GUI_AVAILABLE:
                 return not run_mod.console_run_active(
                     job_mod.workdir_for(doc, prefix="run"))
             return True
+
+    class CommandRefreshResults:
+        """Load a running simulation's results so far into the Results tree.
+
+        Asks the console run for what its monitors have recorded up to now; the
+        tree is rebuilt from that when the solver has written it, marked partial,
+        and replaced by the whole run's when it finishes. Time-domain results
+        only: the impedances and spectra need the whole record.
+        """
+
+        def GetResources(self):
+            return {
+                "Pixmap": _REFRESH_RESULTS_ICON,
+                "MenuText": "Refresh Results",
+                "ToolTip": "Show the results of the running simulation so far "
+                "in the Results tree (the run goes on)",
+            }
+
+        def Activated(self):
+            from wavesim_gui import job as job_mod
+            from wavesim_gui import run as run_mod
+            run_mod.request_partial_results(
+                job_mod.workdir_for(FreeCAD.ActiveDocument, prefix="run"))
+
+        def IsActive(self):
+            # Only while this document's time-domain console run is going, and
+            # not while an earlier request is still being answered.
+            from wavesim_gui import run as run_mod
+            if not run_mod.console_run_active():
+                return False
+            doc = FreeCAD.ActiveDocument
+            if active_simulation(doc) is None:
+                return False
+            from wavesim_gui import job as job_mod
+            return run_mod.partial_results_available(
+                job_mod.workdir_for(doc, prefix="run"))
 
     def _show_run_summary(summary, workdir):
         """Pop a short info dialog with the grid dims, CFL dt and timing."""
@@ -1050,6 +1100,7 @@ if _GUI_AVAILABLE:
         )
 
     Gui.addCommand("Wavesim_Run", CommandRun())
+    Gui.addCommand("Wavesim_RefreshResults", CommandRefreshResults())
 
     # Importing these modules registers their commands. Done last so
     # active_simulation / the child-group constants are fully defined before they

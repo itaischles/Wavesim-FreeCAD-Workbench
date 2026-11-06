@@ -36,8 +36,12 @@ import wavesim_settings
 # as if it belonged to the new job. ``exit.json`` is the console run's
 # end-of-run marker (see run.start_console_run); it is deleted once read, so it
 # is here only for a run whose FreeCAD session ended before the run did.
+# ``partial.request`` and the ``partial`` folder are a console run's mid-run
+# results (see run.request_partial_results); a finished run deletes them, a
+# cancelled one leaves them for the tree until the next run starts.
 JOB_ARTEFACTS = ("job.json", "materials.npz", "results.npz", "summary.json",
-                 "exit.json")
+                 "exit.json", "partial.request")
+JOB_ARTEFACT_DIRS = ("partial",)
 
 _UNSAFE_CHARS = re.compile(r"[^A-Za-z0-9._-]+")
 
@@ -92,6 +96,8 @@ def prepare_workdir(doc, prefix="run"):
         path = os.path.join(workdir, name)
         if os.path.isfile(path):
             os.remove(path)
+    for name in JOB_ARTEFACT_DIRS:
+        shutil.rmtree(os.path.join(workdir, name), ignore_errors=True)
     return workdir
 
 

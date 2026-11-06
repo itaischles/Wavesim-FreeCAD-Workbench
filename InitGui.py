@@ -117,7 +117,10 @@ class WavesimWorkbench(Gui.Workbench):
             # and importing the module is what registers it.
             from wavesim_gui import portmatrix  # noqa: F401
 
-            add_group("Wavesim_Run", "Wavesim_PortMatrix")
+            # Refresh Results sits with them: it is live only while a Run
+            # goes, and shows that run's results so far.
+            add_group("Wavesim_Run", "Wavesim_PortMatrix",
+                      "Wavesim_RefreshResults")
             # Viewing: cutting the model open on a grid plane. NOT part of
             # command_list -- it gets a toolbar of its own, below (see
             # view_command_list). It changes nothing in the model and runs

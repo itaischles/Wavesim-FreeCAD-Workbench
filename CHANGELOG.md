@@ -41,6 +41,17 @@ section is started above it.
   Results tree is built when the run finishes. *Wavesim → Settings → Solver
   run* switches back to the progress dialog. Windows only; elsewhere the
   dialog is always used. Port Matrix and Compute Mode still use the dialog.
+- **Refresh Results** (new button beside *Run*, and on the *Results* group's
+  right-click menu) shows a running simulation's results so far: the solver
+  writes what its monitors have recorded, and the Results tree is rebuilt from
+  it, labelled e.g. *Results (partial: 23%, t = 1.12 of 4.8 ns)*. Snapshots
+  animate up to the current time; probes, voltages, currents, energy and port
+  V/I plot up to it. Impedance leaves and spectrum views need the whole record
+  and appear only when the run finishes. A plot window opened from a partial
+  tree says so in a banner and keeps showing what it loaded. The finished run
+  replaces the partial tree and deletes the temporary files, so its folder and
+  results are exactly what they would have been without a refresh. Console
+  runs of time-domain simulations only.
 
 ### Changed
 

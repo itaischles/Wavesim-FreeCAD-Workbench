@@ -1,18 +1,28 @@
 # Wavesim FreeCAD Workbench
 
-The Wavesim workbench turns FreeCAD solids into an electromagnetic simulation. You assign a
-material to each body, place sources, ports and monitors, and then run the simulation. The
-separate Wavesim solver performs the computation, and the results return to the FreeCAD
-document tree as plots and tables.
+The Wavesim workbench turns FreeCAD solids into electromagnetic simulations.
+Assign materials, configure the mesh, place sources, ports and monitors, and run
+the simulation. Results appear in the FreeCAD document tree as plots and tables.
 
-Two solvers are currently available:
-1. **Full wave (FDTD)** solves the full Maxwell's equations in the time domain.
-2. **Electrostatic** solves for conductors held at fixed potentials or charges.
+Two solvers use the same geometry, materials and mesh:
 
-The workbench runs inside FreeCAD 1.1; the solver runs in its own Python environment,
-with the only dependencies being `numpy`, `scipy` and `numba`. The  solver and the workbench
-communicate through files on disk.
+- **Full wave (FDTD)** solves Maxwell's equations in the time domain, providing
+  field animations, probe records, energy measurements and port impedances.
+- **Electrostatic** solves for conductors held at fixed potentials or charges,
+  providing potential and field distributions, conductor charges, capacitance
+  matrices and field measurements along curves.
 
-To learn all the features, and how to install the software read the [user manual](manual/wavesim-manual-v0.1.pdf).
-It is written for physicists, and explains the numerical methods as far as is
-needed using basic terms.
+Models can be built interactively, through a parametric
+[scripting API](docs/API_INVENTORY.md), or with the
+[Wavesim AI Agent](https://github.com/itaischles/Wavesim-AI-Agent) through an
+optional local [Agent bridge](docs/AGENT_BRIDGE.md). Saved results can be exported
+to CSV, PNG, GIF and Touchstone files.
+
+The workbench runs inside **FreeCAD 1.1**; the separate Wavesim solver runs in its
+own Python environment with `numpy`, `scipy` and `numba`. On Windows, the solver
+can run in its own console while FreeCAD remains usable, with partial results
+available during time-domain runs.
+
+The [user manual](manual/wavesim-manual-v0.1.pdf) explains installation, numerical
+methods and worked examples. It currently covers v0.1; see the guides above and
+the [changelog](CHANGELOG.md) for later additions.

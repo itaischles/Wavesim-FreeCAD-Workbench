@@ -15,6 +15,13 @@ GitHub release tags use the short form: v0.2 corresponds to version 0.2.0.
 
 ## [Unreleased]
 
+### Changed
+
+- The user manual is updated to v0.2 (`manual/wavesim-manual-v0.2.pdf`): the console-window
+  run, Refresh Results, the Field Along Curve monitor, the new snapshot controls,
+  voxelisation reuse and the new Settings rows, and a new appendix on the scripting API,
+  the Agent bridge and the results exporter. It replaces the v0.1 PDF.
+
 ## [0.2.0] - 2026-11-08
 
 ### Added

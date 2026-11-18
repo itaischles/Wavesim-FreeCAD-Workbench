@@ -23,6 +23,7 @@ own Python environment with `numpy`, `scipy` and `numba`. On Windows, the solver
 can run in its own console while FreeCAD remains usable, with partial results
 available during time-domain runs.
 
-The [user manual](manual/wavesim-manual-v0.1.pdf) explains installation, numerical
-methods and worked examples. It currently covers v0.1; see the guides above and
-the [changelog](CHANGELOG.md) for later additions.
+The [user manual](manual/wavesim-manual-v0.2.pdf) explains installation, numerical
+methods and worked examples, and covers the scripting API, the Agent bridge and the
+results exporter in an appendix. See the [changelog](CHANGELOG.md) for what changed
+between versions.
